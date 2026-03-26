@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+.venv/
+node_modules/
+admin-ui/node_modules/
+admin-ui/dist/
+.git/
+.gitignore
+.env
+output/
+inputs/
+.pytest_cache/
+.vscode/
+.idea/

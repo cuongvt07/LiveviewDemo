@@ -1,0 +1,28 @@
+# Environments
+.env
+.venv
+env/
+venv/
+ENV/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.pytest_cache/
+.coverage
+
+# Node
+node_modules/
+dist/
+dist-ssr/
+*.local
+
+# Project specific
+output/
+inputs/
+
+# OS generated
+.DS_Store
+Thumbs.db
