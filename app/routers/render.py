@@ -1,6 +1,7 @@
 # app/routers/render.py
 
 import asyncio
+import json
 import logging
 import uuid
 from typing import Optional
@@ -19,7 +20,8 @@ from app.pipeline.clothes.clothes_pipeline import ClothesAssets
 from app.pipeline.mugs.mug_pipeline import MugAssets
 from app.pipeline.mugs.specular_gloss import extract_specular_from_mockup
 from app.pipeline.pipeline import run_pipeline
-from app.pipeline.shared.design_transform import apply_design_transform
+from app.pipeline.shared.decode import decode_design
+from app.pipeline.shared.design_transform import apply_design_transform, estimate_print_area_canvas_size
 from app.services import template_registry
 from app.services.vision import auto_detect_print_area_v2, bake_normal_map, create_soft_mask
 
@@ -87,17 +89,21 @@ def _build_default_adhoc_config(width: int, height: int) -> dict:
             "offset_y": 0.0,
         },
         "lighting": {
-            "shadow_strength": 0.35,
-            "displacement_strength": 0.08,
-            "specular_strength": 0.30,
-            "specular_threshold": 220,
+            # Ad-hoc profile defaults to color fidelity over synthetic lighting.
+            "shadow_strength": 0.0,
+            "displacement_strength": 0.0,
+            "specular_strength": 0.0,
+            "specular_threshold": 245,
         },
         "color": {
-            "enable_color_match": True,
-            "match_strength": 0.40,
+            "enable_color_match": False,
+            "match_strength": 0.0,
         },
         "edge": {
-            "feather_px": 4,
+            "feather_px": 0,
+        },
+        "render": {
+            "preserve_original_color": True,
         },
         "output": {
             "jpeg_quality": 90,
@@ -179,6 +185,59 @@ def _merge_adhoc_user_config(config: dict, config_json: Optional[str]) -> dict:
     if "feather_radius" in user_warp:
         config["edge"]["feather_px"] = int(user_warp.get("feather_radius", config["edge"]["feather_px"]))
 
+    user_edge = user_config.get("edge", {})
+    if isinstance(user_edge, dict) and "feather_px" in user_edge:
+        config["edge"]["feather_px"] = int(user_edge.get("feather_px", config["edge"]["feather_px"]))
+
+    user_color = user_config.get("color", {})
+    if isinstance(user_color, dict):
+        if "enable_color_match" in user_color:
+            config["color"]["enable_color_match"] = bool(user_color.get("enable_color_match"))
+        if "match_strength" in user_color:
+            config["color"]["match_strength"] = float(user_color.get("match_strength", config["color"]["match_strength"]))
+
+    user_lighting = user_config.get("lighting", {})
+    if isinstance(user_lighting, dict):
+        if "shadow_strength" in user_lighting:
+            config["lighting"]["shadow_strength"] = float(user_lighting.get("shadow_strength", config["lighting"]["shadow_strength"]))
+        if "displacement_strength" in user_lighting:
+            config["lighting"]["displacement_strength"] = float(
+                user_lighting.get("displacement_strength", config["lighting"]["displacement_strength"])
+            )
+        if "specular_strength" in user_lighting:
+            config["lighting"]["specular_strength"] = float(
+                user_lighting.get("specular_strength", config["lighting"]["specular_strength"])
+            )
+        if "specular_threshold" in user_lighting:
+            config["lighting"]["specular_threshold"] = int(
+                user_lighting.get("specular_threshold", config["lighting"]["specular_threshold"])
+            )
+
+    user_render = user_config.get("render", {})
+    if isinstance(user_render, dict) and "preserve_original_color" in user_render:
+        config.setdefault("render", {})
+        config["render"]["preserve_original_color"] = bool(user_render.get("preserve_original_color"))
+
+    # Keep ad-hoc mug renders color-faithful by default, but preserve richer
+    # clothes defaults unless caller explicitly overrides color/lighting keys.
+    if config["product_type"] == "clothes":
+        if not isinstance(user_color, dict) or "enable_color_match" not in user_color:
+            config["color"]["enable_color_match"] = True
+        if not isinstance(user_color, dict) or "match_strength" not in user_color:
+            config["color"]["match_strength"] = 0.25
+
+        if not isinstance(user_lighting, dict) or "shadow_strength" not in user_lighting:
+            config["lighting"]["shadow_strength"] = 0.40
+        if not isinstance(user_lighting, dict) or "displacement_strength" not in user_lighting:
+            config["lighting"]["displacement_strength"] = 0.08
+        if not isinstance(user_lighting, dict) or "specular_strength" not in user_lighting:
+            config["lighting"]["specular_strength"] = 0.08
+        if not isinstance(user_edge, dict) or "feather_px" not in user_edge:
+            config["edge"]["feather_px"] = 10
+        if not isinstance(user_render, dict) or "preserve_original_color" not in user_render:
+            config.setdefault("render", {})
+            config["render"]["preserve_original_color"] = False
+
     config["design_transform"] = {
         "scale": float(user_warp.get("design_scale", config["design_transform"]["scale"])),
         "offset_x": float(user_warp.get("design_offset_x", config["design_transform"]["offset_x"])),
@@ -208,6 +267,86 @@ def _build_preview_design_canvas(size: int = 400) -> np.ndarray:
         cv2.line(canvas, (v, 0), (v, size - 1), (255, 255, 255, 170), 1, cv2.LINE_AA)
         cv2.line(canvas, (0, v), (size - 1, v), (255, 255, 255, 170), 1, cv2.LINE_AA)
     return canvas
+
+
+def _render_warp_preview_image(req: WarpPreviewRequest, design_canvas: np.ndarray) -> np.ndarray:
+    from app.pipeline.clothes.tps_warp import tps_warp_design
+    from app.pipeline.mugs.cylindrical_warp import cylindrical_warp
+
+    w, h = req.mockup_width, req.mockup_height
+    pa = {
+        "top_left": req.print_area["top_left"],
+        "top_right": req.print_area["top_right"],
+        "bottom_right": req.print_area["bottom_right"],
+        "bottom_left": req.print_area["bottom_left"],
+    }
+    canvas_w, canvas_h = estimate_print_area_canvas_size(
+        pa,
+        fallback_width=design_canvas.shape[1],
+        fallback_height=design_canvas.shape[0],
+    )
+
+    design_canvas = apply_design_transform(
+        design_canvas,
+        scale=req.design_scale,
+        offset_x=req.design_offset_x,
+        offset_y=req.design_offset_y,
+        target_width=canvas_w,
+        target_height=canvas_h,
+    )
+
+    if req.warp_type == "cylinder":
+        smile_val = float(req.curve)
+        pitch_val = float(req.print_area.get("camera_elevation", 0))
+        warped = cylindrical_warp(
+            design_canvas,
+            pa,
+            (w, h),
+            req.theta_max_deg,
+            pitch_val,
+            smile_val,
+            req.curve_top,
+            req.curve_bottom,
+        )
+    elif req.warp_type == "tps":
+        src_pts_px = np.float32(req.print_area.get("mesh_control_src", []))
+        dst_pts = np.float32(req.print_area.get("mesh_control_dst", []))
+        dh, dw = design_canvas.shape[:2]
+        if len(src_pts_px) >= 3 and len(src_pts_px) == len(dst_pts):
+            base = cv2.warpPerspective(
+                design_canvas,
+                cv2.getPerspectiveTransform(
+                    np.float32([[0, 0], [dw - 1, 0], [dw - 1, dh - 1], [0, dh - 1]]),
+                    np.float32([pa["top_left"], pa["top_right"], pa["bottom_right"], pa["bottom_left"]]),
+                ),
+                (w, h),
+            )
+            warped = tps_warp_design(base, src_pts_px, dst_pts, (w, h))
+        else:
+            warped = cv2.warpPerspective(
+                design_canvas,
+                cv2.getPerspectiveTransform(
+                    np.float32([[0, 0], [dw - 1, 0], [dw - 1, dh - 1], [0, dh - 1]]),
+                    np.float32([pa["top_left"], pa["top_right"], pa["bottom_right"], pa["bottom_left"]]),
+                ),
+                (w, h),
+            )
+    else:
+        dh, dw = design_canvas.shape[:2]
+        warped = cv2.warpPerspective(
+            design_canvas,
+            cv2.getPerspectiveTransform(
+                np.float32([[0, 0], [dw - 1, 0], [dw - 1, dh - 1], [0, dh - 1]]),
+                np.float32([pa["top_left"], pa["top_right"], pa["bottom_right"], pa["bottom_left"]]),
+            ),
+            (w, h),
+        )
+
+    if req.mask_points and warped.shape[2] == 4:
+        mask_to_use = create_soft_mask(req.mask_points, (h, w), feather_radius=2)
+        warped[:, :, 3] = cv2.bitwise_and(warped[:, :, 3], mask_to_use)
+
+    return warped
 
 
 @router.post("/mockup/render")
@@ -338,10 +477,16 @@ async def renderAdhoc(
         shadow_intensity = np.broadcast_to(cos_t[None, :], (h, w))
         shadow_map = np.clip(shadow_intensity * 0.6 + 0.4, 0, 1)
         shadow_map = (shadow_map * 255).astype(np.uint8)
-        specular_map = extract_specular_from_mockup(mockup)
 
         config = _build_default_adhoc_config(w, h)
         config = _merge_adhoc_user_config(config, config_json)
+        lighting_cfg = config.get("lighting", {})
+        specular_strength = float(lighting_cfg.get("specular_strength", 0.0))
+        if specular_strength > 0:
+            specular_threshold = int(lighting_cfg.get("specular_threshold", 220))
+            specular_map = extract_specular_from_mockup(mockup, threshold=specular_threshold)
+        else:
+            specular_map = np.zeros((h, w), dtype=np.float32)
         logging.getLogger("mockup_service").info(
             "render-adhoc effective warp: theta_max_deg=%s curve_top=%s curve_bottom=%s pitch=%s",
             config.get("cylinder", {}).get("theta_max_deg"),
@@ -393,73 +538,30 @@ async def renderAdhoc(
 
 @router.post("/mockup/warp-preview")
 async def renderWarpPreview(req: WarpPreviewRequest):
-    from app.pipeline.clothes.tps_warp import tps_warp_design
-    from app.pipeline.mugs.cylindrical_warp import cylindrical_warp
-
-    w, h = req.mockup_width, req.mockup_height
-    pa = {
-        "top_left": req.print_area["top_left"],
-        "top_right": req.print_area["top_right"],
-        "bottom_right": req.print_area["bottom_right"],
-        "bottom_left": req.print_area["bottom_left"],
-    }
-
     design_canvas = _build_preview_design_canvas(400)
-    design_canvas = apply_design_transform(
-        design_canvas,
-        scale=req.design_scale,
-        offset_x=req.design_offset_x,
-        offset_y=req.design_offset_y,
-    )
+    warped = _render_warp_preview_image(req, design_canvas)
 
-    if req.warp_type == "cylinder":
-        smile_val = float(req.curve)
-        pitch_val = float(req.print_area.get("camera_elevation", 0))
-        warped = cylindrical_warp(
-            design_canvas,
-            pa,
-            (w, h),
-            req.theta_max_deg,
-            pitch_val,
-            smile_val,
-            req.curve_top,
-            req.curve_bottom,
-        )
-    elif req.warp_type == "tps":
-        src_pts_px = np.float32(req.print_area.get("mesh_control_src", []))
-        dst_pts = np.float32(req.print_area.get("mesh_control_dst", []))
-        if len(src_pts_px) >= 3 and len(src_pts_px) == len(dst_pts):
-            base = cv2.warpPerspective(
-                design_canvas,
-                cv2.getPerspectiveTransform(
-                    np.float32([[0, 0], [399, 0], [399, 399], [0, 399]]),
-                    np.float32([pa["top_left"], pa["top_right"], pa["bottom_right"], pa["bottom_left"]]),
-                ),
-                (w, h),
-            )
-            warped = tps_warp_design(base, src_pts_px, dst_pts, (w, h))
-        else:
-            warped = cv2.warpPerspective(
-                design_canvas,
-                cv2.getPerspectiveTransform(
-                    np.float32([[0, 0], [400, 0], [400, 400], [0, 400]]),
-                    np.float32([pa["top_left"], pa["top_right"], pa["bottom_right"], pa["bottom_left"]]),
-                ),
-                (w, h),
-            )
-    else:
-        warped = cv2.warpPerspective(
-            design_canvas,
-            cv2.getPerspectiveTransform(
-                np.float32([[0, 0], [400, 0], [400, 400], [0, 400]]),
-                np.float32([pa["top_left"], pa["top_right"], pa["bottom_right"], pa["bottom_left"]]),
-            ),
-            (w, h),
-        )
+    ok, buf = cv2.imencode(".png", warped)
+    if not ok:
+        raise HTTPException(status_code=500, detail="encode_failed")
+    return Response(content=bytes(buf), media_type="image/png", headers={"Cache-Control": "no-cache"})
 
-    if req.mask_points and warped.shape[2] == 4:
-        mask_to_use = create_soft_mask(req.mask_points, (h, w), feather_radius=2)
-        warped[:, :, 3] = cv2.bitwise_and(warped[:, :, 3], mask_to_use)
+
+@router.post("/mockup/warp-preview-file")
+async def renderWarpPreviewFile(
+    config_json: str = Form(...),
+    design_image: UploadFile = File(...),
+):
+    try:
+        payload = json.loads(config_json)
+        req = WarpPreviewRequest(**payload)
+        design_bytes = await design_image.read()
+        design_canvas = decode_design(design_bytes)
+        warped = _render_warp_preview_image(req, design_canvas)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     ok, buf = cv2.imencode(".png", warped)
     if not ok:

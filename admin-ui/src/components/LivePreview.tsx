@@ -51,17 +51,37 @@ export default function LivePreview() {
         url = '/v1/mockup/render'
       } else {
         formData.append('mockup_image', mockupFile!)
+        formData.append('output_format', 'png')
         const liveSnapshot = liveEditorSnapshotRef.current
         const effectivePrintArea = liveSnapshot?.printArea || lockedSnapshot?.printArea || printArea
         const effectiveWarp = liveSnapshot?.warpConfig || lockedSnapshot?.warpConfig || warpConfigObj
         if (effectivePrintArea) {
+          const isCylinderProduct = String(effectiveWarp?.product_type || productType).startsWith('cylinder')
           console.info('[Gen Mockup] effective adhoc payload', {
             print_area: effectivePrintArea,
             warp: effectiveWarp,
           })
           const configJson = {
             print_area: effectivePrintArea,
-            warp: effectiveWarp
+            warp: effectiveWarp,
+            ...(isCylinderProduct ? {
+              color: {
+                enable_color_match: false,
+                match_strength: 0,
+              },
+              lighting: {
+                shadow_strength: 0,
+                displacement_strength: 0,
+                specular_strength: 0,
+                specular_threshold: 245,
+              },
+              edge: {
+                feather_px: 0,
+              },
+              render: {
+                preserve_original_color: true,
+              },
+            } : {}),
           }
           formData.append('config_json', JSON.stringify(configJson))
         }
@@ -283,6 +303,7 @@ export default function LivePreview() {
               <div style={{ flex: 1, minWidth: 0, overflow: 'hidden' }}>
                 <PrintAreaEditor 
                   imageUrl={mockupPreviewUrl} 
+                  designFile={designFile}
                   productTypeProp={productType}
                   onProductTypeChange={setProductType}
                   initialPrintArea={printArea}
@@ -305,7 +326,7 @@ export default function LivePreview() {
               <aside
                 className="glass-panel"
                 style={{
-                  width: '360px',
+                  width: '550px',
                   minWidth: '320px',
                   borderLeft: '1px solid var(--border-color)',
                   background: 'rgba(10, 16, 28, 0.85)',

@@ -5,6 +5,7 @@ import { WarpGridPreview } from './WarpGridPreview';
 interface Point { x: number; y: number; }
 interface PrintAreaEditorProps {
   imageUrl: string;
+  designFile?: File | null;
   warpConfig: any;
   initialPrintArea?: any;
   onCoordinatesChange: (data: any) => void;
@@ -134,7 +135,7 @@ function toFiniteNumber(input: any, fallback: number): number {
 // ─── Component ───────────────────────────────────────────────────────────────
 
 export default function PrintAreaEditor(props: PrintAreaEditorProps) {
-  const { imageUrl, warpConfig, initialPrintArea, onCoordinatesChange, onConfigChange, onLockedSnapshotChange, onLiveSnapshotChange, productTypeProp, onProductTypeChange } = props;
+  const { imageUrl, designFile, warpConfig, initialPrintArea, onCoordinatesChange, onConfigChange, onLockedSnapshotChange, onLiveSnapshotChange, productTypeProp, onProductTypeChange } = props;
   
   const [basePoints, setBasePoints] = useState<Point[]>([
     { x: 0.22, y: 0.14 }, { x: 0.78, y: 0.14 },
@@ -183,6 +184,7 @@ export default function PrintAreaEditor(props: PrintAreaEditorProps) {
   const didRestoreRef = useRef(false);
 
   const containerRef = useRef<HTMLDivElement>(null);
+  const overlayAlphaCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const calibPts = applyCalibration(basePoints, tilt, rotate, perspective);
 
   const W_px = Math.abs(calibPts[1].x - calibPts[0].x) * (naturalSize.w || 1000);
@@ -197,6 +199,7 @@ export default function PrintAreaEditor(props: PrintAreaEditorProps) {
   const pitchHandle = apply_homography(H_mat, localPitch.x, localPitch.y);
   const showBackendOverlay = Boolean(previewOverlayUrl);
   const showEditorGridLayer = showGrid && editorMode === 'CALIBRATE';
+  const canDragArtwork = Boolean(designFile) && (editorMode === 'DESIGN' || activeMode === 'calibrate');
 
   useEffect(() => {
     fetch('/v1/render/device')
@@ -207,6 +210,32 @@ export default function PrintAreaEditor(props: PrintAreaEditorProps) {
       })
       .catch(() => {});
   }, []);
+
+  useEffect(() => {
+    if (!previewOverlayUrl) {
+      overlayAlphaCanvasRef.current = null;
+      return;
+    }
+
+    let cancelled = false;
+    const img = new Image();
+    img.onload = () => {
+      if (cancelled) return;
+      const canvas = document.createElement('canvas');
+      canvas.width = img.naturalWidth || img.width;
+      canvas.height = img.naturalHeight || img.height;
+      const ctx = canvas.getContext('2d');
+      if (!ctx) return;
+      ctx.drawImage(img, 0, 0);
+      overlayAlphaCanvasRef.current = canvas;
+    };
+    img.src = previewOverlayUrl;
+
+    return () => {
+      cancelled = true;
+      overlayAlphaCanvasRef.current = null;
+    };
+  }, [previewOverlayUrl]);
 
   useEffect(() => {
     return () => {
@@ -380,23 +409,38 @@ export default function PrintAreaEditor(props: PrintAreaEditorProps) {
       const templateIdMatch = imageUrl.match(/\/templates\/([^/]+)\//);
       const templateId = templateIdMatch ? templateIdMatch[1] : null;
 
-      fetch('/v1/mockup/warp-preview', {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          mockup_width: naturalSize.w, mockup_height: naturalSize.h,
-          print_area: pa,
-          warp_type: meshPoints.length > 0 ? 'tps' : 'cylinder',
-          theta_max_deg: curvePct * 0.9,
-          curve: (smile_api / 100) * hr_ratio * 0.15,
-          curve_top: curveTop,
-          curve_bottom: curveBot,
-          design_scale: designScale,
-          design_offset_x: designOffsetX,
-          design_offset_y: designOffsetY,
-          mask_points: pa.mask_points,
-          template_id: templateId,
-        }),
-      })
+      const payload = {
+        mockup_width: naturalSize.w, mockup_height: naturalSize.h,
+        print_area: pa,
+        warp_type: meshPoints.length > 0 ? 'tps' : 'cylinder',
+        theta_max_deg: curvePct * 0.9,
+        curve: (smile_api / 100) * hr_ratio * 0.15,
+        curve_top: curveTop,
+        curve_bottom: curveBot,
+        design_scale: designScale,
+        design_offset_x: designOffsetX,
+        design_offset_y: designOffsetY,
+        mask_points: pa.mask_points,
+        template_id: templateId,
+      };
+
+      const request = designFile
+        ? (() => {
+            const formData = new FormData();
+            formData.append('config_json', JSON.stringify(payload));
+            formData.append('design_image', designFile);
+            return fetch('/v1/mockup/warp-preview-file', {
+              method: 'POST',
+              body: formData,
+            });
+          })()
+        : fetch('/v1/mockup/warp-preview', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload),
+          });
+
+      request
         .then(async r => {
           if (!r.ok) {
             const err = await r.json().catch(() => ({}));
@@ -412,7 +456,7 @@ export default function PrintAreaEditor(props: PrintAreaEditorProps) {
         });
     }, 400);
     return () => clearTimeout(timer);
-  }, [basePoints, tilt, rotate, perspective, curvePct, curveTop, curveBot, designScale, designOffsetX, designOffsetY, featherRadius, productType, maskPoints, meshPoints, naturalSize, editorMode]);
+  }, [basePoints, tilt, rotate, perspective, curvePct, curveTop, curveBot, designScale, designOffsetX, designOffsetY, featherRadius, productType, maskPoints, meshPoints, naturalSize, editorMode, imageUrl, designFile]);
 
   const lastPointerPos = useRef({ x: 0, y: 0 });
 
@@ -423,19 +467,26 @@ export default function PrintAreaEditor(props: PrintAreaEditorProps) {
     (e.currentTarget as Element).setPointerCapture(e.pointerId);
   };
 
+  const handleArtworkPointerDown = (e: React.PointerEvent<HTMLImageElement>) => {
+    if (!canDragArtwork) return;
+    const alphaCanvas = overlayAlphaCanvasRef.current;
+    if (!alphaCanvas) return;
+
+    const rect = e.currentTarget.getBoundingClientRect();
+    if (rect.width <= 0 || rect.height <= 0) return;
+
+    const sampleX = Math.max(0, Math.min(alphaCanvas.width - 1, Math.round(((e.clientX - rect.left) / rect.width) * (alphaCanvas.width - 1))));
+    const sampleY = Math.max(0, Math.min(alphaCanvas.height - 1, Math.round(((e.clientY - rect.top) / rect.height) * (alphaCanvas.height - 1))));
+    const ctx = alphaCanvas.getContext('2d');
+    const alpha = ctx?.getImageData(sampleX, sampleY, 1, 1).data[3] ?? 0;
+    if (alpha < 12) return;
+
+    handlePointerDown('design', 0, e);
+  };
+
   const handlePointerMove = useCallback((e: React.PointerEvent) => {
     if (!containerRef.current) return;
     const r = containerRef.current.getBoundingClientRect();
-    if (!draggingIdx && e.buttons === 1) {
-      if (editorMode === 'DESIGN' || activeMode === 'calibrate') {
-        const dx = (e.clientX - lastPointerPos.current.x) / (r.width * zoom);
-        const dy = (e.clientY - lastPointerPos.current.y) / (r.height * zoom);
-        setDesignOffsetX(prev => prev + dx);
-        setDesignOffsetY(prev => prev + dy);
-      }
-      lastPointerPos.current = { x: e.clientX, y: e.clientY };
-      return;
-    }
     if (!draggingIdx) {
       lastPointerPos.current = { x: e.clientX, y: e.clientY };
       return;
@@ -446,6 +497,11 @@ export default function PrintAreaEditor(props: PrintAreaEditorProps) {
     const y = Math.max(0, Math.min(1, rawY));
     if (draggingIdx.type === 'base') {
       const next = [...basePoints]; next[draggingIdx.id] = { x, y }; setBasePoints(next);
+    } else if (draggingIdx.type === 'design') {
+      const dx = (e.clientX - lastPointerPos.current.x) / (r.width * zoom);
+      const dy = (e.clientY - lastPointerPos.current.y) / (r.height * zoom);
+      setDesignOffsetX(prev => Math.max(-1, Math.min(1, prev + dx)));
+      setDesignOffsetY(prev => Math.max(-1, Math.min(1, prev + dy)));
     } else if (draggingIdx.type === 'mask') {
       const next = [...maskPoints]; next[draggingIdx.id] = { x, y }; setMaskPoints(next);
     } else if (draggingIdx.type === 'mesh') {
@@ -466,13 +522,13 @@ export default function PrintAreaEditor(props: PrintAreaEditorProps) {
       if (curvePct === 0) setCurvePct(60);
     }
     lastPointerPos.current = { x: e.clientX, y: e.clientY };
-  }, [draggingIdx, editorMode, zoom, pan, basePoints, maskPoints, meshPoints, calibPts, H_px, naturalSize, curvePct, activeMode]);
+  }, [draggingIdx, zoom, pan, basePoints, maskPoints, meshPoints, calibPts, H_px, naturalSize, curvePct]);
 
   const handleWheel = (e: React.WheelEvent) => {
     e.preventDefault();
     const delta = -e.deltaY;
     const factor = delta > 0 ? 1.1 : 0.9;
-    if (editorMode === 'DESIGN') {
+    if (designFile && !e.altKey) {
       setDesignScale(prev => Math.max(0.1, Math.min(5, prev * factor)));
     } else {
       setZoom(prev => Math.max(0.5, Math.min(10, prev * factor)));
@@ -577,6 +633,7 @@ export default function PrintAreaEditor(props: PrintAreaEditorProps) {
     if (editorMode === 'DESIGN') return (
       <div className="ctrl-section">
         {productSelector}
+        {designFile && <p className="mode-hint">Kéo trực tiếp trên artwork 2D để đổi vị trí. Lăn chuột để zoom artwork, `Alt + wheel` để zoom canvas.</p>}
         <div className="ctrl-header"><span className="ctrl-label">Design Transformation</span></div>
         <div className="ctrl-grid">
           <Slider label="Artwork Scale" value={designScale} min={0.1} max={5} step={0.01} unit="x" onChange={setDesignScale} />
@@ -596,6 +653,7 @@ export default function PrintAreaEditor(props: PrintAreaEditorProps) {
     return (
       <div className="ctrl-section">
         {productSelector}
+        {designFile && activeMode === 'calibrate' && <p className="mode-hint">Artwork là ảnh ngang 2D. Kéo chỉ tác động lên artwork, không kéo mockup gốc.</p>}
         <div className="group-tabs">
           {availableGroups.map(g => (
             <button key={g} className={`group-tab ${activeGroup === g ? 'active' : ''}`} onClick={() => setActiveGroup(g)}>
@@ -663,14 +721,15 @@ export default function PrintAreaEditor(props: PrintAreaEditorProps) {
         </aside>
 
         <main className="canvas-section">
-          <div className="canvas-wrap" ref={containerRef} onPointerMove={handlePointerMove} onPointerUp={() => setDraggingIdx(null)} onWheel={handleWheel} onMouseDown={handleContainerMouseDown} onMouseMove={handleContainerMouseMove} onMouseUp={handleContainerMouseUp} onMouseLeave={handleContainerMouseUp} onClick={handleCanvasClick} style={{ cursor: isPanning ? 'grabbing' : (activeMode !== 'calibrate' ? 'crosshair' : 'default'), overflow: 'hidden' }}>
+          <div className="canvas-wrap" ref={containerRef} onPointerMove={handlePointerMove} onPointerUp={() => setDraggingIdx(null)} onWheel={handleWheel} onMouseDown={handleContainerMouseDown} onMouseMove={handleContainerMouseMove} onMouseUp={handleContainerMouseUp} onMouseLeave={handleContainerMouseUp} onClick={handleCanvasClick} style={{ cursor: isPanning || draggingIdx?.type === 'design' ? 'grabbing' : (canDragArtwork ? 'grab' : (activeMode !== 'calibrate' ? 'crosshair' : 'default')), overflow: 'hidden' }}>
             <div className="canvas-container" style={{ transform: `translate(${pan.x}px, ${pan.y}px) scale(${zoom})`, transformOrigin: '0 0', width: '100%', height: '100%', position: 'relative', ['--zoom' as any]: zoom }}>
                 <img src={imageUrl} alt="Mockup" className="mockup-img" onLoad={e => setNaturalSize({ w: e.currentTarget.naturalWidth, h: e.currentTarget.naturalHeight })} />
                 {showBackendOverlay && previewOverlayUrl && (
                   <img
                     src={previewOverlayUrl}
-                    className={`overlay-img ${editorMode === 'CALIBRATE' ? 'overlay-img-calibrate' : 'overlay-img-design'}`}
+                    className={`overlay-img ${editorMode === 'CALIBRATE' ? 'overlay-img-calibrate' : 'overlay-img-design'} ${designFile ? 'overlay-img-original-color' : ''} ${canDragArtwork ? 'overlay-img-interactive' : ''}`}
                     alt=""
+                    onPointerDown={handleArtworkPointerDown}
                   />
                 )}
                 <svg className="overlay-svg" viewBox="0 0 100 100" preserveAspectRatio="none">
@@ -808,6 +867,9 @@ export default function PrintAreaEditor(props: PrintAreaEditorProps) {
         }
         .overlay-img-calibrate { opacity: 0.78; }
         .overlay-img-design { opacity: 1; }
+        .overlay-img-original-color { opacity: 1; }
+        .overlay-img-interactive { pointer-events: auto; cursor: grab; }
+        .overlay-img-interactive:active { cursor: grabbing; }
         .overlay-svg {
           position: absolute; top: 0; left: 0; width: 100%; height: 100%;
           pointer-events: none; z-index: 10;

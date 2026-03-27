@@ -1,6 +1,6 @@
 import numpy as np
 from ..shared.decode      import decode_design
-from ..shared.design_transform import apply_design_transform
+from ..shared.design_transform import apply_design_transform, estimate_print_area_canvas_size
 from ..shared.color_match import apply_color_match
 from ..shared.composite   import composite
 from .cylindrical_warp    import cylindrical_warp
@@ -35,15 +35,24 @@ def run_mug_pipeline(
     """
     cfg = assets.config
     l   = cfg.get("lighting", {})
+    render_cfg = cfg.get("render", {})
+    preserve_original_color = bool(render_cfg.get("preserve_original_color", False))
     W, H = assets.mockup.shape[1], assets.mockup.shape[0]
 
     design = decode_design(design_bytes)
     dt = cfg.get("design_transform", {})
+    canvas_w, canvas_h = estimate_print_area_canvas_size(
+        cfg.get("print_area"),
+        fallback_width=design.shape[1],
+        fallback_height=design.shape[0],
+    )
     design = apply_design_transform(
         design,
         scale=dt.get("scale", 1.0),
         offset_x=dt.get("offset_x", 0.0),
         offset_y=dt.get("offset_y", 0.0),
+        target_width=canvas_w,
+        target_height=canvas_h,
     )
 
     # [1] Cylindrical warp — đặc thù mug
@@ -60,17 +69,19 @@ def run_mug_pipeline(
     )
 
     # [2] Color match
-    if cfg.get("color", {}).get("enable_color_match", True):
+    if (not preserve_original_color) and cfg.get("color", {}).get("enable_color_match", True):
         warped = apply_color_match(
             warped, assets.mockup, assets.mask,
             strength=cfg["color"].get("match_strength", 0.40),
         )
 
     # [3] Shadow — Overlay cho men sứ
-    warped = apply_shadow_overlay(
-        warped, assets.shadow_map,
-        strength=l.get("shadow_strength", 0.45),
-    )
+    shadow_strength = float(l.get("shadow_strength", 0.45))
+    if (not preserve_original_color) and shadow_strength > 0:
+        warped = apply_shadow_overlay(
+            warped, assets.shadow_map,
+            strength=shadow_strength,
+        )
 
     # [4] Composite
     result = composite(
@@ -79,10 +90,11 @@ def run_mug_pipeline(
     )
 
     # [5] Specular Phong — chỉ mug
-    if l.get("specular_strength", 0) > 0:
+    specular_strength = float(l.get("specular_strength", 0))
+    if (not preserve_original_color) and specular_strength > 0:
         result = apply_specular_gloss(
             result, assets.specular_map,
-            strength=l.get("specular_strength", 0.30),
+            strength=specular_strength,
             shininess=l.get("shininess", 20.0),
         )
 

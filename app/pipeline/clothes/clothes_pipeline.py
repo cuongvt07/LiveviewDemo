@@ -6,7 +6,7 @@ import numpy as np
 from ..shared.color_match import apply_color_match
 from ..shared.composite import composite
 from ..shared.decode import decode_design
-from ..shared.design_transform import apply_design_transform
+from ..shared.design_transform import apply_design_transform, estimate_print_area_canvas_size
 from .tps_warp import tps_warp_design
 from .wrinkle_lighting import apply_fabric_multiply
 
@@ -38,11 +38,18 @@ def run_clothes_pipeline(
 
     design = decode_design(design_bytes)
     dt = cfg.get("design_transform", {})
+    canvas_w, canvas_h = estimate_print_area_canvas_size(
+        cfg.get("print_area"),
+        fallback_width=design.shape[1],
+        fallback_height=design.shape[0],
+    )
     design = apply_design_transform(
         design,
         scale=dt.get("scale", 1.0),
         offset_x=dt.get("offset_x", 0.0),
         offset_y=dt.get("offset_y", 0.0),
+        target_width=canvas_w,
+        target_height=canvas_h,
     )
 
     mesh = cfg.get("mesh", {})
