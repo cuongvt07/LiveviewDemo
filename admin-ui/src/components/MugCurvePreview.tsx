@@ -1,0 +1,238 @@
+import React from 'react';
+
+interface Point {
+  x: number;
+  y: number;
+}
+
+interface MugCurvePreviewProps {
+  calibPts: Point[];
+  curvePct: number;
+  curveTop: number;
+  curveBot: number;
+  hPx: number;
+  wPx: number;
+  showGrid: boolean;
+  onSmileDrag: (y: number) => void;
+  onPitchDrag: (y: number) => void;
+}
+
+function solve_homography(src: Point[], dst: Point[]): number[] {
+  const A: number[][] = [];
+  const b: number[] = [];
+  for (let i = 0; i < 4; i++) {
+    const { x: sx, y: sy } = src[i];
+    const { x: dx, y: dy } = dst[i];
+    A.push([sx, sy, 1, 0, 0, 0, -sx * dx, -sy * dx]);
+    b.push(dx);
+    A.push([0, 0, 0, sx, sy, 1, -sx * dy, -sy * dy]);
+    b.push(dy);
+  }
+  const n = 8;
+  for (let i = 0; i < n; i++) {
+    let max = i;
+    for (let j = i + 1; j < n; j++) if (Math.abs(A[j][i]) > Math.abs(A[max][i])) max = j;
+    [A[i], A[max]] = [A[max], A[i]];
+    [b[i], b[max]] = [b[max], b[i]];
+    for (let j = i + 1; j < n; j++) {
+      const f = A[j][i] / A[i][i];
+      b[j] -= f * b[i];
+      for (let k = i; k < n; k++) A[j][k] -= f * A[i][k];
+    }
+  }
+  const h = new Array(8).fill(0);
+  for (let i = n - 1; i >= 0; i--) {
+    let sum = 0;
+    for (let j = i + 1; j < n; j++) sum += A[i][j] * h[j];
+    h[i] = (b[i] - sum) / A[i][i];
+  }
+  return [...h, 1];
+}
+
+function apply_homography(H: number[], u: number, v: number): Point {
+  const x = u * 2 - 1;
+  const y = v * 2 - 1;
+  const w = H[6] * x + H[7] * y + H[8];
+  return {
+    x: (H[0] * x + H[1] * y + H[2]) / w,
+    y: (H[3] * x + H[4] * y + H[5]) / w,
+  };
+}
+
+function cylinderWarpPoint(
+  u: number,
+  v: number,
+  curvePct: number,
+  curveTop: number,
+  curveBot: number,
+  hPx: number,
+  wPx: number
+): Point {
+  const thetaMaxDeg = curvePct * 0.9;
+  if (thetaMaxDeg <= 0.001) return { x: u, y: v };
+  const thetaMax = (thetaMaxDeg * Math.PI) / 180;
+  const nx = (u - 0.5) * 2;
+
+  const sinThetaMax = Math.sin(thetaMax);
+  const sinTheta = Math.max(-1, Math.min(1, nx * sinThetaMax));
+  const theta = Math.asin(sinTheta);
+  const wx = (theta / thetaMax + 1) * 0.5;
+
+  const hr_ratio = hPx / (wPx + 1e-8);
+  const cosDisplacement = Math.cos(theta) - Math.cos(thetaMax);
+  const yProj = (v - 0.5) * 2;
+  const curveAtPixel = (curveTop / 100) * (1 - v) + (curveBot / 100) * v;
+  const sign = -yProj;
+  const wy_canon = yProj + sign * curveAtPixel * hr_ratio * 0.15 * cosDisplacement;
+  const wy = (wy_canon + 1) * 0.5;
+  return { x: Math.max(0, Math.min(1, wx)), y: Math.max(-0.5, Math.min(1.5, wy)) };
+}
+
+function coonsFromBoundary(
+  u: number,
+  v: number,
+  edgeAt: {
+    top: (uu: number) => Point;
+    bottom: (uu: number) => Point;
+    left: (vv: number) => Point;
+    right: (vv: number) => Point;
+    c00: Point;
+    c10: Point;
+    c01: Point;
+    c11: Point;
+  }
+): Point {
+  const t = edgeAt.top(u);
+  const b = edgeAt.bottom(u);
+  const l = edgeAt.left(v);
+  const r = edgeAt.right(v);
+  const { c00, c10, c01, c11 } = edgeAt;
+
+  const x =
+    (1 - v) * t.x +
+    v * b.x +
+    (1 - u) * l.x +
+    u * r.x -
+    ((1 - u) * (1 - v) * c00.x + u * (1 - v) * c10.x + (1 - u) * v * c01.x + u * v * c11.x);
+  const y =
+    (1 - v) * t.y +
+    v * b.y +
+    (1 - u) * l.y +
+    u * r.y -
+    ((1 - u) * (1 - v) * c00.y + u * (1 - v) * c10.y + (1 - u) * v * c01.y + u * v * c11.y);
+  return { x, y };
+}
+
+export const MugCurvePreview: React.FC<MugCurvePreviewProps> = ({
+  calibPts,
+  curvePct,
+  curveTop,
+  curveBot,
+  hPx,
+  wPx,
+  showGrid,
+}) => {
+  const srcCanon = [
+    { x: -1, y: -1 },
+    { x: 1, y: -1 },
+    { x: 1, y: 1 },
+    { x: -1, y: 1 },
+  ];
+  const hMat = solve_homography(srcCanon, calibPts);
+
+  const worldAt = (u: number, v: number): Point => {
+    const wLocal = cylinderWarpPoint(u, v, curvePct, curveTop, curveBot, hPx, wPx);
+    return apply_homography(hMat, wLocal.x, wLocal.y);
+  };
+
+  const edgeAt = {
+    top: (u: number) => worldAt(u, 0),
+    bottom: (u: number) => worldAt(u, 1),
+    left: (v: number) => worldAt(0, v),
+    right: (v: number) => worldAt(1, v),
+    c00: worldAt(0, 0),
+    c10: worldAt(1, 0),
+    c01: worldAt(0, 1),
+    c11: worldAt(1, 1),
+  };
+
+  const patchAt = (u: number, v: number) => coonsFromBoundary(u, v, edgeAt);
+
+  const pathSamples = 36;
+  const pathParts: string[] = [];
+  for (let i = 0; i <= pathSamples; i++) {
+    const u = i / pathSamples;
+    const p = patchAt(u, 0);
+    pathParts.push(i === 0 ? `M ${p.x * 100},${p.y * 100}` : `L ${p.x * 100},${p.y * 100}`);
+  }
+  for (let i = pathSamples; i >= 0; i--) {
+    const u = i / pathSamples;
+    const p = patchAt(u, 1);
+    pathParts.push(`L ${p.x * 100},${p.y * 100}`);
+  }
+  pathParts.push('Z');
+  const boundaryPath = pathParts.join(' ');
+
+  const cols = 12;
+  const rows = 10;
+  const lineSamples = 24;
+
+  return (
+    <g className="mug-curve-preview">
+      <defs>
+        <clipPath id="mug-clip-unified">
+          <path d={boundaryPath} />
+        </clipPath>
+      </defs>
+
+      {showGrid && (
+        <g clipPath="url(#mug-clip-unified)">
+          {Array.from({ length: rows }).flatMap((_, r) =>
+            Array.from({ length: cols }).map((__, c) => {
+              const u0 = c / cols;
+              const u1 = (c + 1) / cols;
+              const v0 = r / rows;
+              const v1 = (r + 1) / rows;
+              const p00 = patchAt(u0, v0);
+              const p10 = patchAt(u1, v0);
+              const p11 = patchAt(u1, v1);
+              const p01 = patchAt(u0, v1);
+              const pts = [
+                `${p00.x * 100},${p00.y * 100}`,
+                `${p10.x * 100},${p10.y * 100}`,
+                `${p11.x * 100},${p11.y * 100}`,
+                `${p01.x * 100},${p01.y * 100}`,
+              ].join(' ');
+              const fill = (r + c) % 2 === 0 ? 'rgba(255,255,255,0.15)' : 'rgba(0,0,0,0.07)';
+              return <polygon key={`cell-${r}-${c}`} points={pts} fill={fill} stroke="none" />;
+            })
+          )}
+
+          {Array.from({ length: cols + 1 }).map((_, ci) => {
+            const u = ci / cols;
+            const line: string[] = [];
+            for (let s = 0; s <= lineSamples; s++) {
+              const v = s / lineSamples;
+              const p = patchAt(u, v);
+              line.push(`${s === 0 ? 'M' : 'L'} ${p.x * 100},${p.y * 100}`);
+            }
+            return <path key={`gv-${ci}`} d={line.join(' ')} className="grid-line" />;
+          })}
+
+          {Array.from({ length: rows + 1 }).map((_, ri) => {
+            const v = ri / rows;
+            const line: string[] = [];
+            for (let s = 0; s <= lineSamples; s++) {
+              const u = s / lineSamples;
+              const p = patchAt(u, v);
+              line.push(`${s === 0 ? 'M' : 'L'} ${p.x * 100},${p.y * 100}`);
+            }
+            return <path key={`gh-${ri}`} d={line.join(' ')} className="grid-line" />;
+          })}
+        </g>
+      )}
+
+      <path d={boundaryPath} className="grid-boundary-unified" fill="transparent" />
+    </g>
+  );
+};

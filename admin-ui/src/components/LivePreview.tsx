@@ -1,4 +1,4 @@
-import { useState, useEffect, useMemo } from 'react'
+import { useState, useEffect, useMemo, useRef } from 'react'
 import PrintAreaEditor from './PrintAreaEditor'
 
 export default function LivePreview() {
@@ -11,6 +11,10 @@ export default function LivePreview() {
   const [mockupFile, setMockupFile] = useState<File | null>(null)
   const [printArea, setPrintArea] = useState<any>(null)
   const [warpConfigObj, setWarpConfigObj] = useState<any>({ warp_type: 'cylinder', theta_max_deg: 52, curve: 0.15 })
+  const [lockedSnapshot, setLockedSnapshot] = useState<{ printArea: any; warpConfig: any } | null>(null)
+  const liveEditorSnapshotRef = useRef<{ printArea: any; warpConfig: any } | null>(null)
+  const [showEditor, setShowEditor] = useState(false)
+  const [productType, setProductType] = useState('') // Initial empty state to enforce selection
   
   // Results
   const [previewUrl, setPreviewUrl] = useState<string | null>(null)
@@ -47,10 +51,17 @@ export default function LivePreview() {
         url = '/v1/mockup/render'
       } else {
         formData.append('mockup_image', mockupFile!)
-        if (printArea) {
+        const liveSnapshot = liveEditorSnapshotRef.current
+        const effectivePrintArea = liveSnapshot?.printArea || lockedSnapshot?.printArea || printArea
+        const effectiveWarp = liveSnapshot?.warpConfig || lockedSnapshot?.warpConfig || warpConfigObj
+        if (effectivePrintArea) {
+          console.info('[Gen Mockup] effective adhoc payload', {
+            print_area: effectivePrintArea,
+            warp: effectiveWarp,
+          })
           const configJson = {
-            print_area: printArea,
-            warp: warpConfigObj
+            print_area: effectivePrintArea,
+            warp: effectiveWarp
           }
           formData.append('config_json', JSON.stringify(configJson))
         }
@@ -87,6 +98,7 @@ export default function LivePreview() {
   }
 
   const isValid = designFile && (mode === 'template' ? selectedTemplate !== '' : mockupFile !== null)
+  const hasEffectivePrintArea = Boolean(liveEditorSnapshotRef.current?.printArea || lockedSnapshot?.printArea || printArea)
 
   return (
     <div style={{ display: 'flex', gap: '2rem', height: '100%' }}>
@@ -125,30 +137,72 @@ export default function LivePreview() {
             </select>
           </div>
         ) : (
-          <div className="input-group">
-            <label className="input-label">Upload Base Mockup (Phôi)</label>
-            <input 
-              type="file" 
-              accept="image/png, image/jpeg" 
-              className="input-field"
-              onChange={e => setMockupFile(e.target.files?.[0] || null)}
-            />
-            
-            {mockupPreviewUrl && (
-              <div style={{ marginTop: '1rem' }}>
-                <PrintAreaEditor 
-                  imageUrl={mockupPreviewUrl} 
-                  warpConfig={{
-                    ...warpConfigObj,
-                    tilt_deg: warpConfigObj.tilt_deg || 0,
-                    rotate_deg: warpConfigObj.rotate_deg || 0,
-                    persp_strength: warpConfigObj.persp_strength || 0
-                  }}
-                  onCoordinatesChange={setPrintArea}
-                  onConfigChange={(newConfig) => {
-                    setWarpConfigObj((prev: any) => ({ ...prev, ...newConfig }));
-                  }}
-                />
+          <div className="adhoc-workflow">
+            {/* STEP 1: MODULE SELECTION */}
+            <div className="input-group" style={{ border: '1px solid var(--accent-color)', padding: '1rem', borderRadius: '8px', marginBottom: '1.5rem' }}>
+              <label className="input-label" style={{ color: 'var(--accent-color)', fontWeight: 'bold' }}>Step 1: Chọn loại sản phẩm (Module)</label>
+              <select 
+                className="input-field" 
+                value={productType} 
+                onChange={e => {
+                  setProductType(e.target.value);
+                  // Reset if module changes
+                  setPrintArea(null);
+                  setLockedSnapshot(null);
+                  liveEditorSnapshotRef.current = null;
+                  setMockupFile(null);
+                }}
+              >
+                <option value="">-- Chọn Module --</option>
+                <optgroup label="🍵 MUGS MODULE (Cylindrical Warp)">
+                  <option value="cylinder_ceramic">Ceramic Mug</option>
+                  <option value="cylinder_glass">Glass Mug</option>
+                  <option value="cylinder_travel">Travel Mug</option>
+                </optgroup>
+                <optgroup label="👕 CLOTHES MODULE (TPS Warp)">
+                  <option value="apparel_cotton">T-Shirt</option>
+                  <option value="apparel_hoodie">Hoodie</option>
+                  <option value="apparel_totebag">Tote Bag</option>
+                </optgroup>
+                <optgroup label="🖼 OTHER">
+                  <option value="flat_print">Flat Print</option>
+                  <option value="plastic_case">Phone Case</option>
+                </optgroup>
+              </select>
+            </div>
+
+            {/* STEP 2: UPLOAD (Only if Module selected) */}
+            {productType && (
+              <div className="input-group animate-in" style={{ padding: '1rem', background: 'rgba(255,255,255,0.03)', borderRadius: '8px' }}>
+                <label className="input-label" style={{ fontWeight: 'bold' }}>Step 2: Upload Base Mockup (Phôi)</label>
+                <div style={{ display: 'flex', gap: '0.5rem' }}>
+                  <input 
+                    type="file" 
+                    accept="image/png, image/jpeg" 
+                    className="input-field"
+                    onChange={e => {
+                      setMockupFile(e.target.files?.[0] || null);
+                      setLockedSnapshot(null);
+                      liveEditorSnapshotRef.current = null;
+                      if (e.target.files?.[0]) setShowEditor(true);
+                    }}
+                  />
+                  {mockupFile && (
+                    <button className="btn btn-outline" onClick={() => setShowEditor(true)} style={{ padding: '0.75rem' }}>
+                      Edit Area
+                    </button>
+                  )}
+                </div>
+                
+                {mockupFile && printArea ? (
+                  <div style={{ marginTop: '0.5rem', fontSize: '0.8rem', color: '#10b981' }}>
+                    ✓ Print Area & {productType.startsWith('cylinder') ? 'Curve' : 'Mesh'} Configured
+                  </div>
+                ) : mockupFile && (
+                  <div style={{ marginTop: '0.5rem', fontSize: '0.8rem', color: 'var(--accent-color)' }}>
+                    ⚠ Cần Calibrate Print Area
+                  </div>
+                )}
               </div>
             )}
           </div>
@@ -198,6 +252,105 @@ export default function LivePreview() {
           )}
         </div>
       </div>
+
+      {/* Fullscreen Editor Modal */}
+      {showEditor && mockupPreviewUrl && (
+        <div className="modal-overlay" style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.8)', zIndex: 1000, display: 'flex', alignItems: 'center', justifyItems: 'center', padding: '2rem' }}>
+          <div className="glass-panel" style={{ width: '100%', height: '100%', background: 'var(--bg-color)', display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
+            <div style={{ padding: '1rem', borderBottom: '1px solid var(--border-color)', display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: '1rem' }}>
+              <h3 style={{ margin: 0, whiteSpace: 'nowrap' }}>Calibrate Print Area & Mesh</h3>
+              <div style={{ display: 'flex', alignItems: 'center', gap: '0.75rem', flexWrap: 'wrap', justifyContent: 'flex-end' }}>
+                <label className="input-label" style={{ marginBottom: 0 }}>Upload Design (Artwork)</label>
+                <input
+                  type="file"
+                  accept="image/png, image/jpeg"
+                  className="input-field"
+                  style={{ width: '260px', maxWidth: '45vw' }}
+                  onChange={e => setDesignFile(e.target.files?.[0] || null)}
+                />
+                <button
+                  className="btn btn-primary"
+                  onClick={handleRender}
+                  disabled={loading || !designFile || !mockupFile || !hasEffectivePrintArea}
+                  title={!designFile ? 'Hãy upload artwork trước khi gen' : (!hasEffectivePrintArea ? 'Hãy chỉnh vùng in trước khi gen' : 'Gen ngay với lưới hiện tại')}
+                >
+                  {loading ? 'Đang Gen...' : 'Gen Mockup'}
+                </button>
+                <button className="btn btn-outline" onClick={() => setShowEditor(false)}>Done & Close</button>
+              </div>
+            </div>
+            <div style={{ flex: 1, overflow: 'hidden', display: 'flex', minHeight: 0 }}>
+              <div style={{ flex: 1, minWidth: 0, overflow: 'hidden' }}>
+                <PrintAreaEditor 
+                  imageUrl={mockupPreviewUrl} 
+                  productTypeProp={productType}
+                  onProductTypeChange={setProductType}
+                  initialPrintArea={printArea}
+                  warpConfig={{
+                    ...warpConfigObj,
+                    tilt_deg: warpConfigObj.tilt_deg || 0,
+                    rotate_deg: warpConfigObj.rotate_deg || 0,
+                    persp_strength: warpConfigObj.persp_strength || 0
+                  }}
+                  onCoordinatesChange={setPrintArea}
+                  onConfigChange={(newConfig) => {
+                    setWarpConfigObj((prev: any) => ({ ...prev, ...newConfig }));
+                  }}
+                  onLockedSnapshotChange={setLockedSnapshot}
+                  onLiveSnapshotChange={(snapshot) => {
+                    liveEditorSnapshotRef.current = snapshot;
+                  }}
+                />
+              </div>
+              <aside
+                className="glass-panel"
+                style={{
+                  width: '360px',
+                  minWidth: '320px',
+                  borderLeft: '1px solid var(--border-color)',
+                  background: 'rgba(10, 16, 28, 0.85)',
+                  padding: '0.9rem',
+                  display: 'flex',
+                  flexDirection: 'column',
+                  gap: '0.6rem',
+                }}
+              >
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                  <h4 style={{ margin: 0, fontSize: '0.95rem' }}>Gen Result (Popup)</h4>
+                  {renderTime && (
+                    <span style={{ fontSize: '0.78rem', color: 'var(--accent-color)' }}>⚡ {renderTime} ms</span>
+                  )}
+                </div>
+                <div
+                  style={{
+                    flex: 1,
+                    minHeight: 0,
+                    borderRadius: '8px',
+                    border: '1px solid var(--border-color)',
+                    background: 'rgba(0,0,0,0.25)',
+                    display: 'flex',
+                    alignItems: 'center',
+                    justifyContent: 'center',
+                    overflow: 'hidden',
+                  }}
+                >
+                  {previewUrl ? (
+                    <img
+                      src={previewUrl}
+                      alt="Popup Render Result"
+                      style={{ width: '100%', height: '100%', objectFit: 'contain' }}
+                    />
+                  ) : (
+                    <div style={{ color: 'var(--text-secondary)', fontSize: '0.82rem', textAlign: 'center', padding: '1rem' }}>
+                      Bấm Gen Mockup để xem kết quả ngay trong popup.
+                    </div>
+                  )}
+                </div>
+              </aside>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   )
 }

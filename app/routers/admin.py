@@ -214,6 +214,43 @@ async def archiveTemplate(slug: str, _admin=Depends(verifyAdmin)):
     return {'message': 'Template archived', 'slug': slug, 'status': 'archived'}
 
 
+@router.post('/templates/{slug}/rollback/{history_id}')
+async def rollbackConfig(slug: str, history_id: int, _admin=Depends(verifyAdmin)):
+    '''Khôi phục config từ lịch sử.'''
+    async with async_session() as session:
+        result = await session.execute(
+            select(Template).where(Template.slug == slug)
+        )
+        template = result.scalar_one_or_none()
+        if not template:
+            raise HTTPException(status_code=404, detail={'message': f'Template \'{slug}\' không tồn tại'})
+
+        history_result = await session.execute(
+            select(TemplateConfigHistory)
+            .where(TemplateConfigHistory.id == history_id, TemplateConfigHistory.template_id == template.id)
+        )
+        history_record = history_result.scalar_one_or_none()
+        if not history_record:
+            raise HTTPException(status_code=404, detail={'message': 'History record not found'})
+
+        # Lưu config hiện tại vào history trước khi rollback
+        new_history = TemplateConfigHistory(
+            template_id=template.id,
+            config=template.config,
+            change_note=f"Auto-backup before rollback to #{history_id}",
+        )
+        session.add(new_history)
+
+        # Cập nhật config
+        template.config = history_record.config
+        await session.commit()
+
+    # Invalidate cache
+    template_registry.invalidate(slug)
+
+    return {'message': 'Config rolled back successfully', 'slug': slug, 'history_id': history_id}
+
+
 @router.get('/templates/{slug}/config-history')
 async def getConfigHistory(slug: str, _admin=Depends(verifyAdmin)):
     '''Lịch sử thay đổi config.'''

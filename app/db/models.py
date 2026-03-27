@@ -36,6 +36,8 @@ class Template(Base):
         default='draft',
     )  # 'draft' | 'active' | 'archived'
 
+    product_type = Column(String(20), nullable=False, default='mug')
+
     mockup_path     = Column(String(500), nullable=False)
     shadow_map_path = Column(String(500), nullable=True)
     normal_map_path = Column(String(500), nullable=True)

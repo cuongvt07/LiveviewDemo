@@ -19,8 +19,11 @@ ASSET_BASE_DIR = os.getenv('ASSET_BASE_DIR', './templates')
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    '''Startup: load tất cả active templates vào cache.'''
-    logger.info('Starting Mug Mockup Service...')
+    '''Startup: init GPU + load tất cả active templates vào cache.'''
+    # Khởi tạo GPU nếu RENDER_DEVICE=gpu
+    from app.config import initGpu, getRenderDevice
+    gpu_ok = initGpu()
+    logger.info(f'Render device: {getRenderDevice()} (GPU active: {gpu_ok})')
 
     # Tạo thư mục templates nếu chưa có
     os.makedirs(ASSET_BASE_DIR, exist_ok=True)
@@ -111,4 +114,10 @@ app.include_router(admin.router, prefix='/admin')
 
 @app.get('/health')
 async def healthCheck():
-    return {'status': 'ok', 'version': '1.2.0'}
+    from app.config import getRenderDevice, isGpuEnabled
+    return {
+        'status': 'ok',
+        'version': '1.2.0',
+        'render_device': getRenderDevice(),
+        'gpu_active': isGpuEnabled(),
+    }

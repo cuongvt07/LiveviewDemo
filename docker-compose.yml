@@ -10,10 +10,16 @@ services:
       - ASSET_BASE_DIR=/app/templates
       - REDIS_URL=redis://redis:6379/0
       - ADMIN_TOKEN=${ADMIN_TOKEN:-change-me-in-production}
+      - RENDER_DEVICE=${RENDER_DEVICE:-cpu}
     volumes:
       - ./templates:/app/templates
       - ./inputs:/app/inputs
       - ./output:/app/output
+    # GPU (Linux only): uncomment below to pass Intel UHD to container
+    # devices:
+    #   - /dev/dri:/dev/dri
+    # group_add:
+    #   - video
     depends_on:
       postgres:
         condition: service_healthy
