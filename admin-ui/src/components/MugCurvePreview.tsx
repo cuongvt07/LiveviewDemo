@@ -10,11 +10,35 @@ interface MugCurvePreviewProps {
   curvePct: number;
   curveTop: number;
   curveBot: number;
+  edgeSqueeze: number;
+  squeezePower: number;
+  centerFocusWidth: number;
   hPx: number;
   wPx: number;
   showGrid: boolean;
   onSmileDrag: (y: number) => void;
   onPitchDrag: (y: number) => void;
+}
+
+const BASE_CENTER_BAND = 0.30;
+const MAX_CENTER_BAND = 0.70;
+const BASE_EDGE_ROLL_START = 0.55;
+const GRID_CELL_PX = 90;
+const MIN_GRID_DIVS = 4;
+const MAX_GRID_DIVS = 24;
+
+function clampGridDivs(value: number): number {
+  return Math.max(MIN_GRID_DIVS, Math.min(MAX_GRID_DIVS, value));
+}
+
+function computeAdaptiveGrid(wPx: number, hPx: number): { cols: number; rows: number } {
+  if (!Number.isFinite(wPx) || !Number.isFinite(hPx) || wPx <= 0 || hPx <= 0) {
+    return { cols: 12, rows: 10 };
+  }
+  return {
+    cols: clampGridDivs(Math.round(wPx / GRID_CELL_PX)),
+    rows: clampGridDivs(Math.round(hPx / GRID_CELL_PX)),
+  };
 }
 
 function solve_homography(src: Point[], dst: Point[]): number[] {
@@ -59,12 +83,62 @@ function apply_homography(H: number[], u: number, v: number): Point {
   };
 }
 
+function computeCenterBand(centerFocusWidth: number): number {
+  const widthStrength = Math.max(0, Math.min(1, centerFocusWidth));
+  return BASE_CENTER_BAND + (MAX_CENTER_BAND - BASE_CENTER_BAND) * widthStrength;
+}
+
+function applyCenterFocusWidth(radius: number, centerFocusWidth: number): number {
+  const widthStrength = Math.max(0, Math.min(1, centerFocusWidth));
+  if (widthStrength <= 1e-8) return radius;
+
+  const sourceBand = BASE_CENTER_BAND;
+  const targetBand = computeCenterBand(widthStrength);
+
+  if (radius <= sourceBand) {
+    const innerRatio = Math.max(0, Math.min(1, radius / Math.max(sourceBand, 1e-8)));
+    return targetBand * innerRatio;
+  }
+
+  const outerRatio = Math.max(0, Math.min(1, (radius - sourceBand) / Math.max(1 - sourceBand, 1e-8)));
+  return targetBand + (1 - targetBand) * outerRatio;
+}
+
+function applyEdgeRoll(radius: number, edgeSqueeze: number, squeezePower: number, centerFocusWidth: number): number {
+  const blend = Math.max(0, Math.min(1, edgeSqueeze));
+  if (blend <= 1e-8) return radius;
+
+  const protectedCenterBand = computeCenterBand(centerFocusWidth);
+  const edgeStart = Math.min(Math.max(BASE_EDGE_ROLL_START, protectedCenterBand), 0.95);
+  if (edgeStart >= 1 - 1e-8) return radius;
+
+  const power = Math.max(1, squeezePower);
+  const progress = Math.max(0, Math.min(1, (radius - edgeStart) / Math.max(1 - edgeStart, 1e-8)));
+  const rolledProgress = Math.pow(progress, 1 / power);
+  const mappedProgress = progress + (rolledProgress - progress) * blend;
+  if (radius <= edgeStart) return radius;
+  return edgeStart + (1 - edgeStart) * mappedProgress;
+}
+
+function applyHorizontalSqueeze(t: number, edgeSqueeze: number, squeezePower: number, centerFocusWidth: number): number {
+  const blend = Math.max(0, Math.min(1, edgeSqueeze));
+  const width = Math.max(0, Math.min(1, centerFocusWidth));
+  if (blend <= 1e-8 && width <= 1e-8) return t;
+  const radius = Math.abs(t);
+  const widthAdjustedRadius = applyCenterFocusWidth(radius, width);
+  const mappedRadius = applyEdgeRoll(widthAdjustedRadius, blend, squeezePower, width);
+  return Math.max(-1, Math.min(1, Math.sign(t) * mappedRadius));
+}
+
 function cylinderWarpPoint(
   u: number,
   v: number,
   curvePct: number,
   curveTop: number,
   curveBot: number,
+  edgeSqueeze: number,
+  squeezePower: number,
+  centerFocusWidth: number,
   hPx: number,
   wPx: number
 ): Point {
@@ -76,7 +150,9 @@ function cylinderWarpPoint(
   const sinThetaMax = Math.sin(thetaMax);
   const sinTheta = Math.max(-1, Math.min(1, nx * sinThetaMax));
   const theta = Math.asin(sinTheta);
-  const wx = (theta / thetaMax + 1) * 0.5;
+  const t = theta / thetaMax;
+  const tFinal = applyHorizontalSqueeze(t, edgeSqueeze, squeezePower, centerFocusWidth);
+  const wx = (tFinal + 1) * 0.5;
 
   const hr_ratio = hPx / (wPx + 1e-8);
   const cosDisplacement = Math.cos(theta) - Math.cos(thetaMax);
@@ -88,46 +164,14 @@ function cylinderWarpPoint(
   return { x: Math.max(0, Math.min(1, wx)), y: Math.max(-0.5, Math.min(1.5, wy)) };
 }
 
-function coonsFromBoundary(
-  u: number,
-  v: number,
-  edgeAt: {
-    top: (uu: number) => Point;
-    bottom: (uu: number) => Point;
-    left: (vv: number) => Point;
-    right: (vv: number) => Point;
-    c00: Point;
-    c10: Point;
-    c01: Point;
-    c11: Point;
-  }
-): Point {
-  const t = edgeAt.top(u);
-  const b = edgeAt.bottom(u);
-  const l = edgeAt.left(v);
-  const r = edgeAt.right(v);
-  const { c00, c10, c01, c11 } = edgeAt;
-
-  const x =
-    (1 - v) * t.x +
-    v * b.x +
-    (1 - u) * l.x +
-    u * r.x -
-    ((1 - u) * (1 - v) * c00.x + u * (1 - v) * c10.x + (1 - u) * v * c01.x + u * v * c11.x);
-  const y =
-    (1 - v) * t.y +
-    v * b.y +
-    (1 - u) * l.y +
-    u * r.y -
-    ((1 - u) * (1 - v) * c00.y + u * (1 - v) * c10.y + (1 - u) * v * c01.y + u * v * c11.y);
-  return { x, y };
-}
-
 export const MugCurvePreview: React.FC<MugCurvePreviewProps> = ({
   calibPts,
   curvePct,
   curveTop,
   curveBot,
+  edgeSqueeze,
+  squeezePower,
+  centerFocusWidth,
   hPx,
   wPx,
   showGrid,
@@ -141,22 +185,10 @@ export const MugCurvePreview: React.FC<MugCurvePreviewProps> = ({
   const hMat = solve_homography(srcCanon, calibPts);
 
   const worldAt = (u: number, v: number): Point => {
-    const wLocal = cylinderWarpPoint(u, v, curvePct, curveTop, curveBot, hPx, wPx);
+    const wLocal = cylinderWarpPoint(u, v, curvePct, curveTop, curveBot, edgeSqueeze, squeezePower, centerFocusWidth, hPx, wPx);
     return apply_homography(hMat, wLocal.x, wLocal.y);
   };
-
-  const edgeAt = {
-    top: (u: number) => worldAt(u, 0),
-    bottom: (u: number) => worldAt(u, 1),
-    left: (v: number) => worldAt(0, v),
-    right: (v: number) => worldAt(1, v),
-    c00: worldAt(0, 0),
-    c10: worldAt(1, 0),
-    c01: worldAt(0, 1),
-    c11: worldAt(1, 1),
-  };
-
-  const patchAt = (u: number, v: number) => coonsFromBoundary(u, v, edgeAt);
+  const patchAt = (u: number, v: number) => worldAt(u, v);
 
   const pathSamples = 36;
   const pathParts: string[] = [];
@@ -173,9 +205,8 @@ export const MugCurvePreview: React.FC<MugCurvePreviewProps> = ({
   pathParts.push('Z');
   const boundaryPath = pathParts.join(' ');
 
-  const cols = 12;
-  const rows = 10;
-  const lineSamples = 24;
+  const { cols, rows } = computeAdaptiveGrid(wPx, hPx);
+  const lineSamples = Math.min(72, Math.max(24, Math.ceil(Math.max(cols, rows) * 2)));
 
   return (
     <g className="mug-curve-preview">

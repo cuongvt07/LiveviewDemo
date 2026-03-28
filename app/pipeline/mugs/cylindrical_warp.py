@@ -1,7 +1,7 @@
 import cv2
 import numpy as np
 
-from .cylinder_math import compute_uv_cylindrical
+from .cylinder_math import apply_horizontal_squeeze, compute_uv_cylindrical
 from ..shared.gpu_ops import gpuRemap
 
 
@@ -14,6 +14,9 @@ def _local_warp_point(
     smile_base: float,
     curve_top: float | None,
     curve_bottom: float | None,
+    edge_squeeze: float,
+    squeeze_power: float,
+    center_focus_width: float,
 ) -> tuple[np.ndarray, np.ndarray]:
     theta_max = np.radians(theta_max_deg)
     if abs(theta_max) < 1e-8:
@@ -23,7 +26,14 @@ def _local_warp_point(
     sin_theta_max = np.sin(theta_max)
     sin_theta = np.clip(nx * sin_theta_max, -1.0, 1.0)
     theta = np.arcsin(sin_theta)
-    wx = (theta / theta_max + 1.0) / 2.0
+    t_final = apply_horizontal_squeeze(
+        theta,
+        theta_max,
+        edge_squeeze=edge_squeeze,
+        squeeze_power=squeeze_power,
+        center_focus_width=center_focus_width,
+    )
+    wx = (t_final + 1.0) / 2.0
 
     cos_displacement = np.cos(theta) - np.cos(theta_max)
     if curve_top is not None and curve_bottom is not None:
@@ -51,6 +61,9 @@ def _build_curved_clip_mask(
     smile_base: float,
     curve_top: float | None,
     curve_bottom: float | None,
+    edge_squeeze: float,
+    squeeze_power: float,
+    center_focus_width: float,
     samples: int = 256,
 ) -> np.ndarray:
     H_inv = np.linalg.inv(H_mat_output_to_canon)
@@ -60,10 +73,30 @@ def _build_curved_clip_mask(
     v_bot = np.ones_like(u)
 
     wx_top, wy_top = _local_warp_point(
-        u, v_top, theta_max_deg, pitch, hr_ratio, smile_base, curve_top, curve_bottom
+        u,
+        v_top,
+        theta_max_deg,
+        pitch,
+        hr_ratio,
+        smile_base,
+        curve_top,
+        curve_bottom,
+        edge_squeeze,
+        squeeze_power,
+        center_focus_width,
     )
     wx_bot, wy_bot = _local_warp_point(
-        u, v_bot, theta_max_deg, pitch, hr_ratio, smile_base, curve_top, curve_bottom
+        u,
+        v_bot,
+        theta_max_deg,
+        pitch,
+        hr_ratio,
+        smile_base,
+        curve_top,
+        curve_bottom,
+        edge_squeeze,
+        squeeze_power,
+        center_focus_width,
     )
 
     x_canon = np.concatenate([wx_top * 2.0 - 1.0, (wx_bot[::-1] * 2.0 - 1.0)]).astype(np.float32)
@@ -91,6 +124,9 @@ def cylindrical_warp(
     smile_base: float = 0.08,
     curve_top: float | None = None,
     curve_bottom: float | None = None,
+    edge_squeeze: float = 0.0,
+    squeeze_power: float = 2.0,
+    center_focus_width: float = 0.0,
 ) -> np.ndarray:
     """
     Warp a flat design to mug cylindrical space.
@@ -133,6 +169,9 @@ def cylindrical_warp(
         smile_base=smile_base,
         curve_top=curve_top,
         curve_bottom=curve_bottom,
+        edge_squeeze=edge_squeeze,
+        squeeze_power=squeeze_power,
+        center_focus_width=center_focus_width,
         clamp_v=False,
     )
 
@@ -171,6 +210,9 @@ def cylindrical_warp(
             smile_base=smile_base,
             curve_top=curve_top,
             curve_bottom=curve_bottom,
+            edge_squeeze=edge_squeeze,
+            squeeze_power=squeeze_power,
+            center_focus_width=center_focus_width,
         )
         warped[:, :, 3] = cv2.bitwise_and(warped[:, :, 3], curved_mask)
 

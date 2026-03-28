@@ -16,6 +16,10 @@ interface PrintAreaEditorProps {
   onProductTypeChange?: (val: string) => void;
 }
 
+const BASE_CENTER_BAND = 0.30;
+const MAX_CENTER_BAND = 0.70;
+const BASE_EDGE_ROLL_START = 0.55;
+
 // ─── Math helpers ────────────────────────────────────────────────────────────
 
 function applyCalibration(base: Point[], tilt: number, rotate: number, perspective: number): Point[] {
@@ -92,7 +96,65 @@ function apply_homography(H: number[], u: number, v: number): Point {
   };
 }
 
-function cylinderWarpPoint(u: number, v: number, curvePct: number, curveTop: number, curveBot: number, hPx: number, wPx: number): Point {
+function computeCenterBand(centerFocusWidth: number): number {
+  const widthStrength = Math.max(0, Math.min(1, centerFocusWidth));
+  return BASE_CENTER_BAND + (MAX_CENTER_BAND - BASE_CENTER_BAND) * widthStrength;
+}
+
+function applyCenterFocusWidth(radius: number, centerFocusWidth: number): number {
+  const widthStrength = Math.max(0, Math.min(1, centerFocusWidth));
+  if (widthStrength <= 1e-8) return radius;
+
+  const sourceBand = BASE_CENTER_BAND;
+  const targetBand = computeCenterBand(widthStrength);
+
+  if (radius <= sourceBand) {
+    const innerRatio = Math.max(0, Math.min(1, radius / Math.max(sourceBand, 1e-8)));
+    return targetBand * innerRatio;
+  }
+
+  const outerRatio = Math.max(0, Math.min(1, (radius - sourceBand) / Math.max(1 - sourceBand, 1e-8)));
+  return targetBand + (1 - targetBand) * outerRatio;
+}
+
+function applyEdgeRoll(radius: number, edgeSqueeze: number, squeezePower: number, centerFocusWidth: number): number {
+  const blend = Math.max(0, Math.min(1, edgeSqueeze));
+  if (blend <= 1e-8) return radius;
+
+  const protectedCenterBand = computeCenterBand(centerFocusWidth);
+  const edgeStart = Math.min(Math.max(BASE_EDGE_ROLL_START, protectedCenterBand), 0.95);
+  if (edgeStart >= 1 - 1e-8) return radius;
+
+  const power = Math.max(1, squeezePower);
+  const progress = Math.max(0, Math.min(1, (radius - edgeStart) / Math.max(1 - edgeStart, 1e-8)));
+  const rolledProgress = Math.pow(progress, 1 / power);
+  const mappedProgress = progress + (rolledProgress - progress) * blend;
+  if (radius <= edgeStart) return radius;
+  return edgeStart + (1 - edgeStart) * mappedProgress;
+}
+
+function applyHorizontalSqueeze(t: number, edgeSqueeze: number, squeezePower: number, centerFocusWidth: number): number {
+  const blend = Math.max(0, Math.min(1, edgeSqueeze));
+  const width = Math.max(0, Math.min(1, centerFocusWidth));
+  if (blend <= 1e-8 && width <= 1e-8) return t;
+  const radius = Math.abs(t);
+  const widthAdjustedRadius = applyCenterFocusWidth(radius, width);
+  const mappedRadius = applyEdgeRoll(widthAdjustedRadius, blend, squeezePower, width);
+  return Math.max(-1, Math.min(1, Math.sign(t) * mappedRadius));
+}
+
+function cylinderWarpPoint(
+  u: number,
+  v: number,
+  curvePct: number,
+  curveTop: number,
+  curveBot: number,
+  edgeSqueeze: number,
+  squeezePower: number,
+  centerFocusWidth: number,
+  hPx: number,
+  wPx: number
+): Point {
   const thetaMaxDeg = curvePct * 0.9;
   if (thetaMaxDeg <= 0.001) return { x: u, y: v };
   const thetaMax = (thetaMaxDeg * Math.PI) / 180;
@@ -100,7 +162,9 @@ function cylinderWarpPoint(u: number, v: number, curvePct: number, curveTop: num
   const sinThetaMax = Math.sin(thetaMax);
   const sinTheta = Math.max(-1, Math.min(1, nx * sinThetaMax));
   const theta = Math.asin(sinTheta);
-  const wx = (theta / thetaMax + 1) * 0.5;
+  const t = theta / thetaMax;
+  const tFinal = applyHorizontalSqueeze(t, edgeSqueeze, squeezePower, centerFocusWidth);
+  const wx = (tFinal + 1) * 0.5;
 
   const hr_ratio = hPx / (wPx + 1e-8);
   const cosDisplacement = Math.cos(theta) - Math.cos(thetaMax);
@@ -128,11 +192,169 @@ function parsePoint(input: any): Point | null {
   return null;
 }
 
+function edgeLengthPx(a: Point, b: Point, imageW: number, imageH: number): number {
+  const dx = (b.x - a.x) * imageW;
+  const dy = (b.y - a.y) * imageH;
+  return Math.hypot(dx, dy);
+}
+
 function toFiniteNumber(input: any, fallback: number): number {
   return typeof input === 'number' && Number.isFinite(input) ? input : fallback;
 }
 
+function getStepPrecision(step: number): number {
+  const stepText = String(step);
+  const dotIndex = stepText.indexOf('.');
+  return dotIndex >= 0 ? stepText.length - dotIndex - 1 : 0;
+}
+
+function clampControlValue(value: number, min: number, max: number, step: number): number {
+  const precision = getStepPrecision(step);
+  const clamped = Math.max(min, Math.min(max, value));
+  return Number(clamped.toFixed(precision));
+}
+
+function buildHorizontalSqueezeDebug(edgeSqueeze: number, squeezePower: number, centerFocusWidth: number) {
+  const sampleIn = [0.1, 0.2, 0.4, 0.6, 0.8];
+  const sampleOut = sampleIn.map((sample) => Number(applyHorizontalSqueeze(sample, edgeSqueeze, squeezePower, centerFocusWidth).toFixed(4)));
+  const sampleDelta = sampleOut.map((mapped, index) => Number((mapped - sampleIn[index]).toFixed(4)));
+
+  const hasEdge = edgeSqueeze > 1e-8;
+  const hasWidth = centerFocusWidth > 1e-8;
+  let inactiveReason: string | null = null;
+  let mode = 'edge_and_width_active';
+  if (!hasEdge && !hasWidth) {
+    inactiveReason = 'edge_and_center_zero';
+    mode = 'inactive';
+  } else if (!hasEdge) {
+    mode = 'width_only_active';
+  } else if (!hasWidth) {
+    mode = 'edge_only_active';
+  }
+
+  return {
+    active: hasEdge || hasWidth,
+    inactiveReason,
+    mode,
+    sampleIn,
+    sampleOut,
+    sampleDelta,
+  };
+}
+
 // ─── Component ───────────────────────────────────────────────────────────────
+
+interface ControlAdjusterProps {
+  label: string;
+  description?: string;
+  value: number;
+  min: number;
+  max: number;
+  step?: number;
+  unit?: string;
+  onChange: (v: number) => void;
+}
+
+function ControlAdjuster({
+  label,
+  description,
+  value,
+  min,
+  max,
+  step = 0.1,
+  unit = '',
+  onChange,
+}: ControlAdjusterProps) {
+  const precision = getStepPrecision(step);
+  const formattedValue = value.toFixed(precision);
+  const [draft, setDraft] = useState(formattedValue);
+
+  useEffect(() => {
+    setDraft(formattedValue);
+  }, [formattedValue]);
+
+  const nudge = (direction: -1 | 1) => {
+    onChange(clampControlValue(value + direction * step, min, max, step));
+  };
+
+  const commitDraft = () => {
+    const normalized = draft.replace(',', '.').trim();
+    if (normalized === '' || normalized === '-' || normalized === '+') {
+      setDraft(formattedValue);
+      return;
+    }
+    const parsed = Number(normalized);
+    if (!Number.isFinite(parsed)) {
+      setDraft(formattedValue);
+      return;
+    }
+    const nextValue = clampControlValue(parsed, min, max, step);
+    onChange(nextValue);
+    setDraft(nextValue.toFixed(precision));
+  };
+
+  const handleInputKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
+    if (e.key === 'ArrowLeft' || e.key === 'ArrowDown') {
+      e.preventDefault();
+      nudge(-1);
+      return;
+    }
+    if (e.key === 'ArrowRight' || e.key === 'ArrowUp') {
+      e.preventDefault();
+      nudge(1);
+      return;
+    }
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      commitDraft();
+      e.currentTarget.blur();
+      return;
+    }
+    if (e.key === 'Escape') {
+      e.preventDefault();
+      setDraft(formattedValue);
+      e.currentTarget.blur();
+    }
+  };
+
+  return (
+    <div className="ctrl">
+      <div className="ctrl-header"><span className="ctrl-label">{label}</span><span className="ctrl-value">{formattedValue}{unit}</span></div>
+      <div className="stepper">
+        <button
+          type="button"
+          className="stepper-btn"
+          onMouseDown={(e) => e.preventDefault()}
+          onClick={() => nudge(-1)}
+          aria-label={`Giảm ${label}`}
+        >
+          ←
+        </button>
+        <input
+          className="stepper-input"
+          type="text"
+          inputMode="decimal"
+          value={draft}
+          onChange={(e) => setDraft(e.target.value)}
+          onBlur={commitDraft}
+          onKeyDown={handleInputKeyDown}
+          aria-label={label}
+        />
+        <button
+          type="button"
+          className="stepper-btn"
+          onMouseDown={(e) => e.preventDefault()}
+          onClick={() => nudge(1)}
+          aria-label={`Tăng ${label}`}
+        >
+          →
+        </button>
+      </div>
+      <div className="ctrl-step">Bước chỉnh: {step.toFixed(precision)}{unit}</div>
+      {description && <div className="ctrl-help">{description}</div>}
+    </div>
+  );
+}
 
 export default function PrintAreaEditor(props: PrintAreaEditorProps) {
   const { imageUrl, designFile, warpConfig, initialPrintArea, onCoordinatesChange, onConfigChange, onLockedSnapshotChange, onLiveSnapshotChange, productTypeProp, onProductTypeChange } = props;
@@ -152,6 +374,9 @@ export default function PrintAreaEditor(props: PrintAreaEditorProps) {
   );
   const [curveTop, setCurveTop] = useState(toFiniteNumber(warpConfig?.curve_top, 0));
   const [curveBot, setCurveBot] = useState(toFiniteNumber(warpConfig?.curve_bottom, 0));
+  const [edgeSqueeze, setEdgeSqueeze] = useState(toFiniteNumber(warpConfig?.edge_squeeze, 0));
+  const [squeezePower, setSqueezePower] = useState(toFiniteNumber(warpConfig?.squeeze_power, 2));
+  const [centerFocusWidth, setCenterFocusWidth] = useState(toFiniteNumber(warpConfig?.center_focus_width, 0));
   const [designScale, setDesignScale] = useState(toFiniteNumber(warpConfig?.design_scale, 1.0));
   const [designOffsetX, setDesignOffsetX] = useState(toFiniteNumber(warpConfig?.design_offset_x, 0.0));
   const [designOffsetY, setDesignOffsetY] = useState(toFiniteNumber(warpConfig?.design_offset_y, 0.0));
@@ -171,6 +396,7 @@ export default function PrintAreaEditor(props: PrintAreaEditorProps) {
   const [maskPoints, setMaskPoints] = useState<Point[]>([]);
   const [meshPoints, setMeshPoints] = useState<{ src: Point; dst: Point }[]>([]);
   const [isDetecting, setIsDetecting] = useState(false);
+  const [gridOverlayUrl, setGridOverlayUrl] = useState<string | null>(null);
   const [previewOverlayUrl, setPreviewOverlayUrl] = useState<string | null>(null);
   const [naturalSize, setNaturalSize] = useState({ w: 0, h: 0 });
   const [draggingIdx, setDraggingIdx] = useState<{ type: string; id: number } | null>(null);
@@ -184,22 +410,48 @@ export default function PrintAreaEditor(props: PrintAreaEditorProps) {
   const didRestoreRef = useRef(false);
 
   const containerRef = useRef<HTMLDivElement>(null);
+  const controlSectionRef = useRef<HTMLDivElement>(null);
+  const controlScrollTopRef = useRef(0);
   const overlayAlphaCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const designPreviewRequestSeqRef = useRef(0);
+  const gridPreviewRequestSeqRef = useRef(0);
   const calibPts = applyCalibration(basePoints, tilt, rotate, perspective);
 
-  const W_px = Math.abs(calibPts[1].x - calibPts[0].x) * (naturalSize.w || 1000);
-  const H_px = Math.abs(calibPts[3].y - calibPts[0].y) * (naturalSize.h || 1000);
+  const imageW = naturalSize.w || 1000;
+  const imageH = naturalSize.h || 1000;
+  const topWidthPx = edgeLengthPx(calibPts[0], calibPts[1], imageW, imageH);
+  const bottomWidthPx = edgeLengthPx(calibPts[3], calibPts[2], imageW, imageH);
+  const leftHeightPx = edgeLengthPx(calibPts[0], calibPts[3], imageW, imageH);
+  const rightHeightPx = edgeLengthPx(calibPts[1], calibPts[2], imageW, imageH);
+  const W_px = (topWidthPx + bottomWidthPx) * 0.5;
+  const H_px = (leftHeightPx + rightHeightPx) * 0.5;
 
   const src_canon_coords = [{ x: -1, y: -1 }, { x: 1, y: -1 }, { x: 1, y: 1 }, { x: -1, y: 1 }];
   const H_mat = solve_homography(src_canon_coords, calibPts);
 
-  const localSmile = cylinderWarpPoint(0.5, 0, curvePct, curveTop, curveBot, H_px, W_px);
+  const localSmile = cylinderWarpPoint(0.5, 0, curvePct, curveTop, curveBot, edgeSqueeze, squeezePower, centerFocusWidth, H_px, W_px);
   const smileHandle = apply_homography(H_mat, localSmile.x, localSmile.y);
-  const localPitch = cylinderWarpPoint(0.5, 1, curvePct, curveTop, curveBot, H_px, W_px);
+  const localPitch = cylinderWarpPoint(0.5, 1, curvePct, curveTop, curveBot, edgeSqueeze, squeezePower, centerFocusWidth, H_px, W_px);
   const pitchHandle = apply_homography(H_mat, localPitch.x, localPitch.y);
-  const showBackendOverlay = Boolean(previewOverlayUrl);
-  const showEditorGridLayer = showGrid && editorMode === 'CALIBRATE';
+  const wantsDesignOverlay = Boolean(designFile);
+  const showGridOverlay = showGrid && productType.includes('cylinder') && Boolean(gridOverlayUrl);
+  const showDesignOverlay = Boolean(previewOverlayUrl) && wantsDesignOverlay;
+  const showEditorGridLayer = showGrid && editorMode === 'CALIBRATE' && !productType.includes('cylinder');
   const canDragArtwork = Boolean(designFile) && (editorMode === 'DESIGN' || activeMode === 'calibrate');
+
+  const captureControlScroll = useCallback(() => {
+    if (controlSectionRef.current) {
+      controlScrollTopRef.current = controlSectionRef.current.scrollTop;
+    }
+  }, []);
+
+  useLayoutEffect(() => {
+    const controlSection = controlSectionRef.current;
+    if (!controlSection) return;
+    if (Math.abs(controlSection.scrollTop - controlScrollTopRef.current) > 1) {
+      controlSection.scrollTop = controlScrollTopRef.current;
+    }
+  });
 
   useEffect(() => {
     fetch('/v1/render/device')
@@ -210,6 +462,26 @@ export default function PrintAreaEditor(props: PrintAreaEditorProps) {
       })
       .catch(() => {});
   }, []);
+
+  useEffect(() => {
+    if (!productType.includes('cylinder')) return;
+    if (centerFocusWidth <= 0 && edgeSqueeze <= 0) return;
+
+    const debug = buildHorizontalSqueezeDebug(edgeSqueeze, squeezePower, centerFocusWidth);
+    console.info('[PrintAreaEditor] horizontal squeeze debug', {
+      edge_squeeze: edgeSqueeze,
+      squeeze_power: squeezePower,
+      center_focus_width: centerFocusWidth,
+      ...debug,
+    });
+    if (!debug.active) {
+      console.warn('[PrintAreaEditor] horizontal squeeze inactive', {
+        inactive_reason: debug.inactiveReason,
+        edge_squeeze: edgeSqueeze,
+        center_focus_width: centerFocusWidth,
+      });
+    }
+  }, [productType, edgeSqueeze, squeezePower, centerFocusWidth]);
 
   useEffect(() => {
     if (!previewOverlayUrl) {
@@ -239,9 +511,33 @@ export default function PrintAreaEditor(props: PrintAreaEditorProps) {
 
   useEffect(() => {
     return () => {
+      if (gridOverlayUrl) URL.revokeObjectURL(gridOverlayUrl);
+    };
+  }, [gridOverlayUrl]);
+
+  useEffect(() => {
+    return () => {
       if (previewOverlayUrl) URL.revokeObjectURL(previewOverlayUrl);
     };
   }, [previewOverlayUrl]);
+
+  useEffect(() => {
+    if (!showGrid || !productType.includes('cylinder')) {
+      setGridOverlayUrl(prev => {
+        if (prev) URL.revokeObjectURL(prev);
+        return null;
+      });
+    }
+  }, [showGrid, productType]);
+
+  useEffect(() => {
+    if (!designFile) {
+      setPreviewOverlayUrl(prev => {
+        if (prev) URL.revokeObjectURL(prev);
+        return null;
+      });
+    }
+  }, [designFile]);
 
   useEffect(() => {
     if (didRestoreRef.current || naturalSize.w <= 0 || naturalSize.h <= 0) return;
@@ -279,6 +575,9 @@ export default function PrintAreaEditor(props: PrintAreaEditorProps) {
     );
     setCurveTop(toFiniteNumber(warpConfig?.curve_top, 0));
     setCurveBot(toFiniteNumber(warpConfig?.curve_bottom, 0));
+    setEdgeSqueeze(toFiniteNumber(warpConfig?.edge_squeeze, 0));
+    setSqueezePower(toFiniteNumber(warpConfig?.squeeze_power, 2));
+    setCenterFocusWidth(toFiniteNumber(warpConfig?.center_focus_width, 0));
     setFeatherRadius(toFiniteNumber(warpConfig?.feather_radius, 3));
     setDesignScale(toFiniteNumber(warpConfig?.design_scale, 1));
     setDesignOffsetX(toFiniteNumber(warpConfig?.design_offset_x, 0));
@@ -350,6 +649,9 @@ export default function PrintAreaEditor(props: PrintAreaEditorProps) {
       curve: (smile_api / 100) * hr_ratio * 0.15,
       curve_top: curveTop,
       curve_bottom: curveBot,
+      edge_squeeze: edgeSqueeze,
+      squeeze_power: squeezePower,
+      center_focus_width: centerFocusWidth,
       tilt_deg: tilt, rotate_deg: rotate, persp_strength: perspective,
       camera_elevation: pitch_api,
       product_type: productType,
@@ -362,10 +664,93 @@ export default function PrintAreaEditor(props: PrintAreaEditorProps) {
     };
 
     onLiveSnapshotChange({ printArea: pa, warpConfig: nextWarpConfig });
-  }, [basePoints, tilt, rotate, perspective, curvePct, curveTop, curveBot, designScale, designOffsetX, designOffsetY, featherRadius, productType, maskPoints, meshPoints, naturalSize, editorMode]);
+  }, [basePoints, tilt, rotate, perspective, curvePct, curveTop, curveBot, edgeSqueeze, squeezePower, centerFocusWidth, designScale, designOffsetX, designOffsetY, featherRadius, productType, maskPoints, meshPoints, naturalSize, editorMode]);
 
   useEffect(() => {
     if (naturalSize.w === 0) return;
+    if (!showGrid || !productType.includes('cylinder')) return;
+
+    const toPx = (p: Point) => [Math.round(p.x * naturalSize.w), Math.round(p.y * naturalSize.h)];
+    const hr_ratio = H_px / (W_px + 1e-8);
+    const smile_api = (curveTop + curveBot) / 2;
+    const pitch_api = (curveTop - curveBot);
+    const pa = {
+      quad: calibPts.map(toPx),
+      base_points_raw: basePoints.map(toPx),
+      top_left: toPx(calibPts[0]), top_right: toPx(calibPts[1]),
+      bottom_right: toPx(calibPts[2]), bottom_left: toPx(calibPts[3]),
+      mask_points: maskPoints.length > 2 ? maskPoints.map(toPx) : null,
+      mesh_control_src: meshPoints.map(m => toPx(m.src)),
+      mesh_control_dst: meshPoints.map(m => toPx(m.dst)),
+      product_type: productType,
+      camera_elevation: pitch_api,
+    };
+    const templateIdMatch = imageUrl.match(/\/templates\/([^/]+)\//);
+    const templateId = templateIdMatch ? templateIdMatch[1] : null;
+    const payload = {
+      mockup_width: naturalSize.w, mockup_height: naturalSize.h,
+      print_area: pa,
+      warp_type: meshPoints.length > 0 ? 'tps' : 'cylinder',
+      theta_max_deg: curvePct * 0.9,
+      curve: (smile_api / 100) * hr_ratio * 0.15,
+      curve_top: curveTop,
+      curve_bottom: curveBot,
+      edge_squeeze: edgeSqueeze,
+      squeeze_power: squeezePower,
+      center_focus_width: centerFocusWidth,
+      design_scale: designScale,
+      design_offset_x: designOffsetX,
+      design_offset_y: designOffsetY,
+      mask_points: pa.mask_points,
+      template_id: templateId,
+    };
+
+    const requestSeq = ++gridPreviewRequestSeqRef.current;
+    const controller = new AbortController();
+    const timer = setTimeout(async () => {
+      try {
+        const response = await fetch('/v1/mockup/warp-preview', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload),
+          signal: controller.signal,
+        });
+        if (!response.ok) {
+          const err = await response.json().catch(() => ({}));
+          throw new Error(err.detail || `Server error ${response.status}`);
+        }
+        if (controller.signal.aborted || requestSeq !== gridPreviewRequestSeqRef.current) return;
+        const blob = await response.blob();
+        if (controller.signal.aborted || requestSeq !== gridPreviewRequestSeqRef.current) return;
+        setGridOverlayUrl(prev => {
+          if (prev) URL.revokeObjectURL(prev);
+          return URL.createObjectURL(blob);
+        });
+      } catch (e: any) {
+        if (controller.signal.aborted || e?.name === 'AbortError') return;
+        console.error('Warp Grid Preview Error:', e);
+        if (requestSeq === gridPreviewRequestSeqRef.current) {
+          setApiError(e.message || 'Failed to fetch grid preview');
+        }
+      }
+    }, 200);
+
+    return () => {
+      clearTimeout(timer);
+      controller.abort();
+    };
+  }, [basePoints, tilt, rotate, perspective, curvePct, curveTop, curveBot, edgeSqueeze, squeezePower, centerFocusWidth, designScale, designOffsetX, designOffsetY, productType, maskPoints, meshPoints, naturalSize, imageUrl, showGrid]);
+
+  useEffect(() => {
+    if (naturalSize.w === 0) return;
+    if (!designFile) {
+      setApiError(null);
+      setPreviewOverlayUrl(prev => {
+        if (prev) URL.revokeObjectURL(prev);
+        return null;
+      });
+      return;
+    }
     const toPx = (p: Point) => [Math.round(p.x * naturalSize.w), Math.round(p.y * naturalSize.h)];
     const hr_ratio = H_px / (W_px + 1e-8);
     const smile_api = (curveTop + curveBot) / 2;
@@ -389,6 +774,9 @@ export default function PrintAreaEditor(props: PrintAreaEditorProps) {
       curve: (smile_api / 100) * hr_ratio * 0.15,
       curve_top: curveTop,
       curve_bottom: curveBot,
+      edge_squeeze: edgeSqueeze,
+      squeeze_power: squeezePower,
+      center_focus_width: centerFocusWidth,
       tilt_deg: tilt, rotate_deg: rotate, persp_strength: perspective,
       camera_elevation: pitch_api,
       product_type: productType,
@@ -405,7 +793,9 @@ export default function PrintAreaEditor(props: PrintAreaEditorProps) {
       else onLockedSnapshotChange(null);
     }
 
-    const timer = setTimeout(() => {
+    const requestSeq = ++designPreviewRequestSeqRef.current;
+    const controller = new AbortController();
+    const timer = setTimeout(async () => {
       const templateIdMatch = imageUrl.match(/\/templates\/([^/]+)\//);
       const templateId = templateIdMatch ? templateIdMatch[1] : null;
 
@@ -417,6 +807,9 @@ export default function PrintAreaEditor(props: PrintAreaEditorProps) {
         curve: (smile_api / 100) * hr_ratio * 0.15,
         curve_top: curveTop,
         curve_bottom: curveBot,
+        edge_squeeze: edgeSqueeze,
+        squeeze_power: squeezePower,
+        center_focus_width: centerFocusWidth,
         design_scale: designScale,
         design_offset_x: designOffsetX,
         design_offset_y: designOffsetY,
@@ -424,39 +817,66 @@ export default function PrintAreaEditor(props: PrintAreaEditorProps) {
         template_id: templateId,
       };
 
-      const request = designFile
-        ? (() => {
-            const formData = new FormData();
-            formData.append('config_json', JSON.stringify(payload));
-            formData.append('design_image', designFile);
-            return fetch('/v1/mockup/warp-preview-file', {
-              method: 'POST',
-              body: formData,
-            });
-          })()
-        : fetch('/v1/mockup/warp-preview', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(payload),
-          });
-
-      request
-        .then(async r => {
-          if (!r.ok) {
-            const err = await r.json().catch(() => ({}));
-            throw new Error(err.detail || `Server error ${r.status}`);
-          }
-          setApiError(null);
-          return r.blob();
-        })
-        .then(blob => setPreviewOverlayUrl(prev => { if (prev) URL.revokeObjectURL(prev); return URL.createObjectURL(blob); }))
-        .catch((e) => {
-          console.error("Warp Preview Error:", e);
-          setApiError(e.message || "Failed to fetch preview");
+      if (payload.warp_type === 'cylinder' && (centerFocusWidth > 0 || edgeSqueeze > 0)) {
+        console.info('[Warp Preview] request payload', {
+          theta_max_deg: payload.theta_max_deg,
+          edge_squeeze: payload.edge_squeeze,
+          squeeze_power: payload.squeeze_power,
+          center_focus_width: payload.center_focus_width,
+          debug: buildHorizontalSqueezeDebug(edgeSqueeze, squeezePower, centerFocusWidth),
         });
+      }
+
+      try {
+        const response = await (designFile
+          ? (() => {
+              const formData = new FormData();
+              formData.append('config_json', JSON.stringify(payload));
+              formData.append('design_image', designFile);
+              return fetch('/v1/mockup/warp-preview-file', {
+                method: 'POST',
+                body: formData,
+                signal: controller.signal,
+              });
+            })()
+          : fetch('/v1/mockup/warp-preview', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify(payload),
+              signal: controller.signal,
+            }));
+
+        if (!response.ok) {
+          const err = await response.json().catch(() => ({}));
+          throw new Error(err.detail || `Server error ${response.status}`);
+        }
+        if (controller.signal.aborted || requestSeq !== designPreviewRequestSeqRef.current) {
+          return;
+        }
+        setApiError(null);
+        const blob = await response.blob();
+        if (controller.signal.aborted || requestSeq !== designPreviewRequestSeqRef.current) {
+          return;
+        }
+        setPreviewOverlayUrl(prev => {
+          if (prev) URL.revokeObjectURL(prev);
+          return URL.createObjectURL(blob);
+        });
+      } catch (e: any) {
+        if (controller.signal.aborted || e?.name === 'AbortError') {
+          return;
+        }
+        console.error("Warp Preview Error:", e);
+        if (requestSeq === designPreviewRequestSeqRef.current) {
+          setApiError(e.message || "Failed to fetch preview");
+        }
+      }
     }, 400);
-    return () => clearTimeout(timer);
-  }, [basePoints, tilt, rotate, perspective, curvePct, curveTop, curveBot, designScale, designOffsetX, designOffsetY, featherRadius, productType, maskPoints, meshPoints, naturalSize, editorMode, imageUrl, designFile]);
+    return () => {
+      clearTimeout(timer);
+      controller.abort();
+    };
+  }, [basePoints, tilt, rotate, perspective, curvePct, curveTop, curveBot, edgeSqueeze, squeezePower, centerFocusWidth, designScale, designOffsetX, designOffsetY, featherRadius, productType, maskPoints, meshPoints, naturalSize, editorMode, imageUrl, designFile]);
 
   const lastPointerPos = useRef({ x: 0, y: 0 });
 
@@ -607,21 +1027,14 @@ export default function PrintAreaEditor(props: PrintAreaEditorProps) {
     }
   };
 
-  const Slider = ({ label, value, min, max, step = 1, unit = '', onChange }: { label: string; value: number; min: number; max: number; step?: number; unit?: string; onChange: (v: number) => void; }) => (
-    <div className="ctrl">
-      <div className="ctrl-header"><span className="ctrl-label">{label}</span><span className="ctrl-value">{value}{unit}</span></div>
-      <input type="range" min={min} max={max} step={step} value={value} onChange={e => onChange(Number(e.target.value))} className="slider" />
-    </div>
-  );
-
   const renderControls = () => {
     const productSelector = !productTypeProp && (
-      <div className="product-selector-top glass-panel" style={{ padding: '8px 16px', marginBottom: '12px', border: '1px solid #1e2d44', background: '#111827', borderRadius: '8px' }}>
-        <div className="ctrl-header" style={{ marginBottom: '6px' }}><span className="ctrl-label" style={{ color: '#60a5fa', fontSize: '9px' }}>Step 1: Product Category</span></div>
-        <select className="select" style={{ width: '100%', fontSize: '0.9rem', padding: '6px 10px' }} value={productType} onChange={e => setProductType(e.target.value)}>
-          <optgroup label="🍵 MUGS MODULE"><option value="cylinder_ceramic">Ceramic Mug</option><option value="cylinder_glass">Glass Mug</option><option value="cylinder_travel">Travel Mug</option></optgroup>
-          <optgroup label="👕 CLOTHES MODULE"><option value="apparel_cotton">T-Shirt</option><option value="apparel_hoodie">Hoodie</option><option value="apparel_totebag">Tote Bag</option></optgroup>
-          <optgroup label="🖼 OTHER"><option value="flat_print">Flat Print</option><option value="plastic_case">Phone Case</option></optgroup>
+      <div className="product-selector-top glass-panel" style={{ padding: '5px', marginBottom: '8px', border: '1px solid #1e2d44', background: '#111827', borderRadius: '8px' }}>
+        <div className="ctrl-header" style={{ marginBottom: '6px' }}><span className="ctrl-label" style={{ color: '#60a5fa', fontSize: '9px' }}>Bước 1: Chọn loại sản phẩm</span></div>
+        <select className="select" style={{ width: '100%', fontSize: '0.9rem', padding: '5px' }} value={productType} onChange={e => setProductType(e.target.value)}>
+          <optgroup label="🍵 CỐC"><option value="cylinder_ceramic">Cốc sứ</option><option value="cylinder_glass">Cốc thủy tinh</option><option value="cylinder_travel">Ly giữ nhiệt</option></optgroup>
+          <optgroup label="👕 QUẦN ÁO"><option value="apparel_cotton">Áo thun</option><option value="apparel_hoodie">Áo hoodie</option><option value="apparel_totebag">Túi tote</option></optgroup>
+          <optgroup label="🖼 KHÁC"><option value="flat_print">In phẳng</option><option value="plastic_case">Ốp điện thoại</option></optgroup>
         </select>
       </div>
     );
@@ -631,55 +1044,58 @@ export default function PrintAreaEditor(props: PrintAreaEditorProps) {
     availableGroups.push('blend', 'advanced');
 
     if (editorMode === 'DESIGN') return (
-      <div className="ctrl-section">
+      <div className="ctrl-section" ref={controlSectionRef} onScroll={captureControlScroll}>
         {productSelector}
         {designFile && <p className="mode-hint">Kéo trực tiếp trên artwork 2D để đổi vị trí. Lăn chuột để zoom artwork, `Alt + wheel` để zoom canvas.</p>}
-        <div className="ctrl-header"><span className="ctrl-label">Design Transformation</span></div>
-        <div className="ctrl-grid">
-          <Slider label="Artwork Scale" value={designScale} min={0.1} max={5} step={0.01} unit="x" onChange={setDesignScale} />
-          <Slider label="Offset X" value={designOffsetX} min={-1} max={1} step={0.001} onChange={setDesignOffsetX} />
-          <Slider label="Offset Y" value={designOffsetY} min={-1} max={1} step={0.001} onChange={setDesignOffsetY} />
+        <div className="ctrl-header"><span className="ctrl-label">Chỉnh Artwork</span></div>
+        <div className="ctrl-grid ctrl-grid-two">
+          <ControlAdjuster label="Phóng to artwork" description="Tăng để artwork phủ rộng hơn trong vùng in." value={designScale} min={0.1} max={5} step={0.1} unit="x" onChange={setDesignScale} />
+          <ControlAdjuster label="Dịch ngang" description="Dời artwork sang trái hoặc phải bên trong vùng in." value={designOffsetX} min={-1} max={1} step={0.1} onChange={setDesignOffsetX} />
+          <ControlAdjuster label="Dịch dọc" description="Dời artwork lên hoặc xuống bên trong vùng in." value={designOffsetY} min={-1} max={1} step={0.1} onChange={setDesignOffsetY} />
         </div>
       </div>
     );
 
     if (activeMode === 'mesh') return (
-      <div className="ctrl-section">{productSelector}<p className="mode-hint">Kéo chấm cam để biến dạng bề mặt.</p><div className="btn-row"><button className="btn-primary" onClick={make4x4Mesh}>⊞ Lưới 4×4</button><button className="btn-ghost" onClick={() => setMeshPoints([])}>↺ Reset</button></div></div>
+      <div className="ctrl-section" ref={controlSectionRef} onScroll={captureControlScroll}>{productSelector}<p className="mode-hint">Kéo chấm cam để biến dạng bề mặt.</p><div className="btn-row"><button className="btn-primary" onClick={make4x4Mesh}>⊞ Lưới 4×4</button><button className="btn-ghost" onClick={() => setMeshPoints([])}>↺ Đặt lại</button></div></div>
     );
     if (activeMode === 'mask') return (
-      <div className="ctrl-section">{productSelector}<p className="mode-hint">Click để vẽ vùng mask. Đóng vòng để hoàn thành.</p><div className="btn-row"><button className="btn-ghost" onClick={() => setMaskPoints([])}>↺ Xóa Mask</button></div></div>
+      <div className="ctrl-section" ref={controlSectionRef} onScroll={captureControlScroll}>{productSelector}<p className="mode-hint">Click để vẽ vùng mask. Đóng vòng để hoàn thành.</p><div className="btn-row"><button className="btn-ghost" onClick={() => setMaskPoints([])}>↺ Xóa Mask</button></div></div>
     );
 
     return (
-      <div className="ctrl-section">
+      <div className="ctrl-section" ref={controlSectionRef} onScroll={captureControlScroll}>
         {productSelector}
         {designFile && activeMode === 'calibrate' && <p className="mode-hint">Artwork là ảnh ngang 2D. Kéo chỉ tác động lên artwork, không kéo mockup gốc.</p>}
         <div className="group-tabs">
           {availableGroups.map(g => (
             <button key={g} className={`group-tab ${activeGroup === g ? 'active' : ''}`} onClick={() => setActiveGroup(g)}>
-              {{ geometry: '📐 Geometry', wrap: '🌀 Wrap', blend: '🎨 Blend', advanced: '⚙️ Advanced' }[g]}
+              {{ geometry: '📐 Hình học', wrap: '🌀 Ôm cong', blend: '🎨 Viền', advanced: '⚙️ Nâng cao' }[g]}
             </button>
           ))}
         </div>
         {activeGroup === 'geometry' && (
-          <div className="ctrl-grid">
-            <Slider label="Tilt" value={tilt} min={-45} max={45} unit="°" onChange={setTilt} />
-            <Slider label="Rotate" value={rotate} min={-30} max={30} unit="°" onChange={setRotate} />
-            <Slider label="Perspective" value={perspective} min={-50} max={50} onChange={setPerspective} />
+          <div className="ctrl-grid ctrl-grid-two">
+            <ControlAdjuster label="Nghiêng" description="Giả góc chụp bằng cách đẩy mép trên theo chiều ngang." value={tilt} min={-45} max={45} unit="°" onChange={setTilt} />
+            <ControlAdjuster label="Xoay" description="Xoay toàn bộ vùng in quanh tâm." value={rotate} min={-30} max={30} unit="°" onChange={setRotate} />
+            <ControlAdjuster label="Phối cảnh" description="Làm phần trên hoặc dưới hẹp lại để giống ảnh chụp xiên." value={perspective} min={-50} max={50} onChange={setPerspective} />
           </div>
         )}
         {activeGroup === 'wrap' && (
-          <div className="ctrl-grid">
-            <Slider label="Cylinder Width" value={curvePct} min={0} max={100} unit="%" onChange={setCurvePct} />
-            <Slider label="Curve Top" value={curveTop} min={-100} max={100} unit="%" onChange={setCurveTop} />
-            <Slider label="Curve Bottom" value={-curveBot} min={-100} max={100} unit="%" onChange={(v) => setCurveBot(-v)} />
+          <div className="ctrl-grid ctrl-grid-two">
+            <ControlAdjuster label="Độ ôm ngang" description="Tăng để vùng in quấn sang hai bên thân cốc nhiều hơn." value={curvePct} min={0} max={100} unit="%" onChange={setCurvePct} />
+            <ControlAdjuster label="Cong mép trên" description="Bẻ đường mép trên lên hoặc xuống để khớp miệng cốc." value={curveTop} min={-100} max={100} unit="%" onChange={setCurveTop} />
+            <ControlAdjuster label="Cong mép dưới" description="Bẻ đường mép dưới lên hoặc xuống để khớp đáy cốc." value={-curveBot} min={-100} max={100} unit="%" onChange={(v) => setCurveBot(-v)} />
+            <ControlAdjuster label="Cường độ ép mép" description="Cuộn dải gần hai mép vào trong. Vùng giữa gần như giữ nguyên, chỉ phần rìa bị ép mạnh hơn." value={edgeSqueeze} min={0} max={1} step={0.1} onChange={setEdgeSqueeze} />
+            <ControlAdjuster label="Độ mạnh chuyển tiếp" description="Điều khiển độ gắt của vùng cuộn mép. Cao hơn thì hiệu ứng dồn sát về mép rõ hơn." value={squeezePower} min={1} max={5} step={0.1} onChange={setSqueezePower} />
+            <ControlAdjuster label="Độ rộng vùng giữa" description="Mở rộng băng giữa thật sự. Tăng lên thì các ô ở giữa rộng ra, còn hai mép bị co lại tương ứng." value={centerFocusWidth} min={0} max={1} step={0.1} onChange={setCenterFocusWidth} />
           </div>
         )}
         {activeGroup === 'blend' && (
-          <div className="ctrl-grid"><Slider label="Feather Radius" value={featherRadius} min={0} max={12} unit="px" onChange={setFeatherRadius} /></div>
+          <div className="ctrl-grid"><ControlAdjuster label="Làm mềm viền" description="Làm mượt mép vùng in khi ghép lên mockup." value={featherRadius} min={0} max={12} unit="px" onChange={setFeatherRadius} /></div>
         )}
         {activeGroup === 'advanced' && (
-          <div className="ctrl-grid"><button className="btn-ghost" style={{ marginTop: 8 }} onClick={() => { setTilt(0); setRotate(0); setPerspective(0); setCurveTop(0); setCurveBot(0); setDesignScale(1); setDesignOffsetX(0); setDesignOffsetY(0); }}> ↺ Reset All </button></div>
+          <div className="ctrl-grid"><button className="btn-ghost" style={{ marginTop: 8 }} onClick={() => { setTilt(0); setRotate(0); setPerspective(0); setCurveTop(0); setCurveBot(0); setEdgeSqueeze(0); setSqueezePower(2); setCenterFocusWidth(0); setDesignScale(1); setDesignOffsetX(0); setDesignOffsetY(0); }}> ↺ Đặt lại tất cả </button></div>
         )}
       </div>
     );
@@ -689,11 +1105,11 @@ export default function PrintAreaEditor(props: PrintAreaEditorProps) {
     <div className="pae-root">
       <div className="toolbar">
         <div className="toolbar-left">
-          <div className="logo-badge">Print Area Editor</div>
+          <div className="logo-badge">Trình Chỉnh Vùng In</div>
           <div className="mode-sub-pills" style={{ marginLeft: 20, display: 'flex', gap: 6, visibility: editorMode === 'CALIBRATE' ? 'visible' : 'hidden' }}>
             {(['calibrate', 'mesh', 'mask'] as const).filter(m => (m === 'mesh' ? productType.startsWith('apparel') : true)).map(m => (
               <button key={m} className={`pill pill-sm ${activeMode === m ? 'active' : ''}`} onClick={() => setActiveMode(m)}>
-                {m === 'calibrate' && '📐 '} {m === 'mesh' && '⊞ '} {m === 'mask' && '🎭 '} {m.toUpperCase()}
+                {m === 'calibrate' && '📐 '} {m === 'mesh' && '⊞ '} {m === 'mask' && '🎭 '} {{ calibrate: 'Căn chỉnh', mesh: 'Lưới', mask: 'Mask' }[m]}
               </button>
             ))}
           </div>
@@ -705,12 +1121,12 @@ export default function PrintAreaEditor(props: PrintAreaEditorProps) {
             disabled={isSwitchingDevice || (renderDevice === 'cpu' && !gpuAvailable)}
             title={gpuAvailable ? 'Bật/tắt GPU runtime' : 'GPU/OpenCL không khả dụng'}
           >
-            {isSwitchingDevice ? 'Switching…' : (renderDevice === 'gpu' ? 'GPU ON' : 'CPU')}
+            {isSwitchingDevice ? 'Đang chuyển…' : (renderDevice === 'gpu' ? 'GPU ON' : 'CPU')}
           </button>
-          <button className={`icon-btn ${showGrid ? 'active' : ''}`} onClick={() => setShowGrid(v => !v)}>Grid</button>
-          <button className="btn-detect" onClick={handleAutoDetect} disabled={isDetecting}>{isDetecting ? 'Detecting…' : '✦ Smart Detect'}</button>
+          <button className={`icon-btn ${showGrid ? 'active' : ''}`} onClick={() => setShowGrid(v => !v)}>Lưới</button>
+          <button className="btn-detect" onClick={handleAutoDetect} disabled={isDetecting}>{isDetecting ? 'Đang dò…' : '✦ Dò tự động'}</button>
           <div className="workflow-status">
-            {editorMode === 'CALIBRATE' ? <button className="btn-confirm-lock" onClick={() => setEditorMode('DESIGN')}>✅ Confirm & Lock</button> : <button className="btn-unlock" onClick={() => setEditorMode('CALIBRATE')}>🔓 Unlock</button>}
+            {editorMode === 'CALIBRATE' ? <button className="btn-confirm-lock" onClick={() => setEditorMode('DESIGN')}>✅ Chốt vùng in</button> : <button className="btn-unlock" onClick={() => setEditorMode('CALIBRATE')}>🔓 Mở khóa</button>}
           </div>
         </div>
       </div>
@@ -724,7 +1140,14 @@ export default function PrintAreaEditor(props: PrintAreaEditorProps) {
           <div className="canvas-wrap" ref={containerRef} onPointerMove={handlePointerMove} onPointerUp={() => setDraggingIdx(null)} onWheel={handleWheel} onMouseDown={handleContainerMouseDown} onMouseMove={handleContainerMouseMove} onMouseUp={handleContainerMouseUp} onMouseLeave={handleContainerMouseUp} onClick={handleCanvasClick} style={{ cursor: isPanning || draggingIdx?.type === 'design' ? 'grabbing' : (canDragArtwork ? 'grab' : (activeMode !== 'calibrate' ? 'crosshair' : 'default')), overflow: 'hidden' }}>
             <div className="canvas-container" style={{ transform: `translate(${pan.x}px, ${pan.y}px) scale(${zoom})`, transformOrigin: '0 0', width: '100%', height: '100%', position: 'relative', ['--zoom' as any]: zoom }}>
                 <img src={imageUrl} alt="Mockup" className="mockup-img" onLoad={e => setNaturalSize({ w: e.currentTarget.naturalWidth, h: e.currentTarget.naturalHeight })} />
-                {showBackendOverlay && previewOverlayUrl && (
+                {showGridOverlay && gridOverlayUrl && !showDesignOverlay && (
+                  <img
+                    src={gridOverlayUrl}
+                    className="overlay-img overlay-img-grid overlay-img-grid-base"
+                    alt=""
+                  />
+                )}
+                {showDesignOverlay && previewOverlayUrl && (
                   <img
                     src={previewOverlayUrl}
                     className={`overlay-img ${editorMode === 'CALIBRATE' ? 'overlay-img-calibrate' : 'overlay-img-design'} ${designFile ? 'overlay-img-original-color' : ''} ${canDragArtwork ? 'overlay-img-interactive' : ''}`}
@@ -732,8 +1155,15 @@ export default function PrintAreaEditor(props: PrintAreaEditorProps) {
                     onPointerDown={handleArtworkPointerDown}
                   />
                 )}
+                {showGridOverlay && gridOverlayUrl && showDesignOverlay && (
+                  <img
+                    src={gridOverlayUrl}
+                    className="overlay-img overlay-img-grid overlay-img-grid-top"
+                    alt=""
+                  />
+                )}
                 <svg className="overlay-svg" viewBox="0 0 100 100" preserveAspectRatio="none">
-                  {productType.includes('cylinder') ? <MugCurvePreview calibPts={calibPts} curvePct={curvePct} curveTop={curveTop} curveBot={curveBot} hPx={H_px} wPx={W_px} showGrid={showEditorGridLayer} onSmileDrag={setCurveTop} onPitchDrag={setCurveBot} /> : <WarpGridPreview meshPoints={meshPoints} showGrid={showEditorGridLayer} />}
+                  {productType.includes('cylinder') ? <MugCurvePreview calibPts={calibPts} curvePct={curvePct} curveTop={curveTop} curveBot={curveBot} edgeSqueeze={edgeSqueeze} squeezePower={squeezePower} centerFocusWidth={centerFocusWidth} hPx={H_px} wPx={W_px} showGrid={showEditorGridLayer} onSmileDrag={setCurveTop} onPitchDrag={setCurveBot} /> : <WarpGridPreview meshPoints={meshPoints} showGrid={showEditorGridLayer} />}
                 </svg>
               {editorMode === 'CALIBRATE' && (
                 <>
@@ -764,24 +1194,24 @@ export default function PrintAreaEditor(props: PrintAreaEditorProps) {
         /* ── TOOLBAR ── */
         .toolbar {
           display: flex; align-items: center; justify-content: space-between;
-          padding: 0 20px; height: 52px; background: #0e1117;
+          padding: 0 5px; height: 48px; background: #0e1117;
           border-bottom: 1px solid #1e2330; flex-shrink: 0; gap: 12px; z-index: 100;
         }
         .toolbar-left, .toolbar-right { display: flex; align-items: center; gap: 12px; }
         .logo-badge {
           font-size: 11px; font-weight: 700; letter-spacing: 0.12em; text-transform: uppercase;
-          color: #475569; padding: 4px 10px; border: 1px solid #1e2330; border-radius: 6px;
+          color: #475569; padding: 5px; border: 1px solid #1e2330; border-radius: 6px;
         }
         .pill {
-          padding: 5px 14px; border: none; background: transparent; color: #475569;
+          padding: 5px; border: none; background: transparent; color: #475569;
           cursor: pointer; border-radius: 6px; font-family: 'Syne', sans-serif;
           font-size: 12px; font-weight: 600; letter-spacing: 0.04em; transition: all 0.15s;
         }
-        .pill-sm { font-size: 10px; padding: 4px 10px; }
+        .pill-sm { font-size: 10px; padding: 5px; }
         .pill:hover { background: #161b27; color: #94a3b8; }
         .pill.active { background: #1a2540; color: #60a5fa; }
         .icon-btn {
-          display: flex; align-items: center; gap: 6px; padding: 5px 12px;
+          display: flex; align-items: center; gap: 6px; padding: 5px;
           border: 1px solid #1e2330; background: transparent; color: #475569;
           cursor: pointer; border-radius: 6px; font-family: 'Syne', sans-serif;
           font-size: 11px; font-weight: 600; letter-spacing: 0.06em; text-transform: uppercase; transition: all 0.15s;
@@ -790,53 +1220,118 @@ export default function PrintAreaEditor(props: PrintAreaEditorProps) {
         .icon-btn.active { border-color: #3b82f6; color: #60a5fa; background: #1a2540; }
         .icon-btn:disabled { opacity: 0.45; cursor: not-allowed; }
         .btn-detect {
-          display: flex; align-items: center; gap: 8px; padding: 7px 18px;
+          display: flex; align-items: center; gap: 8px; padding: 5px;
           background: linear-gradient(135deg, #1d4ed8, #2563eb); color: white; border: none;
           border-radius: 8px; font-family: 'Syne', sans-serif; font-size: 12px;
           font-weight: 700; cursor: pointer; letter-spacing: 0.04em; transition: opacity 0.15s;
         }
         .btn-detect:disabled { opacity: 0.5; cursor: not-allowed; }
         .btn-confirm-lock {
-          background: #3b82f6; color: white; border: none; padding: 6px 16px;
+          background: #3b82f6; color: white; border: none; padding: 5px;
           border-radius: 6px; font-weight: 700; cursor: pointer; font-size: 13px; transition: all 0.2s;
         }
         .btn-confirm-lock:hover { background: #2563eb; transform: scale(1.05); }
         .btn-unlock {
           background: #374151; color: #9ca3af; border: 1px solid #4b5563;
-          padding: 6px 16px; border-radius: 6px; font-weight: 600; cursor: pointer; font-size: 13px;
+          padding: 5px; border-radius: 6px; font-weight: 600; cursor: pointer; font-size: 13px;
         }
         .btn-unlock:hover { color: white; border-color: #6b7280; }
 
         /* ── SIDEBAR ── */
         .sidebar {
-          width: 320px; background: #0e1117; border-right: 1px solid #1e2330;
-          display: flex; flex-direction: column; overflow-y: auto; flex-shrink: 0;
+          width: 400px; background: #0e1117; border-right: 1px solid #1e2330;
+          display: flex; flex-direction: column; min-height: 0; overflow: hidden; flex-shrink: 0;
         }
         .ctrl-section {
-          padding: 24px; display: flex; flex-direction: column; gap: 20px;
+          flex: 1; min-height: 0; overflow-y: auto; overscroll-behavior: contain;
+          scrollbar-gutter: stable;
+          padding: 5px; display: flex; flex-direction: column; gap: 14px;
         }
         .group-tabs {
-          display: flex; flex-direction: column; gap: 4px;
-          padding-bottom: 12px; border-bottom: 1px solid #1e2330;
+          display: flex; flex-wrap: wrap; gap: 6px;
+          padding-bottom: 5px; border-bottom: 1px solid #1e2330;
         }
         .group-tab {
-          padding: 8px 14px; text-align: left; background: transparent; border: 1px solid transparent;
+          padding: 5px; text-align: left; background: transparent; border: 1px solid transparent;
           color: #475569; cursor: pointer; border-radius: 6px;
-          font-family: 'Syne', sans-serif; font-size: 12px; font-weight: 600;
+          font-family: 'Syne', sans-serif; font-size: 11px; font-weight: 600;
           letter-spacing: 0.05em; transition: all 0.15s;
         }
         .group-tab:hover { color: #94a3b8; background: #141924; }
         .group-tab.active { border-color: #1e2d44; color: #60a5fa; background: #111827; }
         .ctrl-grid {
-          display: flex; flex-direction: column; gap: 20px;
+          display: flex; flex-direction: column; gap: 14px;
         }
-        .ctrl { display: flex; flex-direction: column; gap: 8px; }
+        .ctrl-grid-two {
+          display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; align-items: start;
+        }
+        .ctrl { display: flex; flex-direction: column; gap: 6px; }
         .ctrl-header { display: flex; justify-content: space-between; align-items: baseline; }
         .ctrl-label {
           font-size: 10px; font-weight: 700; text-transform: uppercase;
           letter-spacing: 0.1em; color: #475569;
         }
         .ctrl-value { font-family: 'DM Mono', monospace; font-size: 11px; color: #60a5fa; }
+        .stepper {
+          display: grid;
+          grid-template-columns: 38px minmax(0, 1fr) 38px;
+          gap: 6px;
+          align-items: center;
+          padding: 4px;
+          border: 1px solid #1e2330;
+          border-radius: 8px;
+          background: #111827;
+          outline: none;
+          transition: border-color 0.15s, box-shadow 0.15s;
+        }
+        .stepper:focus {
+          border-color: #3b82f6;
+          box-shadow: 0 0 0 2px rgba(59, 130, 246, 0.15);
+        }
+        .stepper-btn,
+        .stepper-input {
+          border: none;
+          border-radius: 8px;
+          background: #1a2540;
+          color: #dbeafe;
+          font-family: 'Syne', sans-serif;
+        }
+        .stepper-btn {
+          height: 32px;
+          cursor: pointer;
+          font-size: 14px;
+          font-weight: 700;
+          transition: background 0.15s, transform 0.1s;
+        }
+        .stepper-btn:hover { background: #223153; }
+        .stepper-btn:active { transform: scale(0.98); }
+        .stepper-input {
+          height: 32px;
+          width: 100%;
+          padding: 0 8px;
+          cursor: text;
+          text-align: center;
+          font-family: 'DM Mono', monospace;
+          font-size: 11px;
+          font-weight: 500;
+          letter-spacing: 0.04em;
+        }
+        .stepper-input:focus {
+          outline: none;
+          box-shadow: inset 0 0 0 1px rgba(147, 197, 253, 0.45);
+        }
+        .ctrl-step {
+          font-size: 9px;
+          color: #475569;
+          text-transform: uppercase;
+          letter-spacing: 0.08em;
+        }
+        .ctrl-help {
+          font-size: 10px;
+          line-height: 1.4;
+          color: #64748b;
+        }
+        .mode-hint { font-size: 11px; color: #64748b; line-height: 1.45; }
         .slider {
           -webkit-appearance: none; appearance: none; width: 100%; height: 3px;
           background: #1e2330; border-radius: 2px; outline: none; cursor: pointer;
@@ -864,6 +1359,15 @@ export default function PrintAreaEditor(props: PrintAreaEditorProps) {
         .overlay-img {
           position: absolute; top: 0; left: 0; width: 100%; height: 100%;
           object-fit: contain; pointer-events: none;
+        }
+        .overlay-img-grid-base {
+          opacity: 1;
+        }
+        .overlay-img-grid-top {
+          opacity: 0.42;
+          mix-blend-mode: screen;
+          filter: contrast(1.1) brightness(1.08);
+          z-index: 6;
         }
         .overlay-img-calibrate { opacity: 0.78; }
         .overlay-img-design { opacity: 1; }
@@ -922,26 +1426,26 @@ export default function PrintAreaEditor(props: PrintAreaEditorProps) {
         /* ── MISC ── */
         .select {
           background: #141924; color: #94a3b8; border: 1px solid #1e2330;
-          padding: 8px 12px; border-radius: 6px; font-family: 'Syne', sans-serif;
-          font-size: 13px; cursor: pointer; width: 100%;
+          padding: 5px; border-radius: 6px; font-family: 'Syne', sans-serif;
+          font-size: 12px; cursor: pointer; width: 100%;
         }
         .select:focus { outline: none; border-color: #3b82f6; }
-        .mode-hint { font-size: 12px; color: #64748b; line-height: 1.5; }
-        .btn-row { display: flex; gap: 10px; flex-wrap: wrap; }
+        .mode-hint { font-size: 11px; color: #64748b; line-height: 1.45; }
+        .btn-row { display: flex; gap: 8px; flex-wrap: wrap; }
         .btn-primary {
-          padding: 8px 18px; background: #1d4ed8; color: white; border: none;
-          border-radius: 7px; font-family: 'Syne', sans-serif; font-size: 12px;
+          padding: 5px; background: #1d4ed8; color: white; border: none;
+          border-radius: 7px; font-family: 'Syne', sans-serif; font-size: 11px;
           font-weight: 700; cursor: pointer; transition: background 0.15s;
         }
         .btn-ghost {
-          padding: 8px 18px; background: transparent; color: #94a3b8;
+          padding: 5px; background: transparent; color: #94a3b8;
           border: 1px solid #1e2330; border-radius: 7px; font-family: 'Syne', sans-serif;
-          font-size: 12px; font-weight: 600; cursor: pointer; transition: all 0.15s;
+          font-size: 11px; font-weight: 600; cursor: pointer; transition: all 0.15s;
         }
         .btn-ghost:hover { background: #141924; color: #e2e8f0; }
         .error-toast {
           position: fixed; bottom: 20px; right: 20px;
-          background: rgba(220, 38, 38, 0.9); color: white; padding: 10px 20px;
+          background: rgba(220, 38, 38, 0.9); color: white; padding: 5px;
           border-radius: 8px; display: flex; gap: 12px; align-items: center; z-index: 1000;
         }
       `}</style>

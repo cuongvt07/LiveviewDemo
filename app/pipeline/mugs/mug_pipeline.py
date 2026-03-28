@@ -66,6 +66,9 @@ def run_mug_pipeline(
         smile_base=cyl.get("smile_base", 0.08),
         curve_top=cyl.get("curve_top"),
         curve_bottom=cyl.get("curve_bottom"),
+        edge_squeeze=cyl.get("edge_squeeze", 0.0),
+        squeeze_power=cyl.get("squeeze_power", 2.0),
+        center_focus_width=cyl.get("center_focus_width", 0.0),
     )
 
     # [2] Color match

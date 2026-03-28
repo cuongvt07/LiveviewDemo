@@ -17,6 +17,7 @@ from app.config import getRenderDevice, isGpuEnabled, setRenderDevice
 from app.db.database import async_session
 from app.db.models import Template
 from app.pipeline.clothes.clothes_pipeline import ClothesAssets
+from app.pipeline.mugs.cylinder_math import summarize_horizontal_squeeze
 from app.pipeline.mugs.mug_pipeline import MugAssets
 from app.pipeline.mugs.specular_gloss import extract_specular_from_mockup
 from app.pipeline.pipeline import run_pipeline
@@ -26,6 +27,39 @@ from app.services import template_registry
 from app.services.vision import auto_detect_print_area_v2, bake_normal_map, create_soft_mask
 
 router = APIRouter(tags=["render"])
+
+GRID_CELL_PX = 90
+MIN_GRID_DIVS = 4
+MAX_GRID_DIVS = 24
+
+
+def _log_horizontal_squeeze_debug(
+    source: str,
+    theta_max_deg: float,
+    edge_squeeze: float,
+    squeeze_power: float,
+    center_focus_width: float,
+) -> None:
+    logger = logging.getLogger("mockup_service")
+    debug = summarize_horizontal_squeeze(
+        theta_max_deg=theta_max_deg,
+        edge_squeeze=edge_squeeze,
+        squeeze_power=squeeze_power,
+        center_focus_width=center_focus_width,
+    )
+    logger.info(
+        "%s horizontal squeeze debug: edge_squeeze=%s squeeze_power=%s center_focus_width=%s active=%s mode=%s inactive_reason=%s sample_in=%s sample_out=%s sample_delta=%s",
+        source,
+        edge_squeeze,
+        squeeze_power,
+        center_focus_width,
+        debug["active"],
+        debug["mode"],
+        debug["inactive_reason"],
+        debug["sample_in"],
+        debug["sample_out"],
+        debug["sample_delta"],
+    )
 
 
 class WarpPreviewRequest(BaseModel):
@@ -37,6 +71,9 @@ class WarpPreviewRequest(BaseModel):
     curve: float = 0.0
     curve_top: Optional[float] = None
     curve_bottom: Optional[float] = None
+    edge_squeeze: float = 0.0
+    squeeze_power: float = 2.0
+    center_focus_width: float = 0.0
     design_scale: float = 1.0
     design_offset_x: float = 0.0
     design_offset_y: float = 0.0
@@ -72,6 +109,9 @@ def _build_default_adhoc_config(width: int, height: int) -> dict:
             "pitch": 0.0,
             "curve_top": None,
             "curve_bottom": None,
+            "edge_squeeze": 0.0,
+            "squeeze_power": 2.0,
+            "center_focus_width": 0.0,
         },
         "mesh": {
             "n_points": 80,
@@ -181,6 +221,15 @@ def _merge_adhoc_user_config(config: dict, config_json: Optional[str]) -> dict:
             "camera_elevation", user_warp.get("camera_elevation", config["cylinder"]["pitch"])
         )
     )
+    config["cylinder"]["edge_squeeze"] = float(
+        user_warp.get("edge_squeeze", config["cylinder"]["edge_squeeze"])
+    )
+    config["cylinder"]["squeeze_power"] = float(
+        user_warp.get("squeeze_power", config["cylinder"]["squeeze_power"])
+    )
+    config["cylinder"]["center_focus_width"] = float(
+        user_warp.get("center_focus_width", config["cylinder"]["center_focus_width"])
+    )
 
     if "feather_radius" in user_warp:
         config["edge"]["feather_px"] = int(user_warp.get("feather_radius", config["edge"]["feather_px"]))
@@ -252,20 +301,39 @@ def _merge_adhoc_user_config(config: dict, config_json: Optional[str]) -> dict:
     return config
 
 
-def _build_preview_design_canvas(size: int = 400) -> np.ndarray:
-    canvas = np.zeros((size, size, 4), dtype=np.uint8)
-    cell = max(16, size // 10)
-    for y in range(0, size, cell):
-        for x in range(0, size, cell):
-            even = ((x // cell) + (y // cell)) % 2 == 0
+def _compute_adaptive_grid(width: int, height: int, cell_px: int = GRID_CELL_PX) -> tuple[int, int]:
+    safe_w = max(1, int(width))
+    safe_h = max(1, int(height))
+    cols = int(np.clip(np.round(safe_w / max(cell_px, 1)), MIN_GRID_DIVS, MAX_GRID_DIVS))
+    rows = int(np.clip(np.round(safe_h / max(cell_px, 1)), MIN_GRID_DIVS, MAX_GRID_DIVS))
+    return cols, rows
+
+
+def _build_preview_design_canvas(width: int, height: int, cell_px: int = GRID_CELL_PX) -> np.ndarray:
+    safe_w = max(1, int(width))
+    safe_h = max(1, int(height))
+    cols, rows = _compute_adaptive_grid(safe_w, safe_h, cell_px=cell_px)
+    canvas = np.zeros((safe_h, safe_w, 4), dtype=np.uint8)
+
+    x_edges = np.linspace(0, safe_w, cols + 1, dtype=np.int32)
+    y_edges = np.linspace(0, safe_h, rows + 1, dtype=np.int32)
+
+    for r in range(rows):
+        y0, y1 = int(y_edges[r]), int(y_edges[r + 1])
+        for c in range(cols):
+            x0, x1 = int(x_edges[c]), int(x_edges[c + 1])
+            even = (r + c) % 2 == 0
             color = 240 if even else 160
             alpha = 100 if even else 55
-            canvas[y : y + cell, x : x + cell, :3] = [color, color, color]
-            canvas[y : y + cell, x : x + cell, 3] = alpha
+            canvas[y0:y1, x0:x1, :3] = [color, color, color]
+            canvas[y0:y1, x0:x1, 3] = alpha
 
-    for v in range(0, size + 1, cell):
-        cv2.line(canvas, (v, 0), (v, size - 1), (255, 255, 255, 170), 1, cv2.LINE_AA)
-        cv2.line(canvas, (0, v), (size - 1, v), (255, 255, 255, 170), 1, cv2.LINE_AA)
+    for x in x_edges:
+        xi = int(np.clip(x, 0, safe_w - 1))
+        cv2.line(canvas, (xi, 0), (xi, safe_h - 1), (255, 255, 255, 170), 1, cv2.LINE_AA)
+    for y in y_edges:
+        yi = int(np.clip(y, 0, safe_h - 1))
+        cv2.line(canvas, (0, yi), (safe_w - 1, yi), (255, 255, 255, 170), 1, cv2.LINE_AA)
     return canvas
 
 
@@ -298,15 +366,25 @@ def _render_warp_preview_image(req: WarpPreviewRequest, design_canvas: np.ndarra
     if req.warp_type == "cylinder":
         smile_val = float(req.curve)
         pitch_val = float(req.print_area.get("camera_elevation", 0))
+        _log_horizontal_squeeze_debug(
+            source="warp-preview",
+            theta_max_deg=req.theta_max_deg,
+            edge_squeeze=req.edge_squeeze,
+            squeeze_power=req.squeeze_power,
+            center_focus_width=req.center_focus_width,
+        )
         warped = cylindrical_warp(
             design_canvas,
             pa,
             (w, h),
-            req.theta_max_deg,
-            pitch_val,
-            smile_val,
-            req.curve_top,
-            req.curve_bottom,
+            theta_max_deg=req.theta_max_deg,
+            pitch=pitch_val,
+            smile_base=smile_val,
+            curve_top=req.curve_top,
+            curve_bottom=req.curve_bottom,
+            edge_squeeze=req.edge_squeeze,
+            squeeze_power=req.squeeze_power,
+            center_focus_width=req.center_focus_width,
         )
     elif req.warp_type == "tps":
         src_pts_px = np.float32(req.print_area.get("mesh_control_src", []))
@@ -488,11 +566,21 @@ async def renderAdhoc(
         else:
             specular_map = np.zeros((h, w), dtype=np.float32)
         logging.getLogger("mockup_service").info(
-            "render-adhoc effective warp: theta_max_deg=%s curve_top=%s curve_bottom=%s pitch=%s",
+            "render-adhoc effective warp: theta_max_deg=%s curve_top=%s curve_bottom=%s pitch=%s edge_squeeze=%s squeeze_power=%s center_focus_width=%s",
             config.get("cylinder", {}).get("theta_max_deg"),
             config.get("cylinder", {}).get("curve_top"),
             config.get("cylinder", {}).get("curve_bottom"),
             config.get("cylinder", {}).get("pitch"),
+            config.get("cylinder", {}).get("edge_squeeze"),
+            config.get("cylinder", {}).get("squeeze_power"),
+            config.get("cylinder", {}).get("center_focus_width"),
+        )
+        _log_horizontal_squeeze_debug(
+            source="render-adhoc",
+            theta_max_deg=float(config.get("cylinder", {}).get("theta_max_deg", 52.0)),
+            edge_squeeze=float(config.get("cylinder", {}).get("edge_squeeze", 0.0)),
+            squeeze_power=float(config.get("cylinder", {}).get("squeeze_power", 2.0)),
+            center_focus_width=float(config.get("cylinder", {}).get("center_focus_width", 0.0)),
         )
 
         product_type = config.get("product_type", "mug")
@@ -538,7 +626,12 @@ async def renderAdhoc(
 
 @router.post("/mockup/warp-preview")
 async def renderWarpPreview(req: WarpPreviewRequest):
-    design_canvas = _build_preview_design_canvas(400)
+    canvas_w, canvas_h = estimate_print_area_canvas_size(
+        req.print_area,
+        fallback_width=req.mockup_width,
+        fallback_height=req.mockup_height,
+    )
+    design_canvas = _build_preview_design_canvas(canvas_w, canvas_h)
     warped = _render_warp_preview_image(req, design_canvas)
 
     ok, buf = cv2.imencode(".png", warped)

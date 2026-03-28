@@ -10,8 +10,16 @@ export default function LivePreview() {
   // Custom mockups
   const [mockupFile, setMockupFile] = useState<File | null>(null)
   const [printArea, setPrintArea] = useState<any>(null)
-  const [warpConfigObj, setWarpConfigObj] = useState<any>({ warp_type: 'cylinder', theta_max_deg: 52, curve: 0.15 })
+  const [warpConfigObj, setWarpConfigObj] = useState<any>({
+    warp_type: 'cylinder',
+    theta_max_deg: 52,
+    curve: 0.15,
+    edge_squeeze: 0,
+    squeeze_power: 2,
+    center_focus_width: 0,
+  })
   const [lockedSnapshot, setLockedSnapshot] = useState<{ printArea: any; warpConfig: any } | null>(null)
+  const [liveEditorSnapshot, setLiveEditorSnapshot] = useState<{ printArea: any; warpConfig: any } | null>(null)
   const liveEditorSnapshotRef = useRef<{ printArea: any; warpConfig: any } | null>(null)
   const [showEditor, setShowEditor] = useState(false)
   const [productType, setProductType] = useState('') // Initial empty state to enforce selection
@@ -35,10 +43,22 @@ export default function LivePreview() {
     return mockupFile ? URL.createObjectURL(mockupFile) : null
   }, [mockupFile])
 
+  useEffect(() => {
+    return () => {
+      if (mockupPreviewUrl) URL.revokeObjectURL(mockupPreviewUrl)
+    }
+  }, [mockupPreviewUrl])
+
+  const effectiveSnapshot = liveEditorSnapshotRef.current || liveEditorSnapshot
+  const effectivePrintArea = effectiveSnapshot?.printArea || lockedSnapshot?.printArea || printArea
+  const effectiveWarp = effectiveSnapshot?.warpConfig || lockedSnapshot?.warpConfig || warpConfigObj
+  const hasEffectivePrintArea = Boolean(effectivePrintArea)
+
   const handleRender = async () => {
     if (!designFile) return
     if (mode === 'template' && !selectedTemplate) return
     if (mode === 'adhoc' && !mockupFile) return
+    if (mode === 'adhoc' && !effectivePrintArea) return
 
     setLoading(true)
     const formData = new FormData()
@@ -52,9 +72,6 @@ export default function LivePreview() {
       } else {
         formData.append('mockup_image', mockupFile!)
         formData.append('output_format', 'png')
-        const liveSnapshot = liveEditorSnapshotRef.current
-        const effectivePrintArea = liveSnapshot?.printArea || lockedSnapshot?.printArea || printArea
-        const effectiveWarp = liveSnapshot?.warpConfig || lockedSnapshot?.warpConfig || warpConfigObj
         if (effectivePrintArea) {
           const isCylinderProduct = String(effectiveWarp?.product_type || productType).startsWith('cylinder')
           console.info('[Gen Mockup] effective adhoc payload', {
@@ -110,15 +127,24 @@ export default function LivePreview() {
       if (timeStr) setRenderTime(parseInt(timeStr, 10))
 
       const blob = await res.blob()
-      setPreviewUrl(URL.createObjectURL(blob))
+      setPreviewUrl(prev => {
+        if (prev) URL.revokeObjectURL(prev)
+        return URL.createObjectURL(blob)
+      })
     } catch (e: any) {
       alert(`Lỗi kết nối: ${e.message}`)
+    } finally {
+      setLoading(false)
     }
-    setLoading(false)
   }
 
-  const isValid = designFile && (mode === 'template' ? selectedTemplate !== '' : mockupFile !== null)
-  const hasEffectivePrintArea = Boolean(liveEditorSnapshotRef.current?.printArea || lockedSnapshot?.printArea || printArea)
+  const isValid = Boolean(
+    designFile && (
+      mode === 'template'
+        ? selectedTemplate !== ''
+        : mockupFile !== null && hasEffectivePrintArea
+    )
+  )
 
   return (
     <div style={{ display: 'flex', gap: '2rem', height: '100%' }}>
@@ -169,6 +195,7 @@ export default function LivePreview() {
                   // Reset if module changes
                   setPrintArea(null);
                   setLockedSnapshot(null);
+                  setLiveEditorSnapshot(null);
                   liveEditorSnapshotRef.current = null;
                   setMockupFile(null);
                 }}
@@ -203,6 +230,7 @@ export default function LivePreview() {
                     onChange={e => {
                       setMockupFile(e.target.files?.[0] || null);
                       setLockedSnapshot(null);
+                      setLiveEditorSnapshot(null);
                       liveEditorSnapshotRef.current = null;
                       if (e.target.files?.[0]) setShowEditor(true);
                     }}
@@ -311,7 +339,10 @@ export default function LivePreview() {
                     ...warpConfigObj,
                     tilt_deg: warpConfigObj.tilt_deg || 0,
                     rotate_deg: warpConfigObj.rotate_deg || 0,
-                    persp_strength: warpConfigObj.persp_strength || 0
+                    persp_strength: warpConfigObj.persp_strength || 0,
+                    edge_squeeze: warpConfigObj.edge_squeeze ?? 0,
+                    squeeze_power: warpConfigObj.squeeze_power ?? 2,
+                    center_focus_width: warpConfigObj.center_focus_width ?? 0,
                   }}
                   onCoordinatesChange={setPrintArea}
                   onConfigChange={(newConfig) => {
@@ -320,6 +351,7 @@ export default function LivePreview() {
                   onLockedSnapshotChange={setLockedSnapshot}
                   onLiveSnapshotChange={(snapshot) => {
                     liveEditorSnapshotRef.current = snapshot;
+                    setLiveEditorSnapshot(snapshot);
                   }}
                 />
               </div>
