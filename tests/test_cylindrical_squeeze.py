@@ -64,6 +64,21 @@ class HorizontalSqueezeTests(unittest.TestCase):
         self.assertAlmostEqual(float(widened[1]), 0.91428571, places=6)
         self.assertGreater(float(widened[0]) - 0.2, float(widened[1]) - 0.8)
 
+    def test_negative_center_width_shrinks_middle_band_and_expands_sides(self) -> None:
+        theta_max = np.radians(52.0)
+        narrowed = apply_horizontal_squeeze(
+            np.array([0.2 * theta_max, 0.8 * theta_max], dtype=np.float32),
+            theta_max,
+            edge_squeeze=0.0,
+            squeeze_power=2.0,
+            center_focus_width=-1.0,
+        )
+
+        self.assertAlmostEqual(float(narrowed[0]), 0.06666667, places=6)
+        self.assertAlmostEqual(float(narrowed[1]), 0.74285714, places=6)
+        self.assertLess(float(narrowed[0]), 0.2)
+        self.assertLess(float(narrowed[1]), 0.8)
+
     def test_width_and_edge_are_visibly_distinct_profiles(self) -> None:
         theta_max = np.radians(52.0)
         theta = np.array([0.3 * theta_max, 0.6 * theta_max], dtype=np.float32)
@@ -86,6 +101,33 @@ class HorizontalSqueezeTests(unittest.TestCase):
         self.assertGreater(float(width_only[0]), float(edge_only[0]))
         self.assertAlmostEqual(float(edge_only[0]), 0.3, places=6)
         self.assertGreater(float(edge_only[1]), 0.6)
+
+    def test_negative_width_is_active_and_changes_horizontal_mapping(self) -> None:
+        x = np.linspace(-1.0, 1.0, 33, dtype=np.float32)[None, :]
+        y = np.linspace(-1.0, 1.0, 9, dtype=np.float32)[:, None]
+        x_proj = np.broadcast_to(x, (9, 33))
+        y_proj = np.broadcast_to(y, (9, 33))
+
+        u_base, v_base = compute_uv_cylindrical(
+            x_proj,
+            y_proj,
+            theta_max_deg=52.0,
+            curve_top=12.0,
+            curve_bottom=-8.0,
+        )
+        u_width, v_width = compute_uv_cylindrical(
+            x_proj,
+            y_proj,
+            theta_max_deg=52.0,
+            curve_top=12.0,
+            curve_bottom=-8.0,
+            edge_squeeze=0.0,
+            squeeze_power=2.0,
+            center_focus_width=-1.0,
+        )
+
+        self.assertGreater(np.max(np.abs(u_width - u_base)), 1e-5)
+        np.testing.assert_allclose(v_width, v_base, atol=1e-6)
 
     def test_zero_edge_and_width_is_noop_in_uv(self) -> None:
         x_proj = np.linspace(-1.0, 1.0, 17, dtype=np.float32)[None, :]

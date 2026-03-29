@@ -17,6 +17,7 @@ interface PrintAreaEditorProps {
 }
 
 const BASE_CENTER_BAND = 0.30;
+const MIN_CENTER_BAND = 0.10;
 const MAX_CENTER_BAND = 0.70;
 const BASE_EDGE_ROLL_START = 0.55;
 
@@ -97,16 +98,19 @@ function apply_homography(H: number[], u: number, v: number): Point {
 }
 
 function computeCenterBand(centerFocusWidth: number): number {
-  const widthStrength = Math.max(0, Math.min(1, centerFocusWidth));
-  return BASE_CENTER_BAND + (MAX_CENTER_BAND - BASE_CENTER_BAND) * widthStrength;
+  const widthStrength = Math.max(-1, Math.min(1, centerFocusWidth));
+  if (widthStrength >= 0) {
+    return BASE_CENTER_BAND + (MAX_CENTER_BAND - BASE_CENTER_BAND) * widthStrength;
+  }
+  return BASE_CENTER_BAND + (BASE_CENTER_BAND - MIN_CENTER_BAND) * widthStrength;
 }
 
 function applyCenterFocusWidth(radius: number, centerFocusWidth: number): number {
-  const widthStrength = Math.max(0, Math.min(1, centerFocusWidth));
-  if (widthStrength <= 1e-8) return radius;
+  const widthStrength = Math.max(-1, Math.min(1, centerFocusWidth));
+  if (Math.abs(widthStrength) <= 1e-8) return radius;
 
   const sourceBand = BASE_CENTER_BAND;
-  const targetBand = computeCenterBand(widthStrength);
+  const targetBand = computeCenterBand(centerFocusWidth);
 
   if (radius <= sourceBand) {
     const innerRatio = Math.max(0, Math.min(1, radius / Math.max(sourceBand, 1e-8)));
@@ -135,8 +139,8 @@ function applyEdgeRoll(radius: number, edgeSqueeze: number, squeezePower: number
 
 function applyHorizontalSqueeze(t: number, edgeSqueeze: number, squeezePower: number, centerFocusWidth: number): number {
   const blend = Math.max(0, Math.min(1, edgeSqueeze));
-  const width = Math.max(0, Math.min(1, centerFocusWidth));
-  if (blend <= 1e-8 && width <= 1e-8) return t;
+  const width = Math.max(-1, Math.min(1, centerFocusWidth));
+  if (blend <= 1e-8 && Math.abs(width) <= 1e-8) return t;
   const radius = Math.abs(t);
   const widthAdjustedRadius = applyCenterFocusWidth(radius, width);
   const mappedRadius = applyEdgeRoll(widthAdjustedRadius, blend, squeezePower, width);
@@ -220,7 +224,7 @@ function buildHorizontalSqueezeDebug(edgeSqueeze: number, squeezePower: number, 
   const sampleDelta = sampleOut.map((mapped, index) => Number((mapped - sampleIn[index]).toFixed(4)));
 
   const hasEdge = edgeSqueeze > 1e-8;
-  const hasWidth = centerFocusWidth > 1e-8;
+  const hasWidth = Math.abs(centerFocusWidth) > 1e-8;
   let inactiveReason: string | null = null;
   let mode = 'edge_and_width_active';
   if (!hasEdge && !hasWidth) {
@@ -465,7 +469,7 @@ export default function PrintAreaEditor(props: PrintAreaEditorProps) {
 
   useEffect(() => {
     if (!productType.includes('cylinder')) return;
-    if (centerFocusWidth <= 0 && edgeSqueeze <= 0) return;
+    if (Math.abs(centerFocusWidth) <= 1e-8 && edgeSqueeze <= 0) return;
 
     const debug = buildHorizontalSqueezeDebug(edgeSqueeze, squeezePower, centerFocusWidth);
     console.info('[PrintAreaEditor] horizontal squeeze debug', {
@@ -817,7 +821,7 @@ export default function PrintAreaEditor(props: PrintAreaEditorProps) {
         template_id: templateId,
       };
 
-      if (payload.warp_type === 'cylinder' && (centerFocusWidth > 0 || edgeSqueeze > 0)) {
+      if (payload.warp_type === 'cylinder' && (Math.abs(centerFocusWidth) > 1e-8 || edgeSqueeze > 0)) {
         console.info('[Warp Preview] request payload', {
           theta_max_deg: payload.theta_max_deg,
           edge_squeeze: payload.edge_squeeze,
@@ -1088,7 +1092,7 @@ export default function PrintAreaEditor(props: PrintAreaEditorProps) {
             <ControlAdjuster label="Cong mép dưới" description="Bẻ đường mép dưới lên hoặc xuống để khớp đáy cốc." value={-curveBot} min={-100} max={100} unit="%" onChange={(v) => setCurveBot(-v)} />
             <ControlAdjuster label="Cường độ ép mép" description="Cuộn dải gần hai mép vào trong. Vùng giữa gần như giữ nguyên, chỉ phần rìa bị ép mạnh hơn." value={edgeSqueeze} min={0} max={1} step={0.1} onChange={setEdgeSqueeze} />
             <ControlAdjuster label="Độ mạnh chuyển tiếp" description="Điều khiển độ gắt của vùng cuộn mép. Cao hơn thì hiệu ứng dồn sát về mép rõ hơn." value={squeezePower} min={1} max={5} step={0.1} onChange={setSqueezePower} />
-            <ControlAdjuster label="Độ rộng vùng giữa" description="Mở rộng băng giữa thật sự. Tăng lên thì các ô ở giữa rộng ra, còn hai mép bị co lại tương ứng." value={centerFocusWidth} min={0} max={1} step={0.1} onChange={setCenterFocusWidth} />
+            <ControlAdjuster label="Độ rộng vùng giữa" description="Số dương: nới băng giữa, làm các ô ở giữa rộng ra và hai mép hẹp lại. Số âm: đảo chiều, siết băng giữa và dồn độ rộng ra hai mép." value={centerFocusWidth} min={-1} max={1} step={0.1} onChange={setCenterFocusWidth} />
           </div>
         )}
         {activeGroup === 'blend' && (

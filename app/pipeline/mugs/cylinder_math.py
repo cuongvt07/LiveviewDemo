@@ -2,22 +2,25 @@ import numpy as np
 
 
 BASE_CENTER_BAND = 0.30
+MIN_CENTER_BAND = 0.10
 MAX_CENTER_BAND = 0.70
 BASE_EDGE_ROLL_START = 0.55
 
 
 def _compute_center_band(center_focus_width: float) -> float:
-    width_strength = float(np.clip(center_focus_width, 0.0, 1.0))
-    return BASE_CENTER_BAND + (MAX_CENTER_BAND - BASE_CENTER_BAND) * width_strength
+    width_strength = float(np.clip(center_focus_width, -1.0, 1.0))
+    if width_strength >= 0.0:
+        return BASE_CENTER_BAND + (MAX_CENTER_BAND - BASE_CENTER_BAND) * width_strength
+    return BASE_CENTER_BAND + (BASE_CENTER_BAND - MIN_CENTER_BAND) * width_strength
 
 
 def apply_center_focus_width(radius: np.ndarray, center_focus_width: float) -> np.ndarray:
-    width_strength = float(np.clip(center_focus_width, 0.0, 1.0))
-    if width_strength <= 1e-8:
+    width_strength = float(np.clip(center_focus_width, -1.0, 1.0))
+    if abs(width_strength) <= 1e-8:
         return radius
 
     source_band = BASE_CENTER_BAND
-    target_band = _compute_center_band(width_strength)
+    target_band = _compute_center_band(center_focus_width)
 
     inner_ratio = np.clip(radius / max(source_band, 1e-8), 0.0, 1.0)
     inner_mapped = target_band * inner_ratio
@@ -70,7 +73,7 @@ def summarize_horizontal_squeeze(
     sample_delta = np.round(mapped - samples, 4).tolist()
 
     has_edge = edge_squeeze > 1e-8
-    has_width = center_focus_width > 1e-8
+    has_width = abs(center_focus_width) > 1e-8
     inactive_reason = None
     mode = "edge_and_width_active"
     if not has_edge and not has_width:
@@ -103,8 +106,8 @@ def apply_horizontal_squeeze(
 
     t = np.clip(theta / theta_max, -1.0, 1.0)
     blend = float(np.clip(edge_squeeze, 0.0, 1.0))
-    width = float(np.clip(center_focus_width, 0.0, 1.0))
-    if blend <= 1e-8 and width <= 1e-8:
+    width = float(np.clip(center_focus_width, -1.0, 1.0))
+    if blend <= 1e-8 and abs(width) <= 1e-8:
         return t
 
     radius = np.abs(t)

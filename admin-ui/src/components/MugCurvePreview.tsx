@@ -21,6 +21,7 @@ interface MugCurvePreviewProps {
 }
 
 const BASE_CENTER_BAND = 0.30;
+const MIN_CENTER_BAND = 0.10;
 const MAX_CENTER_BAND = 0.70;
 const BASE_EDGE_ROLL_START = 0.55;
 const GRID_CELL_PX = 90;
@@ -84,16 +85,19 @@ function apply_homography(H: number[], u: number, v: number): Point {
 }
 
 function computeCenterBand(centerFocusWidth: number): number {
-  const widthStrength = Math.max(0, Math.min(1, centerFocusWidth));
-  return BASE_CENTER_BAND + (MAX_CENTER_BAND - BASE_CENTER_BAND) * widthStrength;
+  const widthStrength = Math.max(-1, Math.min(1, centerFocusWidth));
+  if (widthStrength >= 0) {
+    return BASE_CENTER_BAND + (MAX_CENTER_BAND - BASE_CENTER_BAND) * widthStrength;
+  }
+  return BASE_CENTER_BAND + (BASE_CENTER_BAND - MIN_CENTER_BAND) * widthStrength;
 }
 
 function applyCenterFocusWidth(radius: number, centerFocusWidth: number): number {
-  const widthStrength = Math.max(0, Math.min(1, centerFocusWidth));
-  if (widthStrength <= 1e-8) return radius;
+  const widthStrength = Math.max(-1, Math.min(1, centerFocusWidth));
+  if (Math.abs(widthStrength) <= 1e-8) return radius;
 
   const sourceBand = BASE_CENTER_BAND;
-  const targetBand = computeCenterBand(widthStrength);
+  const targetBand = computeCenterBand(centerFocusWidth);
 
   if (radius <= sourceBand) {
     const innerRatio = Math.max(0, Math.min(1, radius / Math.max(sourceBand, 1e-8)));
@@ -122,8 +126,8 @@ function applyEdgeRoll(radius: number, edgeSqueeze: number, squeezePower: number
 
 function applyHorizontalSqueeze(t: number, edgeSqueeze: number, squeezePower: number, centerFocusWidth: number): number {
   const blend = Math.max(0, Math.min(1, edgeSqueeze));
-  const width = Math.max(0, Math.min(1, centerFocusWidth));
-  if (blend <= 1e-8 && width <= 1e-8) return t;
+  const width = Math.max(-1, Math.min(1, centerFocusWidth));
+  if (blend <= 1e-8 && Math.abs(width) <= 1e-8) return t;
   const radius = Math.abs(t);
   const widthAdjustedRadius = applyCenterFocusWidth(radius, width);
   const mappedRadius = applyEdgeRoll(widthAdjustedRadius, blend, squeezePower, width);
