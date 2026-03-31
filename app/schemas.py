@@ -112,3 +112,8 @@ class TemplateSaveAdhoc(BaseModel):
     # If it's a new upload, the frontend should upload it first to library, then call this.
     output_width: int = 1500
     output_height: int = 1500
+    preview_data_url: Optional[str] = None
+
+
+class UrlAnalysisImportRequest(BaseModel):
+    source_url: str = Field(..., min_length=8, max_length=2000)

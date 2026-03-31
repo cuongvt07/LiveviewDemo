@@ -3,6 +3,7 @@
 import asyncio
 import json
 import logging
+import os
 import uuid
 from pathlib import Path
 from typing import Optional
@@ -26,6 +27,7 @@ from app.pipeline.shared.decode import decode_design
 from app.pipeline.shared.design_transform import apply_design_transform, estimate_print_area_canvas_size
 from app.pipeline.shared.smooth_mesh_warp import apply_smooth_mesh_warp
 from app.services import template_registry
+from app.services.url_analysis import resolve_local_asset_path
 from app.services.vision import auto_detect_print_area_v2, bake_normal_map, create_soft_mask
 
 router = APIRouter(tags=["render"])
@@ -88,6 +90,7 @@ class WarpPreviewRequest(BaseModel):
     design_scale: float = 1.0
     design_offset_x: float = 0.0
     design_offset_y: float = 0.0
+    design_fit_mode: str = "cover"
     mask_points: Optional[list[list[int]]] = None
     template_id: Optional[str] = None
 
@@ -141,6 +144,7 @@ def _build_default_adhoc_config(width: int, height: int) -> dict:
             "scale": 1.0,
             "offset_x": 0.0,
             "offset_y": 0.0,
+            "fit_mode": "cover",
         },
         "lighting": {
             # Ad-hoc mug defaults aim for realism instead of a flat raw overlay.
@@ -193,6 +197,10 @@ def _merge_adhoc_user_config(config: dict, config_json: Optional[str]) -> dict:
         user_config = json.loads(config_json)
     except Exception:
         return config
+
+    def _normalize_design_fit_mode(value: object) -> str:
+        lowered = str(value or "cover").strip().lower()
+        return lowered if lowered in {"cover", "contain"} else "cover"
 
     user_pa = user_config.get("print_area", {})
     if isinstance(user_pa, dict):
@@ -404,6 +412,9 @@ def _merge_adhoc_user_config(config: dict, config_json: Optional[str]) -> dict:
         "scale": float(user_warp.get("design_scale", config["design_transform"]["scale"])),
         "offset_x": float(user_warp.get("design_offset_x", config["design_transform"]["offset_x"])),
         "offset_y": float(user_warp.get("design_offset_y", config["design_transform"]["offset_y"])),
+        "fit_mode": _normalize_design_fit_mode(
+            user_warp.get("design_fit_mode", config["design_transform"].get("fit_mode", "cover"))
+        ),
     }
 
     if has_manual_mesh:
@@ -501,6 +512,7 @@ def _render_warp_preview_image(
         scale=req.design_scale,
         offset_x=req.design_offset_x,
         offset_y=req.design_offset_y,
+        fit_mode=req.design_fit_mode,
         target_width=canvas_w,
         target_height=canvas_h,
     )
@@ -588,7 +600,8 @@ def _render_warp_preview_image(
 
 @router.post("/mockup/render")
 async def renderMockup(
-    design_image: UploadFile = File(...),
+    design_image: Optional[UploadFile] = File(None),
+    design_url: Optional[str] = Form(None),
     template_id: str = Form(...),
     output_format: str = Form("jpg"),
     jpeg_quality: int = Form(None),
@@ -630,7 +643,30 @@ async def renderMockup(
                 detail={"error": "render_failed", "message": str(exc), "request_id": request_id},
             ) from exc
 
-    design_bytes = await design_image.read()
+    if design_image is not None:
+        design_bytes = await design_image.read()
+    elif design_url:
+        p = resolve_local_asset_path(design_url)
+        if not p.exists():
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "error": "design_not_found",
+                    "message": f"Design URL {design_url} not found",
+                    "request_id": request_id,
+                },
+            )
+        design_bytes = p.read_bytes()
+    else:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "missing_design",
+                "message": "Missing design_image or design_url",
+                "request_id": request_id,
+            },
+        )
+
     quality = jpeg_quality if jpeg_quality is not None else assets.config.get("output", {}).get("jpeg_quality", 90)
 
     try:
@@ -684,10 +720,7 @@ async def renderAdhoc(
         if mockup_image:
             mockup_bytes = await mockup_image.read()
         elif mockup_url:
-            local_path = mockup_url
-            if local_path.startswith('/static/'):
-                local_path = local_path.replace('/static/', 'inputs/')
-            p = Path(local_path)
+            p = resolve_local_asset_path(mockup_url)
             if not p.exists():
                 raise HTTPException(status_code=400, detail=f"Mockup URL {mockup_url} not found")
             mockup_bytes = p.read_bytes()
@@ -698,10 +731,7 @@ async def renderAdhoc(
         if design_image:
             design_bytes = await design_image.read()
         elif design_url:
-            local_path = design_url
-            if local_path.startswith('/static/'):
-                local_path = local_path.replace('/static/', 'inputs/')
-            p = Path(local_path)
+            p = resolve_local_asset_path(design_url)
             if not p.exists():
                 raise HTTPException(status_code=400, detail=f"Design URL {design_url} not found")
             design_bytes = p.read_bytes()
@@ -947,6 +977,8 @@ async def bakeNormal(
 
 @router.get("/templates")
 async def listTemplates():
+    asset_base_dir = Path(os.getenv("ASSET_BASE_DIR", "./templates"))
+
     async with async_session() as session:
         stmt = select(Template).where(Template.status == "active")
         result = await session.execute(stmt)
@@ -957,7 +989,11 @@ async def listTemplates():
             {
                 "id": t.slug,
                 "name": t.name,
-                "preview_url": f"/static/templates/{t.slug}/mockup.jpg",
+                "preview_url": (
+                    f"/static/templates/{t.slug}/preview.png"
+                    if (asset_base_dir / t.slug / "preview.png").exists()
+                    else f"/static/templates/{t.slug}/mockup.jpg"
+                ),
                 "output_size": [t.output_width, t.output_height],
             }
             for t in templates

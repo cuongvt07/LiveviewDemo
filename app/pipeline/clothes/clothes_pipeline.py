@@ -49,6 +49,7 @@ def run_clothes_pipeline(
         scale=dt.get("scale", 1.0),
         offset_x=dt.get("offset_x", 0.0),
         offset_y=dt.get("offset_y", 0.0),
+        fit_mode=dt.get("fit_mode", "cover"),
         target_width=canvas_w,
         target_height=canvas_h,
     )

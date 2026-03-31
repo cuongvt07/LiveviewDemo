@@ -29,6 +29,7 @@ async def lifespan(app: FastAPI):
     os.makedirs(ASSET_BASE_DIR, exist_ok=True)
     os.makedirs('inputs/bases', exist_ok=True)
     os.makedirs('inputs/artworks', exist_ok=True)
+    os.makedirs('public/mockups', exist_ok=True)
 
     # Load templates từ DB vào cache
     try:
@@ -103,6 +104,8 @@ if os.path.exists('inputs/bases'):
     app.mount('/static/bases', StaticFiles(directory='inputs/bases'), name='bases')
 if os.path.exists('inputs/artworks'):
     app.mount('/static/artworks', StaticFiles(directory='inputs/artworks'), name='artworks')
+if os.path.exists('public/mockups'):
+    app.mount('/static/mockups', StaticFiles(directory='public/mockups'), name='mockups')
 
 from fastapi import Request
 import time

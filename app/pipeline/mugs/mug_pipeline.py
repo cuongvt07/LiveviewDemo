@@ -65,6 +65,7 @@ def run_mug_pipeline(
         scale=design_transform.get("scale", 1.0),
         offset_x=design_transform.get("offset_x", 0.0),
         offset_y=design_transform.get("offset_y", 0.0),
+        fit_mode=design_transform.get("fit_mode", "cover"),
         target_width=canvas_w,
         target_height=canvas_h,
     )

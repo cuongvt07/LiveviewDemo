@@ -35,6 +35,7 @@ def apply_design_transform(
     scale: float = 1.0,
     offset_x: float = 0.0,
     offset_y: float = 0.0,
+    fit_mode: str = "cover",
     target_width: int | None = None,
     target_height: int | None = None,
 ) -> np.ndarray:
@@ -43,12 +44,18 @@ def apply_design_transform(
     - Preserves original artwork aspect ratio.
     - Uses a print-area viewport model instead of translating inside the raw image canvas.
       This avoids exposing transparent borders during normal drag/pan.
-    - scale: user zoom factor relative to the auto-fit "cover" size.
+    - fit_mode:
+        - "cover": artwork fills the print viewport, possibly cropping overflow.
+        - "contain": artwork stays fully inside the print viewport with transparent margins if needed.
+    - scale: user zoom factor relative to the auto-fit base size selected by fit_mode.
     - offset_x/offset_y: normalized pan inside the overflow area, expected in [-1, 1].
     """
     user_scale = max(0.05, float(scale))
     offset_x = float(np.clip(offset_x, -1.0, 1.0))
     offset_y = float(np.clip(offset_y, -1.0, 1.0))
+    normalized_fit_mode = str(fit_mode or "cover").strip().lower()
+    if normalized_fit_mode not in {"cover", "contain"}:
+        normalized_fit_mode = "cover"
 
     src_h, src_w = design.shape[:2]
     dst_w = max(1, int(target_width or src_w))
@@ -57,7 +64,12 @@ def apply_design_transform(
     if src_w <= 0 or src_h <= 0:
         return design
 
-    base_scale = max(dst_w / max(src_w, 1), dst_h / max(src_h, 1))
+    width_scale = dst_w / max(src_w, 1)
+    height_scale = dst_h / max(src_h, 1)
+    if normalized_fit_mode == "contain":
+        base_scale = min(width_scale, height_scale)
+    else:
+        base_scale = max(width_scale, height_scale)
     total_scale = base_scale * user_scale
     scaled_w = src_w * total_scale
     scaled_h = src_h * total_scale

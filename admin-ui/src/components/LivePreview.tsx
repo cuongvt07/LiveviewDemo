@@ -2,6 +2,22 @@ import { useState, useEffect, useMemo, useRef } from 'react'
 import PrintAreaEditor from './PrintAreaEditor'
 import LibraryPicker from './LibraryPicker'
 
+function isObjectUrl(value: string | null): boolean {
+  return Boolean(value && value.startsWith('blob:'))
+}
+
+function blobToDataUrl(blob: Blob): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader()
+    reader.onloadend = () => {
+      if (typeof reader.result === 'string') resolve(reader.result)
+      else reject(new Error('Không thể đọc ảnh preview'))
+    }
+    reader.onerror = () => reject(reader.error || new Error('Không thể đọc ảnh preview'))
+    reader.readAsDataURL(blob)
+  })
+}
+
 export default function LivePreview() {
   const [mode, setMode] = useState<'template' | 'adhoc'>('template')
   const [templates, setTemplates] = useState<any[]>([])
@@ -36,6 +52,10 @@ export default function LivePreview() {
   const [pickerType, setPickerType] = useState<'bases' | 'artworks' | null>(null)
   const [libraryMockupUrl, setLibraryMockupUrl] = useState<string | null>(null)
   const [libraryDesignUrl, setLibraryDesignUrl] = useState<string | null>(null)
+  const [sourceProductUrl, setSourceProductUrl] = useState('')
+  const [urlImporting, setUrlImporting] = useState(false)
+  const [urlImportSummary, setUrlImportSummary] = useState<any | null>(null)
+  const [resolvedTemplatePreviewUrl, setResolvedTemplatePreviewUrl] = useState<string | null>(null)
   
   // Results
   const [previewUrl, setPreviewUrl] = useState<string | null>(null)
@@ -85,11 +105,15 @@ export default function LivePreview() {
 
   useEffect(() => {
     setPreviewUrl(prev => {
-      if (prev) URL.revokeObjectURL(prev)
+      if (prev && isObjectUrl(prev)) URL.revokeObjectURL(prev)
       return null
     })
     setRenderTime(null)
   }, [designFile, libraryDesignUrl, mockupFile, libraryMockupUrl, mode, selectedTemplate])
+
+  useEffect(() => {
+    setResolvedTemplatePreviewUrl(null)
+  }, [designFile, libraryDesignUrl, mockupFile, libraryMockupUrl, sourceProductUrl])
 
   useEffect(() => {
     if (!isValid) return
@@ -186,8 +210,9 @@ export default function LivePreview() {
       if (timeStr) setRenderTime(parseInt(timeStr, 10))
 
       const blob = await res.blob()
+      setResolvedTemplatePreviewUrl(null)
       setPreviewUrl(prev => {
-        if (prev) URL.revokeObjectURL(prev)
+        if (prev && isObjectUrl(prev)) URL.revokeObjectURL(prev)
         return URL.createObjectURL(blob)
       })
     } catch (e: any) {
@@ -205,6 +230,22 @@ export default function LivePreview() {
 
     setLoading(true);
     try {
+      const previewDataUrl = previewUrl
+        ? await fetch(previewUrl).then(async response => blobToDataUrl(await response.blob()))
+        : null
+
+      const urlAnalysisMeta = urlImportSummary ? {
+        source_url: urlImportSummary.source_url,
+        parsed: urlImportSummary.parsed,
+        design_lookup_key: urlImportSummary.design_lookup_key,
+        mockup_family_key: urlImportSummary.mockup_family_key || urlImportSummary.mockup_policy_key,
+        mockup_policy_key: urlImportSummary.mockup_policy_key,
+        mockup_view: urlImportSummary.mockup_view,
+        design_url: libraryDesignUrl || urlImportSummary.design_url || null,
+        mockup_url: libraryMockupUrl || urlImportSummary.mockup_url || null,
+        design_source_url: urlImportSummary.design_source_url || null,
+        design_source_mode: urlImportSummary.design_source_mode || null,
+      } : null
       // Nếu user upload file local (chưa có trong library), tự động upload lên trước
       let resolvedMockupUrl = libraryMockupUrl || '';
       if (!resolvedMockupUrl && mockupFile) {
@@ -247,10 +288,12 @@ export default function LivePreview() {
           config: {
             print_area: effectivePrintArea,
             warp: effectiveWarp,
+            ...(urlAnalysisMeta ? { url_analysis: urlAnalysisMeta } : {}),
           },
           mockup_url: resolvedMockupUrl,
           output_width: 1500,
           output_height: 1500,
+          preview_data_url: previewDataUrl,
         }),
       });
 
@@ -273,6 +316,72 @@ export default function LivePreview() {
       setLoading(false);
     }
   };
+
+  const handleImportFromSourceUrl = async () => {
+    const normalized = sourceProductUrl.trim()
+    if (!normalized) return
+
+    setUrlImporting(true)
+    try {
+      const res = await fetch('/admin/url-analysis/import', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ source_url: normalized }),
+      })
+
+      const data = await res.json().catch(() => ({}))
+      if (!res.ok) {
+        throw new Error(data?.message || data?.detail?.message || data?.detail || `HTTP ${res.status}`)
+      }
+
+      setUrlImportSummary(data)
+      if (data.template_found && data.existing_template) {
+        setMode('template')
+        setSelectedTemplate(data.existing_template.template_id || data.existing_template.slug)
+        setShowEditor(false)
+        setMockupFile(null)
+        setDesignFile(null)
+        setLibraryMockupUrl(null)
+        setLibraryDesignUrl(null)
+        setPrintArea(null)
+        setLockedSnapshot(null)
+        setLiveEditorSnapshot(null)
+        liveEditorSnapshotRef.current = null
+        setPreviewUrl(prev => {
+          if (prev && isObjectUrl(prev)) URL.revokeObjectURL(prev)
+          return null
+        })
+        setResolvedTemplatePreviewUrl(data.existing_template.preview_url || null)
+        setRenderTime(null)
+        return
+      }
+
+      setResolvedTemplatePreviewUrl(null)
+      setProductType(data.product_type || 'cylinder_ceramic')
+      setMockupFile(null)
+      setDesignFile(null)
+      setLibraryMockupUrl(data.mockup_url || null)
+      setLibraryDesignUrl(data.design_url || null)
+      setPrintArea(data.print_area_preset || null)
+      setWarpConfigObj((prev: any) => ({
+        ...prev,
+        ...(data.warp_config_preset || {}),
+        product_type: data.product_type || prev.product_type,
+      }))
+      setLockedSnapshot(null)
+      setLiveEditorSnapshot(null)
+      liveEditorSnapshotRef.current = null
+      if (data.mockup_url) {
+        setShowEditor(true)
+      }
+    } catch (e: any) {
+      alert(`Lỗi phân tích URL: ${e.message}`)
+    } finally {
+      setUrlImporting(false)
+    }
+  }
 
   return (
     <div style={{ display: 'flex', gap: '2rem', height: '100%' }}>
@@ -312,6 +421,55 @@ export default function LivePreview() {
           </div>
         ) : (
           <div className="adhoc-workflow">
+            <div className="input-group" style={{ padding: '1rem', background: 'rgba(59,130,246,0.08)', border: '1px solid rgba(59,130,246,0.25)', borderRadius: '8px', marginBottom: '1.5rem' }}>
+              <label className="input-label" style={{ fontWeight: 'bold' }}>URL LiveView / CDN</label>
+              <div style={{ display: 'flex', gap: '0.5rem', alignItems: 'stretch' }}>
+                <input
+                  type="text"
+                  className="input-field"
+                  placeholder="Dán URL CDN Printerval để tự fill mockup và artwork"
+                  value={sourceProductUrl}
+                  onChange={e => setSourceProductUrl(e.target.value)}
+                />
+                <button
+                  className="btn btn-outline"
+                  style={{ whiteSpace: 'nowrap', padding: '0 0.9rem' }}
+                  onClick={handleImportFromSourceUrl}
+                  disabled={urlImporting || !sourceProductUrl.trim()}
+                >
+                  {urlImporting ? 'Đang phân tích...' : 'Phân tích URL'}
+                </button>
+              </div>
+              <div style={{ marginTop: '0.5rem', fontSize: '0.8rem', color: 'var(--text-secondary)', lineHeight: 1.5 }}>
+                URL sẽ được phân tích để chọn mockup local trong `public/mockups` và tải artwork tham chiếu về local.
+              </div>
+              {urlImportSummary && (
+                <div style={{ marginTop: '0.75rem', padding: '0.75rem', borderRadius: '8px', background: 'rgba(255,255,255,0.03)', fontSize: '0.8rem', lineHeight: 1.6 }}>
+                  {urlImportSummary?.template_found && urlImportSummary?.existing_template ? (
+                    <>
+                      <div><strong>Template đã có:</strong> {urlImportSummary?.existing_template?.slug || '-'}</div>
+                      <div><strong>Ảnh template:</strong> {urlImportSummary?.existing_template?.preview_url || '-'}</div>
+                      <div><strong>View đã dùng:</strong> {urlImportSummary?.existing_template?.mockup_view || '-'}</div>
+                    </>
+                  ) : (
+                    <>
+                      <div><strong>Template:</strong> {urlImportSummary?.parsed?.template || '-'}</div>
+                      <div><strong>Màu:</strong> {urlImportSummary?.parsed?.color_slug || urlImportSummary?.parsed?.color_hex || '-'}</div>
+                      <div><strong>Mockup policy:</strong> {urlImportSummary?.mockup_policy_key || '-'}</div>
+                      <div><strong>View đang chọn:</strong> {urlImportSummary?.mockup_view || '-'}</div>
+                      <div><strong>Mockup local:</strong> {urlImportSummary?.mockup_url || '-'}</div>
+                      <div><strong>Artwork local:</strong> {urlImportSummary?.design_url || '-'}</div>
+                      <div><strong>Preset vùng in:</strong> {urlImportSummary?.print_area_preset_source || '-'} ({typeof urlImportSummary?.print_area_preset_confidence === 'number' ? `${Math.round(urlImportSummary.print_area_preset_confidence * 100)}%` : '-'})</div>
+                      <div><strong>Mode tải artwork:</strong> {urlImportSummary?.design_source_mode || '-'}</div>
+                      {urlImportSummary?.warning && (
+                        <div style={{ marginTop: '0.35rem', color: '#fbbf24' }}>{urlImportSummary.warning}</div>
+                      )}
+                    </>
+                  )}
+                </div>
+              )}
+            </div>
+
             {/* STEP 1: MODULE SELECTION */}
             <div className="input-group" style={{ border: '1px solid var(--accent-color)', padding: '1rem', borderRadius: '8px', marginBottom: '1.5rem' }}>
               <label className="input-label" style={{ color: 'var(--accent-color)', fontWeight: 'bold' }}>Step 1: Chọn loại sản phẩm (Module)</label>
@@ -440,8 +598,8 @@ export default function LivePreview() {
         </div>
         
         <div className="preview-container" style={{ flex: 1, maxWidth: 'none', background: 'rgba(0,0,0,0.1)' }}>
-          {previewUrl ? (
-            <img src={previewUrl} alt="Mockup Result" className="preview-image" />
+          {(previewUrl || resolvedTemplatePreviewUrl) ? (
+            <img src={previewUrl || resolvedTemplatePreviewUrl || ''} alt="Mockup Result" className="preview-image" />
           ) : loading ? (
             <div className="empty-state">
               <div style={{ fontSize: '3rem', marginBottom: '1rem', opacity: 0.5 }}>⏳</div>
@@ -520,7 +678,7 @@ export default function LivePreview() {
               <aside style={{ width: '400px', borderLeft: '1px solid var(--border-color)', padding: '1rem', display: 'flex', flexDirection: 'column' }}>
                 <h4>Xem nhanh kết quả</h4>
                 <div style={{ flex: 1, background: '#000', borderRadius: '8px', overflow: 'hidden', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
-                  {previewUrl ? <img src={previewUrl} style={{ width: '100%', height: '100%', objectFit: 'contain' }} /> : <small>Bấm Gen Thử</small>}
+                  {(previewUrl || resolvedTemplatePreviewUrl) ? <img src={previewUrl || resolvedTemplatePreviewUrl || ''} style={{ width: '100%', height: '100%', objectFit: 'contain' }} /> : <small>Bấm Gen Thử</small>}
                 </div>
               </aside>
             </div>

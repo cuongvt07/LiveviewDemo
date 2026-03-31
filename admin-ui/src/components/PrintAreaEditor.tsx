@@ -4,6 +4,7 @@ import { WarpGridPreview } from './WarpGridPreview';
 
 interface Point { x: number; y: number; }
 interface MeshPoint { src: Point; dst: Point; }
+type DesignFitMode = 'cover' | 'contain';
 interface PrintAreaEditorProps {
   imageUrl: string;
   designFile?: File | null;
@@ -536,6 +537,7 @@ export default function PrintAreaEditor(props: PrintAreaEditorProps) {
   const [designScale, setDesignScale] = useState(toFiniteNumber(warpConfig?.design_scale, 1.0));
   const [designOffsetX, setDesignOffsetX] = useState(toFiniteNumber(warpConfig?.design_offset_x, 0.0));
   const [designOffsetY, setDesignOffsetY] = useState(toFiniteNumber(warpConfig?.design_offset_y, 0.0));
+  const [designFitMode, setDesignFitMode] = useState<DesignFitMode>(warpConfig?.design_fit_mode === 'contain' ? 'contain' : 'cover');
 
   const [editorMode, setEditorMode] = useState<'CALIBRATE' | 'DESIGN'>(
     warpConfig?.editor_mode === 'DESIGN' || warpConfig?.is_locked === true ? 'DESIGN' : 'CALIBRATE'
@@ -637,6 +639,13 @@ export default function PrintAreaEditor(props: PrintAreaEditorProps) {
     if (controlSectionRef.current) {
       controlScrollTopRef.current = controlSectionRef.current.scrollTop;
     }
+  }, []);
+
+  const applyArtworkFitPreset = useCallback((fitMode: DesignFitMode) => {
+    setDesignFitMode(fitMode);
+    setDesignScale(1);
+    setDesignOffsetX(0);
+    setDesignOffsetY(0);
   }, []);
 
   useLayoutEffect(() => {
@@ -922,6 +931,7 @@ export default function PrintAreaEditor(props: PrintAreaEditorProps) {
     setDesignScale(toFiniteNumber(warpConfig?.design_scale, 1));
     setDesignOffsetX(toFiniteNumber(warpConfig?.design_offset_x, 0));
     setDesignOffsetY(toFiniteNumber(warpConfig?.design_offset_y, 0));
+    setDesignFitMode(warpConfig?.design_fit_mode === 'contain' ? 'contain' : 'cover');
 
     // Restore lighting values if present
     setLightPosX(toFiniteNumber(warpConfig?.light_pos_x, 0.62));
@@ -1023,6 +1033,7 @@ export default function PrintAreaEditor(props: PrintAreaEditorProps) {
       design_scale: designScale,
       design_offset_x: designOffsetX,
       design_offset_y: designOffsetY,
+      design_fit_mode: designFitMode,
       editor_mode: editorMode,
       is_locked: editorMode === 'DESIGN',
       // lighting
@@ -1035,7 +1046,7 @@ export default function PrintAreaEditor(props: PrintAreaEditorProps) {
     };
 
     onLiveSnapshotChange({ printArea: pa, warpConfig: nextWarpConfig });
-  }, [basePoints, tilt, rotate, perspective, curvePct, curveTop, curveBot, edgeSqueeze, squeezePower, centerFocusWidth, meshDensityStrength, designScale, designOffsetX, designOffsetY, featherRadius, productType, maskPoints, meshPoints, naturalSize, editorMode, lightPosX, lightPosY, lightHeight, lightContrast, lightHighlight, lightSoftness]);
+  }, [basePoints, tilt, rotate, perspective, curvePct, curveTop, curveBot, edgeSqueeze, squeezePower, centerFocusWidth, meshDensityStrength, designScale, designOffsetX, designOffsetY, designFitMode, featherRadius, productType, maskPoints, meshPoints, naturalSize, editorMode, lightPosX, lightPosY, lightHeight, lightContrast, lightHighlight, lightSoftness]);
 
   useEffect(() => {
     if (naturalSize.w === 0) return;
@@ -1073,6 +1084,7 @@ export default function PrintAreaEditor(props: PrintAreaEditorProps) {
       design_scale: designScale,
       design_offset_x: designOffsetX,
       design_offset_y: designOffsetY,
+      design_fit_mode: designFitMode,
       mask_points: pa.mask_points,
       template_id: templateId,
     };
@@ -1111,7 +1123,7 @@ export default function PrintAreaEditor(props: PrintAreaEditorProps) {
       clearTimeout(timer);
       controller.abort();
     };
-  }, [basePoints, tilt, rotate, perspective, curvePct, curveTop, curveBot, edgeSqueeze, squeezePower, centerFocusWidth, meshDensityStrength, designScale, designOffsetX, designOffsetY, productType, maskPoints, meshPoints, naturalSize, imageUrl, showGrid]);
+  }, [basePoints, tilt, rotate, perspective, curvePct, curveTop, curveBot, edgeSqueeze, squeezePower, centerFocusWidth, meshDensityStrength, designScale, designOffsetX, designOffsetY, designFitMode, productType, maskPoints, meshPoints, naturalSize, imageUrl, showGrid]);
 
   useEffect(() => {
     if (naturalSize.w === 0) return;
@@ -1157,6 +1169,7 @@ export default function PrintAreaEditor(props: PrintAreaEditorProps) {
       design_scale: designScale,
       design_offset_x: designOffsetX,
       design_offset_y: designOffsetY,
+      design_fit_mode: designFitMode,
       // lighting fields from editor
       light_pos_x: lightPosX,
       light_pos_y: lightPosY,
@@ -1194,6 +1207,7 @@ export default function PrintAreaEditor(props: PrintAreaEditorProps) {
         design_scale: designScale,
         design_offset_x: designOffsetX,
         design_offset_y: designOffsetY,
+        design_fit_mode: designFitMode,
         light_pos_x: lightPosX,
         light_pos_y: lightPosY,
         light_height: lightHeight,
@@ -1259,7 +1273,7 @@ export default function PrintAreaEditor(props: PrintAreaEditorProps) {
       clearTimeout(timer);
       controller.abort();
     };
-  }, [basePoints, tilt, rotate, perspective, curvePct, curveTop, curveBot, edgeSqueeze, squeezePower, centerFocusWidth, meshDensityStrength, designScale, designOffsetX, designOffsetY, featherRadius, productType, maskPoints, meshPoints, naturalSize, editorMode, imageUrl, designFile, designUrl, designPreviewSource, lightPosX, lightPosY, lightHeight, lightContrast, lightHighlight, lightSoftness]);
+  }, [basePoints, tilt, rotate, perspective, curvePct, curveTop, curveBot, edgeSqueeze, squeezePower, centerFocusWidth, meshDensityStrength, designScale, designOffsetX, designOffsetY, designFitMode, featherRadius, productType, maskPoints, meshPoints, naturalSize, editorMode, imageUrl, designFile, designUrl, designPreviewSource, lightPosX, lightPosY, lightHeight, lightContrast, lightHighlight, lightSoftness]);
 
   const lastPointerPos = useRef({ x: 0, y: 0 });
   const wasDraggingRef = useRef(false);
@@ -1665,8 +1679,25 @@ export default function PrintAreaEditor(props: PrintAreaEditorProps) {
         {productSelector}
         {designFile && <p className="mode-hint">Kéo trực tiếp trên ảnh in 2D để đổi vị trí. Lăn chuột để zoom ảnh in, `Alt + wheel` để zoom canvas.</p>}
         <div className="ctrl-header"><span className="ctrl-label">Chỉnh ảnh in</span></div>
+        <div className="btn-row">
+          <button
+            className={designFitMode === 'contain' ? 'btn-primary' : 'btn-ghost'}
+            onClick={() => applyArtworkFitPreset('contain')}
+          >
+            Vừa khung lưới in
+          </button>
+          <button
+            className={designFitMode === 'cover' ? 'btn-primary' : 'btn-ghost'}
+            onClick={() => applyArtworkFitPreset('cover')}
+          >
+            Phủ kín vùng in
+          </button>
+        </div>
+        <p className="mode-hint">
+          `Vừa khung lưới in` dùng kiểu object-fit contain để ảnh nằm gọn trong vùng in. Cấu hình này sẽ được lưu cùng template.
+        </p>
         <div className="ctrl-grid ctrl-grid-two">
-          <ControlAdjuster label="Phóng to ảnh in" description="Tăng để ảnh in phủ rộng hơn trong vùng in." value={designScale} min={0.1} max={5} step={0.1} unit="x" onChange={setDesignScale} />
+          <ControlAdjuster label="Phóng to ảnh in" description="Zoom tương đối trên nền fit hiện tại. Nếu đang `Vừa khung`, giá trị 1.0 sẽ giữ ảnh nằm gọn trong vùng in." value={designScale} min={0.1} max={5} step={0.1} unit="x" onChange={setDesignScale} />
           <ControlAdjuster label="Dịch ngang" description="Dời ảnh in sang trái hoặc phải bên trong vùng in." value={designOffsetX} min={-1} max={1} step={0.1} onChange={setDesignOffsetX} />
           <ControlAdjuster label="Dịch dọc" description="Dời ảnh in lên hoặc xuống bên trong vùng in." value={designOffsetY} min={-1} max={1} step={0.1} onChange={setDesignOffsetY} />
         </div>
@@ -2193,5 +2224,3 @@ export default function PrintAreaEditor(props: PrintAreaEditorProps) {
     </div>
   );
 }
-
-

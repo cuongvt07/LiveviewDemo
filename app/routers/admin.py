@@ -1,12 +1,14 @@
 # app/routers/admin.py
 
 import os
+import base64
 import uuid
 import json
 import copy
 import shutil
 import logging
 import asyncio
+from datetime import datetime
 from pathlib import Path
 from fastapi import (
     APIRouter,
@@ -21,8 +23,20 @@ from sqlalchemy import select
 
 from app.db.database import async_session, getSession
 from app.db.models import Template, TemplateConfigHistory
-from app.schemas import TemplateCreate, TemplateConfigUpdate, LibraryItem, TemplateSaveAdhoc
+from app.schemas import (
+    TemplateCreate,
+    TemplateConfigUpdate,
+    LibraryItem,
+    TemplateSaveAdhoc,
+    UrlAnalysisImportRequest,
+)
 from app.services import template_registry
+from app.services.url_analysis import (
+    analyze_and_ingest_url,
+    build_url_lookup_context,
+    list_available_mockup_views,
+    resolve_local_asset_path,
+)
 
 router = APIRouter(tags=['admin'])
 logger = logging.getLogger('mockup_service')
@@ -59,7 +73,36 @@ def _normalize_saved_template_config(
     payload['warp'].setdefault('product_type', product_type_hint)
 
     default_config = _build_default_adhoc_config(output_width, output_height)
-    return _merge_adhoc_user_config(default_config, json.dumps(payload))
+    merged = _merge_adhoc_user_config(default_config, json.dumps(payload))
+    if isinstance(payload.get('url_analysis'), dict):
+        merged['url_analysis'] = copy.deepcopy(payload['url_analysis'])
+    return merged
+
+
+def _template_preview_url(slug: str) -> str:
+    template_dir = Path(ASSET_BASE_DIR) / slug
+    preview_path = template_dir / 'preview.png'
+    if preview_path.exists():
+        return f'/static/templates/{slug}/preview.png'
+    return f'/static/templates/{slug}/mockup.jpg'
+
+
+def _extract_template_url_analysis_meta(template: Template) -> dict:
+    cfg = template.config if isinstance(template.config, dict) else {}
+    meta = cfg.get('url_analysis')
+    return meta if isinstance(meta, dict) else {}
+
+
+def _write_preview_data_url(preview_data_url: str, destination: Path) -> None:
+    if not isinstance(preview_data_url, str) or not preview_data_url.startswith('data:'):
+        raise ValueError('preview_data_url không hợp lệ')
+
+    header, _, payload = preview_data_url.partition(',')
+    if ';base64' not in header or not payload:
+        raise ValueError('preview_data_url phải là base64 data URL')
+
+    binary = base64.b64decode(payload)
+    destination.write_bytes(binary)
 
 
 @router.post('/templates')
@@ -112,7 +155,7 @@ async def createTemplate(
         dest.write_bytes(content)
 
     mockup_path = template_dir / 'mockup.jpg'
-        mask_path = maps_dir / 'mask.jpg'
+    mask_path = maps_dir / 'mask.jpg'
 
     await saveFile(mockup_file, mockup_path)
     await saveFile(mask_file, mask_path)
@@ -431,6 +474,63 @@ async def uploadToLibrary(
     }
 
 
+@router.post('/url-analysis/import')
+async def importFromAnalyzedUrl(body: UrlAnalysisImportRequest):
+    try:
+        context = build_url_lookup_context(body.source_url)
+
+        async with async_session() as session:
+            result = await session.execute(
+                select(Template).where(Template.status == 'active')
+            )
+            active_templates = result.scalars().all()
+
+        existing_template: Template | None = None
+        family_templates: list[Template] = []
+        for template in active_templates:
+            meta = _extract_template_url_analysis_meta(template)
+            if meta.get('design_lookup_key') == context['design_lookup_key']:
+                existing_template = template
+                break
+            if meta.get('mockup_family_key') == context['mockup_family_key']:
+                family_templates.append(template)
+
+        if existing_template is not None:
+            meta = _extract_template_url_analysis_meta(existing_template)
+            return {
+                'template_found': True,
+                'source_url': body.source_url,
+                'parsed': context['parsed'].to_dict(),
+                'design_lookup_key': context['design_lookup_key'],
+                'mockup_family_key': context['mockup_family_key'],
+                'existing_template': {
+                    'slug': existing_template.slug,
+                    'name': existing_template.name,
+                    'template_id': existing_template.slug,
+                    'preview_url': _template_preview_url(existing_template.slug),
+                    'mockup_view': meta.get('mockup_view'),
+                },
+            }
+
+        available_views = [item['view'] for item in list_available_mockup_views(context['parsed'])]
+        preferred_view = None
+        if available_views:
+            preferred_view = available_views[len(family_templates) % len(available_views)]
+
+        analyzed = analyze_and_ingest_url(body.source_url, preferred_view=preferred_view)
+        analyzed['template_found'] = False
+        analyzed['rotation_index'] = len(family_templates)
+        analyzed['preferred_view'] = preferred_view
+        return analyzed
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail={'message': str(exc)}) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail={'message': str(exc)}) from exc
+    except Exception as exc:
+        logger.exception('URL analysis import failed')
+        raise HTTPException(status_code=502, detail={'message': str(exc)}) from exc
+
+
 @router.post('/templates/save-adhoc')
 async def saveAdhocTemplate(
     body: TemplateSaveAdhoc,
@@ -445,14 +545,9 @@ async def saveAdhocTemplate(
             raise HTTPException(status_code=409, detail={'message': f'Slug \'{body.slug}\' đã tồn tại'})
 
     # 2. Xác định ảnh gốc (từ library hoặc path)
-    # Hỗ trợ URL /static/bases/filename.jpg -> inputs/bases/filename.jpg
-    mockup_path_str = body.mockup_url
-    if mockup_path_str.startswith('/static/bases/'):
-        mockup_path_str = mockup_path_str.replace('/static/bases/', 'inputs/bases/')
-    
-    mockup_path = Path(mockup_path_str)
+    mockup_path = resolve_local_asset_path(body.mockup_url)
     if not mockup_path.exists():
-         raise HTTPException(status_code=400, detail={'message': f'Mockup path \'{mockup_path_str}\' không tồn tại trên server'})
+         raise HTTPException(status_code=400, detail={'message': f'Mockup path \'{body.mockup_url}\' không tồn tại trên server'})
 
     # 3. Chuẩn bị thư mục template
     template_dir = Path(ASSET_BASE_DIR) / body.slug
@@ -481,7 +576,7 @@ async def saveAdhocTemplate(
     
     # Tạo mask.png (giả định mask trắng toàn bộ nếu chưa có logic tách nền)
     # Hoặc nếu user đã vẽ mask_points, chúng ta dùng nó để tạo mask.png
-        mask_path = maps_dir / 'mask.jpg'
+    mask_path = maps_dir / 'mask.jpg'
     
     # Dummy mask generator (trắng) - logic thật nên dùng cv2 vẽ mask_points
     import cv2
@@ -503,16 +598,23 @@ async def saveAdhocTemplate(
         else:
              mask.fill(255) # Fallback trắng xóa
              
-        # Convert to 3-channel before saving JPEG (grayscale -> BGR)
-        mask_bgr = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
-        # Save with reasonable quality
-        cv2.imwrite(str(mask_path), mask_bgr, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
+    # Convert to 3-channel before saving JPEG (grayscale -> BGR)
+    mask_bgr = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
+    # Save with reasonable quality
+    cv2.imwrite(str(mask_path), mask_bgr, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
 
     # 5. Sinh Maps
     try:
         await asyncio.to_thread(generate_all_maps, str(template_dir / 'mockup.jpg'), str(maps_dir))
     except Exception as e:
         logger.error(f'Failed to generate maps: {e}')
+
+    preview_path = template_dir / 'preview.png'
+    if body.preview_data_url:
+        try:
+            _write_preview_data_url(body.preview_data_url, preview_path)
+        except Exception as e:
+            logger.warning(f'Failed to save preview image for {body.slug}: {e}')
 
     # 6. Lưu DB
     template = Template(
@@ -534,4 +636,8 @@ async def saveAdhocTemplate(
         session.add(template)
         await session.commit()
     
-    return {'message': 'Template saved from adhoc', 'slug': body.slug}
+    return {
+        'message': 'Template saved from adhoc',
+        'slug': body.slug,
+        'preview_url': _template_preview_url(body.slug),
+    }

@@ -71,6 +71,42 @@ class RenderAdhocConfigTests(unittest.TestCase):
         self.assertEqual(merged["lighting"]["light_highlight"], 81.0)
         self.assertEqual(merged["lighting"]["light_softness"], 36.0)
 
+    def test_design_fit_mode_merges_into_design_transform(self) -> None:
+        config = _build_default_adhoc_config(1200, 900)
+        merged = _merge_adhoc_user_config(
+            config,
+            json.dumps(
+                {
+                    "warp": {
+                        "design_scale": 1.15,
+                        "design_offset_x": -0.2,
+                        "design_offset_y": 0.3,
+                        "design_fit_mode": "contain",
+                    }
+                }
+            ),
+        )
+
+        self.assertEqual(merged["design_transform"]["fit_mode"], "contain")
+        self.assertEqual(merged["design_transform"]["scale"], 1.15)
+        self.assertEqual(merged["design_transform"]["offset_x"], -0.2)
+        self.assertEqual(merged["design_transform"]["offset_y"], 0.3)
+
+    def test_invalid_design_fit_mode_falls_back_to_cover(self) -> None:
+        config = _build_default_adhoc_config(1200, 900)
+        merged = _merge_adhoc_user_config(
+            config,
+            json.dumps(
+                {
+                    "warp": {
+                        "design_fit_mode": "stretch",
+                    }
+                }
+            ),
+        )
+
+        self.assertEqual(merged["design_transform"]["fit_mode"], "cover")
+
 
 if __name__ == "__main__":
     unittest.main()
