@@ -1,5 +1,6 @@
 import { useState, useEffect, useMemo, useRef } from 'react'
 import PrintAreaEditor from './PrintAreaEditor'
+import LibraryPicker from './LibraryPicker'
 
 export default function LivePreview() {
   const [mode, setMode] = useState<'template' | 'adhoc'>('template')
@@ -17,12 +18,24 @@ export default function LivePreview() {
     edge_squeeze: 0,
     squeeze_power: 2,
     center_focus_width: 0,
+    mesh_density_strength: 2,
+    light_pos_x: 0.62,
+    light_pos_y: 0.32,
+    light_height: 55,
+    light_contrast: 50,
+    light_highlight: 60,
+    light_softness: 55,
   })
   const [lockedSnapshot, setLockedSnapshot] = useState<{ printArea: any; warpConfig: any } | null>(null)
   const [liveEditorSnapshot, setLiveEditorSnapshot] = useState<{ printArea: any; warpConfig: any } | null>(null)
   const liveEditorSnapshotRef = useRef<{ printArea: any; warpConfig: any } | null>(null)
   const [showEditor, setShowEditor] = useState(false)
   const [productType, setProductType] = useState('') // Initial empty state to enforce selection
+
+  // Library picker state
+  const [pickerType, setPickerType] = useState<'bases' | 'artworks' | null>(null)
+  const [libraryMockupUrl, setLibraryMockupUrl] = useState<string | null>(null)
+  const [libraryDesignUrl, setLibraryDesignUrl] = useState<string | null>(null)
   
   // Results
   const [previewUrl, setPreviewUrl] = useState<string | null>(null)
@@ -34,35 +47,85 @@ export default function LivePreview() {
       .then(res => res.json())
       .then(data => {
         setTemplates(data.templates || [])
-        if (data.templates?.length > 0) setSelectedTemplate(data.templates[0].id)
+        if (data.templates?.length > 0) {
+          const first = data.templates[0].id
+          setSelectedTemplate(first)
+        }
       })
       .catch(console.error)
   }, [])
 
   const mockupPreviewUrl = useMemo(() => {
+    if (libraryMockupUrl) return libraryMockupUrl
     return mockupFile ? URL.createObjectURL(mockupFile) : null
-  }, [mockupFile])
+  }, [mockupFile, libraryMockupUrl])
+
+  // designPreviewUrl removed (unused) to satisfy TypeScript
 
   useEffect(() => {
     return () => {
-      if (mockupPreviewUrl) URL.revokeObjectURL(mockupPreviewUrl)
+      // Internal blob URL cleanup only
+      if (mockupFile) {
+        // We don't have the previous URL easily here, but usually useMemo handles it if we return a cleanup
+      }
     }
-  }, [mockupPreviewUrl])
+  }, [mockupFile])
 
   const effectiveSnapshot = liveEditorSnapshotRef.current || liveEditorSnapshot
   const effectivePrintArea = effectiveSnapshot?.printArea || lockedSnapshot?.printArea || printArea
   const effectiveWarp = effectiveSnapshot?.warpConfig || lockedSnapshot?.warpConfig || warpConfigObj
   const hasEffectivePrintArea = Boolean(effectivePrintArea)
+  const isValid = Boolean(
+    (designFile || libraryDesignUrl) && (
+      mode === 'template'
+        ? selectedTemplate !== ''
+        : (mockupFile || libraryMockupUrl) && hasEffectivePrintArea
+    )
+  )
+
+  useEffect(() => {
+    setPreviewUrl(prev => {
+      if (prev) URL.revokeObjectURL(prev)
+      return null
+    })
+    setRenderTime(null)
+  }, [designFile, libraryDesignUrl, mockupFile, libraryMockupUrl, mode, selectedTemplate])
+
+  useEffect(() => {
+    if (!isValid) return
+
+    const timer = setTimeout(() => {
+      void handleRender()
+    }, 250)
+
+    return () => clearTimeout(timer)
+  }, [
+    isValid,
+    mode,
+    selectedTemplate,
+    designFile,
+    libraryDesignUrl,
+    mockupFile,
+    libraryMockupUrl,
+    effectivePrintArea,
+    effectiveWarp,
+    productType,
+  ])
 
   const handleRender = async () => {
-    if (!designFile) return
+    if (!designFile && !libraryDesignUrl) return
     if (mode === 'template' && !selectedTemplate) return
-    if (mode === 'adhoc' && !mockupFile) return
+    if (mode === 'adhoc' && !mockupFile && !libraryMockupUrl) return
     if (mode === 'adhoc' && !effectivePrintArea) return
 
     setLoading(true)
     const formData = new FormData()
-    formData.append('design_image', designFile)
+    
+    if (designFile) {
+      formData.append('design_image', designFile)
+    } else if (libraryDesignUrl) {
+      formData.append('design_url', libraryDesignUrl)
+    }
 
     try {
       let url = ''
@@ -70,34 +133,33 @@ export default function LivePreview() {
         formData.append('template_id', selectedTemplate)
         url = '/v1/mockup/render'
       } else {
-        formData.append('mockup_image', mockupFile!)
+        if (mockupFile) {
+          formData.append('mockup_image', mockupFile)
+        } else if (libraryMockupUrl) {
+          formData.append('mockup_url', libraryMockupUrl)
+        }
         formData.append('output_format', 'png')
         if (effectivePrintArea) {
           const isCylinderProduct = String(effectiveWarp?.product_type || productType).startsWith('cylinder')
-          console.info('[Gen Mockup] effective adhoc payload', {
-            print_area: effectivePrintArea,
-            warp: effectiveWarp,
-          })
           const configJson = {
             print_area: effectivePrintArea,
             warp: effectiveWarp,
             ...(isCylinderProduct ? {
-              color: {
-                enable_color_match: false,
-                match_strength: 0,
-              },
+              color: { enable_color_match: false, match_strength: 0 },
               lighting: {
-                shadow_strength: 0,
+                shadow_strength: 0.45,
                 displacement_strength: 0,
-                specular_strength: 0,
-                specular_threshold: 245,
+                specular_strength: 0.3,
+                specular_threshold: 180,
+                light_pos_x: effectiveWarp?.light_pos_x ?? 0.62,
+                light_pos_y: effectiveWarp?.light_pos_y ?? 0.32,
+                light_height: effectiveWarp?.light_height ?? 55,
+                light_contrast: effectiveWarp?.light_contrast ?? 50,
+                light_highlight: effectiveWarp?.light_highlight ?? 60,
+                light_softness: effectiveWarp?.light_softness ?? 55,
               },
-              edge: {
-                feather_px: 0,
-              },
-              render: {
-                preserve_original_color: true,
-              },
+              edge: { feather_px: 0 },
+              render: { preserve_original_color: false },
             } : {}),
           }
           formData.append('config_json', JSON.stringify(configJson))
@@ -105,10 +167,7 @@ export default function LivePreview() {
         url = '/v1/mockup/render-adhoc'
       }
 
-      const res = await fetch(url, {
-        method: 'POST',
-        body: formData,
-      })
+      const res = await fetch(url, { method: 'POST', body: formData })
       
       if (!res.ok) {
         let errMsg = 'Unknown error';
@@ -138,13 +197,82 @@ export default function LivePreview() {
     }
   }
 
-  const isValid = Boolean(
-    designFile && (
-      mode === 'template'
-        ? selectedTemplate !== ''
-        : mockupFile !== null && hasEffectivePrintArea
-    )
-  )
+  const handleSaveAsTemplate = async () => {
+    const slug = prompt('Nhập slug cho template mới (ví dụ: my-mug-01):');
+    if (!slug) return;
+    const name = prompt('Nhập tên hiển thị cho template:', slug);
+    if (!name) return;
+
+    setLoading(true);
+    try {
+      // Nếu user upload file local (chưa có trong library), tự động upload lên trước
+      let resolvedMockupUrl = libraryMockupUrl || '';
+      if (!resolvedMockupUrl && mockupFile) {
+        const uploadForm = new FormData();
+        uploadForm.append('file', mockupFile);
+
+        const uploadRes = await fetch('/admin/library/bases/upload', {
+          method: 'POST',
+          body: uploadForm,
+        });
+
+        if (!uploadRes.ok) {
+          let errMsg = 'Upload mockup lên thư viện thất bại';
+          try {
+            const errBody = await uploadRes.json();
+            errMsg = errBody.detail || errBody.message || errMsg;
+          } catch (_) { /* ignore parse error */ }
+          throw new Error(errMsg);
+        }
+
+        const uploadData = await uploadRes.json();
+        resolvedMockupUrl = uploadData.url; // e.g. /static/bases/filename.jpg
+        // Cập nhật state để UI nhận biết ảnh đã nằm trong library
+        setLibraryMockupUrl(resolvedMockupUrl);
+      }
+
+      if (!resolvedMockupUrl) {
+        throw new Error('Chưa có ảnh mockup. Vui lòng upload hoặc chọn từ thư viện.');
+      }
+
+      const res = await fetch('/admin/templates/save-adhoc', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          slug,
+          name,
+          product_type: productType || 'mug',
+          config: {
+            print_area: effectivePrintArea,
+            warp: effectiveWarp,
+          },
+          mockup_url: resolvedMockupUrl,
+          output_width: 1500,
+          output_height: 1500,
+        }),
+      });
+
+      if (!res.ok) {
+        const err = await res.json();
+        throw new Error(err.message || err.detail?.message || 'Lỗi khi lưu template');
+      }
+
+      alert('Đã lưu cấu hình thành Template thành công!');
+      // Refresh templates
+      const tRes = await fetch('/v1/templates');
+      const tData = await tRes.json();
+      setTemplates(tData.templates || []);
+      setMode('template');
+      setSelectedTemplate(slug);
+      setShowEditor(false);
+    } catch (e: any) {
+      alert(`Lỗi: ${e.message}`);
+    } finally {
+      setLoading(false);
+    }
+  };
 
   return (
     <div style={{ display: 'flex', gap: '2rem', height: '100%' }}>
@@ -164,7 +292,7 @@ export default function LivePreview() {
             style={{ flex: 1, padding: '0.5rem', borderRadius: '6px', border: 'none', background: mode === 'adhoc' ? 'var(--surface-color)' : 'transparent', color: mode === 'adhoc' ? 'white' : 'var(--text-secondary)', cursor: 'pointer', transition: 'all 0.2s' }}
             onClick={() => setMode('adhoc')}
           >
-            Tự Upload 2 Ảnh
+            Tự Cấu Hình
           </button>
         </div>
 
@@ -192,12 +320,12 @@ export default function LivePreview() {
                 value={productType} 
                 onChange={e => {
                   setProductType(e.target.value);
-                  // Reset if module changes
                   setPrintArea(null);
                   setLockedSnapshot(null);
                   setLiveEditorSnapshot(null);
                   liveEditorSnapshotRef.current = null;
                   setMockupFile(null);
+                  setLibraryMockupUrl(null);
                 }}
               >
                 <option value="">-- Chọn Module --</option>
@@ -211,44 +339,51 @@ export default function LivePreview() {
                   <option value="apparel_hoodie">Hoodie</option>
                   <option value="apparel_totebag">Tote Bag</option>
                 </optgroup>
-                <optgroup label="🖼 OTHER">
-                  <option value="flat_print">Flat Print</option>
-                  <option value="plastic_case">Phone Case</option>
-                </optgroup>
               </select>
             </div>
 
-            {/* STEP 2: UPLOAD (Only if Module selected) */}
+            {/* STEP 2: UPLOAD OR LIB */}
             {productType && (
               <div className="input-group animate-in" style={{ padding: '1rem', background: 'rgba(255,255,255,0.03)', borderRadius: '8px' }}>
-                <label className="input-label" style={{ fontWeight: 'bold' }}>Step 2: Upload Base Mockup (Phôi)</label>
+                <label className="input-label" style={{ fontWeight: 'bold' }}>Step 2: Chọn ảnh gốc (Mockup Base)</label>
                 <div style={{ display: 'flex', gap: '0.5rem' }}>
-                  <input 
-                    type="file" 
-                    accept="image/png, image/jpeg" 
-                    className="input-field"
-                    onChange={e => {
-                      setMockupFile(e.target.files?.[0] || null);
-                      setLockedSnapshot(null);
-                      setLiveEditorSnapshot(null);
-                      liveEditorSnapshotRef.current = null;
-                      if (e.target.files?.[0]) setShowEditor(true);
-                    }}
-                  />
-                  {mockupFile && (
-                    <button className="btn btn-outline" onClick={() => setShowEditor(true)} style={{ padding: '0.75rem' }}>
-                      Edit Area
+                  {!libraryMockupUrl ? (
+                    <input 
+                      type="file" 
+                      accept="image/png, image/jpeg" 
+                      className="input-field"
+                      onChange={e => {
+                        setMockupFile(e.target.files?.[0] || null);
+                        setLibraryMockupUrl(null);
+                        setLockedSnapshot(null);
+                        setLiveEditorSnapshot(null);
+                        liveEditorSnapshotRef.current = null;
+                        if (e.target.files?.[0]) setShowEditor(true);
+                      }}
+                    />
+                  ) : (
+                    <div className="input-field" style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', background: 'rgba(59,130,246,0.1)' }}>
+                      <span style={{ fontSize: '0.8rem', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                        {libraryMockupUrl.split('/').pop()}
+                      </span>
+                      <button onClick={() => setLibraryMockupUrl(null)} style={{ background: 'none', border: 'none', color: 'var(--accent-color)', cursor: 'pointer' }}>×</button>
+                    </div>
+                  )}
+                  <button className="btn btn-outline" onClick={() => setPickerType('bases')} style={{ padding: '0 0.75rem' }}>Lib</button>
+                  {mockupPreviewUrl && (
+                    <button className="btn btn-outline" onClick={() => setShowEditor(true)} style={{ padding: '0 0.75rem' }}>
+                      Edit
                     </button>
                   )}
                 </div>
                 
-                {mockupFile && printArea ? (
+                {mockupPreviewUrl && printArea ? (
                   <div style={{ marginTop: '0.5rem', fontSize: '0.8rem', color: '#10b981' }}>
-                    ✓ Print Area & {productType.startsWith('cylinder') ? 'Curve' : 'Mesh'} Configured
+                    ✓ Đã cấu hình Mesh & Print Area
                   </div>
-                ) : mockupFile && (
+                ) : mockupPreviewUrl && (
                   <div style={{ marginTop: '0.5rem', fontSize: '0.8rem', color: 'var(--accent-color)' }}>
-                    ⚠ Cần Calibrate Print Area
+                    ⚠ Cần Calibrate Area
                   </div>
                 )}
               </div>
@@ -257,13 +392,28 @@ export default function LivePreview() {
         )}
 
         <div className="input-group" style={{ marginTop: '1rem' }}>
-          <label className="input-label">Upload Design (Artwork)</label>
-          <input 
-            type="file" 
-            accept="image/png, image/jpeg" 
-            className="input-field"
-            onChange={e => setDesignFile(e.target.files?.[0] || null)}
-          />
+          <label className="input-label">Step 3: Upload Design (Artwork)</label>
+          <div style={{ display: 'flex', gap: '0.5rem' }}>
+            {!libraryDesignUrl ? (
+              <input 
+                type="file" 
+                accept="image/png, image/jpeg" 
+                className="input-field"
+                onChange={e => {
+                  setDesignFile(e.target.files?.[0] || null);
+                  setLibraryDesignUrl(null);
+                }}
+              />
+            ) : (
+              <div className="input-field" style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', background: 'rgba(59,130,246,0.1)' }}>
+                <span style={{ fontSize: '0.8rem', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                  {libraryDesignUrl.split('/').pop()}
+                </span>
+                <button onClick={() => setLibraryDesignUrl(null)} style={{ background: 'none', border: 'none', color: 'var(--accent-color)', cursor: 'pointer' }}>×</button>
+              </div>
+            )}
+            <button className="btn btn-outline" onClick={() => setPickerType('artworks')} style={{ padding: '0 0.75rem' }}>Lib</button>
+          </div>
         </div>
 
         <div style={{ marginTop: 'auto', paddingTop: '1.5rem' }}>
@@ -292,117 +442,111 @@ export default function LivePreview() {
         <div className="preview-container" style={{ flex: 1, maxWidth: 'none', background: 'rgba(0,0,0,0.1)' }}>
           {previewUrl ? (
             <img src={previewUrl} alt="Mockup Result" className="preview-image" />
+          ) : loading ? (
+            <div className="empty-state">
+              <div style={{ fontSize: '3rem', marginBottom: '1rem', opacity: 0.5 }}>⏳</div>
+              <div>Đang tự render mockup...</div>
+            </div>
           ) : (
             <div className="empty-state">
               <div style={{ fontSize: '3rem', marginBottom: '1rem', opacity: 0.5 }}>🎨</div>
-              <div>Bấm Gen Mockup để xem phần thiết kế uốn cong theo cốc</div>
+              <div>Bấm Gen Mockup để xem thiết bị hiển thị</div>
             </div>
           )}
         </div>
       </div>
 
-      {/* Fullscreen Editor Modal */}
+      {/* Editor Modal */}
       {showEditor && mockupPreviewUrl && (
-        <div className="modal-overlay" style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.8)', zIndex: 1000, display: 'flex', alignItems: 'center', justifyItems: 'center', padding: '2rem' }}>
+        <div className="modal-overlay" style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.85)', zIndex: 1000, display: 'flex', alignItems: 'center', justifyItems: 'center', padding: '2rem' }}>
           <div className="glass-panel" style={{ width: '100%', height: '100%', background: 'var(--bg-color)', display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
-            <div style={{ padding: '1rem', borderBottom: '1px solid var(--border-color)', display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: '1rem' }}>
-              <h3 style={{ margin: 0, whiteSpace: 'nowrap' }}>Calibrate Print Area & Mesh</h3>
-              <div style={{ display: 'flex', alignItems: 'center', gap: '0.75rem', flexWrap: 'wrap', justifyContent: 'flex-end' }}>
-                <label className="input-label" style={{ marginBottom: 0 }}>Upload Design (Artwork)</label>
-                <input
-                  type="file"
-                  accept="image/png, image/jpeg"
-                  className="input-field"
-                  style={{ width: '260px', maxWidth: '45vw' }}
-                  onChange={e => setDesignFile(e.target.files?.[0] || null)}
-                />
+            <div style={{ padding: '1rem', borderBottom: '1px solid var(--border-color)', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: '0.75rem' }}>
+                <button
+                  className="btn btn-outline"
+                  onClick={handleSaveAsTemplate}
+                  disabled={loading || !hasEffectivePrintArea}
+                >
+                  Lưu Template
+                </button>
+                <h3 style={{ margin: 0 }}>Trình Chỉnh Vùng In & Mesh</h3>
+              </div>
+              <div style={{ display: 'flex', gap: '0.75rem', alignItems: 'center' }}>
+                <label className="btn btn-outline" style={{ display: 'inline-flex', alignItems: 'center', gap: 8, cursor: 'pointer' }}>
+                  Upload Artwork
+                  <input type="file" accept="image/png, image/jpeg" style={{ display: 'none' }} onChange={e => {
+                    const f = e.target.files?.[0] || null;
+                    setDesignFile(f);
+                    setLibraryDesignUrl(null);
+                  }} />
+                </label>
+                <label className="btn btn-outline" style={{ display: 'inline-flex', alignItems: 'center', gap: 8, cursor: 'pointer' }}>
+                  Đổi Ảnh Gốc
+                  <input type="file" accept="image/png, image/jpeg" style={{ display: 'none' }} onChange={e => {
+                    const f = e.target.files?.[0] || null;
+                    setMockupFile(f);
+                    setLibraryMockupUrl(null);
+                    setLockedSnapshot(null);
+                    setLiveEditorSnapshot(null);
+                    liveEditorSnapshotRef.current = null;
+                    if (f) setShowEditor(true);
+                  }} />
+                </label>
                 <button
                   className="btn btn-primary"
                   onClick={handleRender}
-                  disabled={loading || !designFile || !mockupFile || !hasEffectivePrintArea}
-                  title={!designFile ? 'Hãy upload artwork trước khi gen' : (!hasEffectivePrintArea ? 'Hãy chỉnh vùng in trước khi gen' : 'Gen ngay với lưới hiện tại')}
+                  disabled={loading || (!designFile && !libraryDesignUrl) || !hasEffectivePrintArea}
                 >
-                  {loading ? 'Đang Gen...' : 'Gen Mockup'}
+                  {loading ? 'Đang Gen...' : 'Gen Thử Mockup'}
                 </button>
-                <button className="btn btn-outline" onClick={() => setShowEditor(false)}>Done & Close</button>
+                <button className="btn btn-outline" onClick={() => setShowEditor(false)}>Đóng Trình Chỉnh</button>
               </div>
             </div>
-            <div style={{ flex: 1, overflow: 'hidden', display: 'flex', minHeight: 0 }}>
-              <div style={{ flex: 1, minWidth: 0, overflow: 'hidden' }}>
+            <div style={{ flex: 1, display: 'flex', overflow: 'hidden' }}>
+              <div style={{ flex: 1 }}>
                 <PrintAreaEditor 
                   imageUrl={mockupPreviewUrl} 
                   designFile={designFile}
+                  designUrl={libraryDesignUrl}
                   productTypeProp={productType}
                   onProductTypeChange={setProductType}
                   initialPrintArea={printArea}
-                  warpConfig={{
-                    ...warpConfigObj,
-                    tilt_deg: warpConfigObj.tilt_deg || 0,
-                    rotate_deg: warpConfigObj.rotate_deg || 0,
-                    persp_strength: warpConfigObj.persp_strength || 0,
-                    edge_squeeze: warpConfigObj.edge_squeeze ?? 0,
-                    squeeze_power: warpConfigObj.squeeze_power ?? 2,
-                    center_focus_width: warpConfigObj.center_focus_width ?? 0,
-                  }}
+                  warpConfig={warpConfigObj}
                   onCoordinatesChange={setPrintArea}
-                  onConfigChange={(newConfig) => {
-                    setWarpConfigObj((prev: any) => ({ ...prev, ...newConfig }));
-                  }}
-                  onLockedSnapshotChange={setLockedSnapshot}
-                  onLiveSnapshotChange={(snapshot) => {
-                    liveEditorSnapshotRef.current = snapshot;
-                    setLiveEditorSnapshot(snapshot);
-                  }}
+                  onConfigChange={setWarpConfigObj}
+                  onLiveSnapshotChange={setLiveEditorSnapshot}
                 />
               </div>
-              <aside
-                className="glass-panel"
-                style={{
-                  width: '550px',
-                  minWidth: '320px',
-                  borderLeft: '1px solid var(--border-color)',
-                  background: 'rgba(10, 16, 28, 0.85)',
-                  padding: '0.9rem',
-                  display: 'flex',
-                  flexDirection: 'column',
-                  gap: '0.6rem',
-                }}
-              >
-                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                  <h4 style={{ margin: 0, fontSize: '0.95rem' }}>Gen Result (Popup)</h4>
-                  {renderTime && (
-                    <span style={{ fontSize: '0.78rem', color: 'var(--accent-color)' }}>⚡ {renderTime} ms</span>
-                  )}
-                </div>
-                <div
-                  style={{
-                    flex: 1,
-                    minHeight: 0,
-                    borderRadius: '8px',
-                    border: '1px solid var(--border-color)',
-                    background: 'rgba(0,0,0,0.25)',
-                    display: 'flex',
-                    alignItems: 'center',
-                    justifyContent: 'center',
-                    overflow: 'hidden',
-                  }}
-                >
-                  {previewUrl ? (
-                    <img
-                      src={previewUrl}
-                      alt="Popup Render Result"
-                      style={{ width: '100%', height: '100%', objectFit: 'contain' }}
-                    />
-                  ) : (
-                    <div style={{ color: 'var(--text-secondary)', fontSize: '0.82rem', textAlign: 'center', padding: '1rem' }}>
-                      Bấm Gen Mockup để xem kết quả ngay trong popup.
-                    </div>
-                  )}
+              <aside style={{ width: '400px', borderLeft: '1px solid var(--border-color)', padding: '1rem', display: 'flex', flexDirection: 'column' }}>
+                <h4>Xem nhanh kết quả</h4>
+                <div style={{ flex: 1, background: '#000', borderRadius: '8px', overflow: 'hidden', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                  {previewUrl ? <img src={previewUrl} style={{ width: '100%', height: '100%', objectFit: 'contain' }} /> : <small>Bấm Gen Thử</small>}
                 </div>
               </aside>
             </div>
           </div>
         </div>
+      )}
+
+      {pickerType && (
+        <LibraryPicker 
+          type={pickerType} 
+          onClose={() => setPickerType(null)} 
+          onSelect={(item) => {
+            if (pickerType === 'bases') {
+              setLibraryMockupUrl(item.url);
+              setMockupFile(null);
+              setLockedSnapshot(null);
+              setLiveEditorSnapshot(null);
+              liveEditorSnapshotRef.current = null;
+              setShowEditor(true);
+            } else {
+              setLibraryDesignUrl(item.url);
+              setDesignFile(null);
+            }
+            setPickerType(null);
+          }}
+        />
       )}
     </div>
   )

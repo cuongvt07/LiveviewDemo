@@ -17,7 +17,25 @@ class LightingConfig(BaseModel):
     highlight_strength: float = 0.55
     displacement_strength: float = 0.10
     specular_strength: float = 0.30
-    specular_threshold: int = 220
+    specular_threshold: int = 180
+    light_pos_x: float = 0.62
+    light_pos_y: float = 0.32
+    light_height: float = 55.0
+    light_contrast: float = 50.0
+    light_highlight: float = 60.0
+    light_softness: float = 55.0
+    cylinder_shading_strength: float = 0.28
+    edge_darkening_strength: float = 0.12
+    specular_line_strength: float = 0.65
+    specular_line_position: float = 0.18
+    specular_line_sigma: float = 0.12
+    specular_line_blur_kernel: int = 11
+    diffuse_highlight_strength: float = 0.25
+    highlight_detail_strength: float = 0.35
+    lighting_blur_kernel: int = 21
+    highlight_blur_kernel: int = 9
+    highlight_extract_blur_kernel: int = 41
+    highlight_detail_blur_kernel: int = 9
 
 
 class ColorConfig(BaseModel):
@@ -76,3 +94,21 @@ class ErrorResponse(BaseModel):
     error: str
     message: str
     request_id: Optional[str] = None
+
+
+class LibraryItem(BaseModel):
+    name: str
+    url: str
+    size_bytes: int
+    modified_at: str
+
+
+class TemplateSaveAdhoc(BaseModel):
+    slug: str
+    name: str
+    product_type: str = 'mug'
+    config: dict  # JSON settings from editor
+    mockup_url: str  # URL if library, or we might need to handle uploaded file separately
+    # If it's a new upload, the frontend should upload it first to library, then call this.
+    output_width: int = 1500
+    output_height: int = 1500

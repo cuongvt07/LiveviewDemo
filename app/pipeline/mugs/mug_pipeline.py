@@ -1,22 +1,36 @@
-import numpy as np
-from ..shared.decode      import decode_design
-from ..shared.design_transform import apply_design_transform, estimate_print_area_canvas_size
-from ..shared.color_match import apply_color_match
-from ..shared.composite   import composite
-from .cylindrical_warp    import cylindrical_warp
-from .shadow_overlay      import apply_shadow_overlay
-from .specular_gloss      import apply_specular_gloss, extract_specular_from_mockup
 from dataclasses import dataclass
+
+import numpy as np
+
+from ..shared.color_match import apply_color_match
+from ..shared.composite import composite
+from ..shared.decode import decode_design
+from ..shared.design_transform import apply_design_transform, estimate_print_area_canvas_size
+from ..shared.smooth_mesh_warp import apply_smooth_mesh_warp
+from .cylindrical_warp import cylindrical_warp
+from .lighting_extract import (
+    build_cylinder_surface_maps,
+    build_light_direction,
+    build_light_field,
+    compute_directional_diffuse,
+    compute_directional_specular,
+    derive_highlight_map,
+    extract_masked_highlight_detail,
+    extract_masked_lighting,
+    normalize_masked_field,
+)
+from .shadow_overlay import apply_shadow_overlay
+from .specular_gloss import apply_specular_gloss
 
 
 @dataclass
 class MugAssets:
-    mockup:       np.ndarray
-    shadow_map:   np.ndarray
-    normal_map:   np.ndarray
-    mask:         np.ndarray
+    mockup: np.ndarray
+    shadow_map: np.ndarray
+    normal_map: np.ndarray
+    mask: np.ndarray
     specular_map: np.ndarray
-    config:       dict
+    config: dict
 
 
 def run_mug_pipeline(
@@ -24,23 +38,23 @@ def run_mug_pipeline(
     assets: MugAssets,
 ) -> np.ndarray:
     """
-    Pipeline riêng cho Mugs.
-
-    Thứ tự:
-    [1] Cylindrical warp (sin/arcsin)
-    [2] Color match
-    [3] Shadow Overlay (men sứ)
-    [4] Edge feather + Composite
-    [5] Specular Gloss (Phong, screen blend)
+    Mug render flow:
+    [1] Cylindrical warp + optional mesh correction
+    [2] Optional color match
+    [3] Extract masked lighting from mockup LAB L channel
+    [4] Apply shadow by multiply
+    [5] Composite
+    [6] Apply highlight by screen
     """
     cfg = assets.config
-    l   = cfg.get("lighting", {})
+    lighting_cfg = cfg.get("lighting", {})
+    color_cfg = cfg.get("color", {})
     render_cfg = cfg.get("render", {})
     preserve_original_color = bool(render_cfg.get("preserve_original_color", False))
-    W, H = assets.mockup.shape[1], assets.mockup.shape[0]
+    out_w, out_h = assets.mockup.shape[1], assets.mockup.shape[0]
 
     design = decode_design(design_bytes)
-    dt = cfg.get("design_transform", {})
+    design_transform = cfg.get("design_transform", {})
     canvas_w, canvas_h = estimate_print_area_canvas_size(
         cfg.get("print_area"),
         fallback_width=design.shape[1],
@@ -48,19 +62,19 @@ def run_mug_pipeline(
     )
     design = apply_design_transform(
         design,
-        scale=dt.get("scale", 1.0),
-        offset_x=dt.get("offset_x", 0.0),
-        offset_y=dt.get("offset_y", 0.0),
+        scale=design_transform.get("scale", 1.0),
+        offset_x=design_transform.get("offset_x", 0.0),
+        offset_y=design_transform.get("offset_y", 0.0),
         target_width=canvas_w,
         target_height=canvas_h,
     )
 
-    # [1] Cylindrical warp — đặc thù mug
     cyl = cfg.get("cylinder", {})
     warped = cylindrical_warp(
         design,
         print_area=cfg["print_area"],
-        output_size=(W, H),
+        output_size=(out_w, out_h),
+        reference_mockup=assets.mockup,
         theta_max_deg=cyl.get("theta_max_deg", 52.0),
         pitch=cyl.get("pitch", 0.0),
         smile_base=cyl.get("smile_base", 0.08),
@@ -69,36 +83,169 @@ def run_mug_pipeline(
         edge_squeeze=cyl.get("edge_squeeze", 0.0),
         squeeze_power=cyl.get("squeeze_power", 2.0),
         center_focus_width=cyl.get("center_focus_width", 0.0),
+        curve_correction_alpha=cyl.get("curve_correction_alpha", 0.0),
+        curve_snap_threshold_px=cyl.get("curve_snap_threshold_px", 2.0),
     )
 
-    # [2] Color match
-    if (not preserve_original_color) and cfg.get("color", {}).get("enable_color_match", True):
-        warped = apply_color_match(
-            warped, assets.mockup, assets.mask,
-            strength=cfg["color"].get("match_strength", 0.40),
+    mesh_src = cfg.get("print_area", {}).get("mesh_control_src")
+    mesh_dst = cfg.get("print_area", {}).get("mesh_control_dst")
+    if (
+        isinstance(mesh_src, list)
+        and isinstance(mesh_dst, list)
+        and len(mesh_src) >= 4
+        and len(mesh_src) == len(mesh_dst)
+    ):
+        warped = apply_smooth_mesh_warp(
+            warped,
+            src_pts=np.float32(mesh_src),
+            dst_pts=np.float32(mesh_dst),
+            output_size=(out_w, out_h),
         )
 
-    # [3] Shadow — Overlay cho men sứ
-    shadow_strength = float(l.get("shadow_strength", 0.45))
+    if (not preserve_original_color) and color_cfg.get("enable_color_match", True):
+        warped = apply_color_match(
+            warped,
+            assets.mockup,
+            assets.mask,
+            strength=color_cfg.get("match_strength", 0.40),
+        )
+
+    lighting_mask = warped[:, :, 3].astype(np.float32) / 255.0
+    base_mask = assets.mask.astype(np.float32)
+    if base_mask.max() > 1.0:
+        base_mask /= 255.0
+    lighting_mask = np.clip(lighting_mask * base_mask, 0.0, 1.0)
+
+    extracted_lighting = extract_masked_lighting(
+        assets.mockup,
+        lighting_mask,
+        blur_kernel=int(lighting_cfg.get("lighting_blur_kernel", 21)),
+    )
+    surface_maps = build_cylinder_surface_maps(
+        print_area=cfg["print_area"],
+        output_size=(out_w, out_h),
+        mask=lighting_mask,
+        theta_max_deg=cyl.get("theta_max_deg", 52.0),
+        edge_squeeze=cyl.get("edge_squeeze", 0.0),
+        squeeze_power=cyl.get("squeeze_power", 2.0),
+        center_focus_width=cyl.get("center_focus_width", 0.0),
+    )
+    light_dir = build_light_direction(
+        light_pos_x=float(lighting_cfg.get("light_pos_x", 0.62)),
+        light_pos_y=float(lighting_cfg.get("light_pos_y", 0.32)),
+        light_height=float(lighting_cfg.get("light_height", 55.0)),
+    )
+    geometry_diffuse = compute_directional_diffuse(
+        surface_maps["normals"],
+        light_dir,
+        valid_mask=surface_maps["valid_mask"],
+    )
+    geometry_diffuse = normalize_masked_field(
+        geometry_diffuse,
+        surface_maps["valid_mask"],
+        empty_fill=1.0,
+        outside_fill=0.0,
+        low_percentile=2.0,
+        high_percentile=98.0,
+    )
+    geometry_diffuse = np.where(
+        surface_maps["valid_mask"],
+        0.35 + 0.65 * geometry_diffuse,
+        0.0,
+    ).astype(np.float32)
+
+    light_field = build_light_field(
+        surface_maps["surface_u"],
+        surface_maps["surface_v"],
+        surface_maps["valid_mask"],
+        light_pos_x=float(lighting_cfg.get("light_pos_x", 0.62)),
+        light_pos_y=float(lighting_cfg.get("light_pos_y", 0.32)),
+        softness=float(lighting_cfg.get("light_softness", 55.0)),
+        contrast=float(lighting_cfg.get("light_contrast", 50.0)),
+        theta_max_deg=cyl.get("theta_max_deg", 52.0),
+        edge_squeeze=cyl.get("edge_squeeze", 0.0),
+        squeeze_power=cyl.get("squeeze_power", 2.0),
+        center_focus_width=cyl.get("center_focus_width", 0.0),
+    )
+    geometry_lighting = np.clip(geometry_diffuse * light_field, 0.0, 1.0)
+    del geometry_diffuse, light_field
+
+    photo_lighting = np.where(
+        surface_maps["valid_mask"],
+        0.60 + 0.40 * extracted_lighting,
+        0.0,
+    ).astype(np.float32)
+    lighting_map = normalize_masked_field(
+        photo_lighting * geometry_lighting,
+        surface_maps["valid_mask"],
+        empty_fill=1.0,
+        outside_fill=0.0,
+        low_percentile=2.0,
+        high_percentile=98.0,
+    )
+    lighting_map = np.where(
+        surface_maps["valid_mask"],
+        0.28 + 0.72 * lighting_map,
+        0.0,
+    ).astype(np.float32)
+    del photo_lighting, extracted_lighting
+
+    shadow_strength = float(lighting_cfg.get("shadow_strength", 0.45))
     if (not preserve_original_color) and shadow_strength > 0:
         warped = apply_shadow_overlay(
-            warped, assets.shadow_map,
+            warped,
+            lighting_map,
             strength=shadow_strength,
         )
 
-    # [4] Composite
     result = composite(
-        assets.mockup, warped, assets.mask,
+        assets.mockup,
+        warped,
+        assets.mask,
         feather_px=cfg.get("edge", {}).get("feather_px", 6),
     )
 
-    # [5] Specular Phong — chỉ mug
-    specular_strength = float(l.get("specular_strength", 0))
+    specular_strength = float(lighting_cfg.get("specular_strength", 0.0))
     if (not preserve_original_color) and specular_strength > 0:
+        # Tái tạo lại extracted_lighting riêng cho highlight để hạn chế RAM đỉnh
+        extracted_lighting_hl = extract_masked_lighting(
+            assets.mockup,
+            lighting_mask,
+            blur_kernel=int(lighting_cfg.get("lighting_blur_kernel", 21)),
+        )
+        light_highlight = float(lighting_cfg.get("light_highlight", 60.0))
+        highlight_t = np.clip(light_highlight / 100.0, 0.0, 1.0)
+        diffuse_highlight = derive_highlight_map(
+            extracted_lighting_hl,
+            threshold=float(lighting_cfg.get("specular_threshold", 180)),
+            blur_kernel=int(lighting_cfg.get("highlight_blur_kernel", 9)),
+        )
+        del extracted_lighting_hl
+        detail_highlight = extract_masked_highlight_detail(
+            assets.mockup,
+            lighting_mask,
+            diffuse_blur_kernel=int(lighting_cfg.get("highlight_extract_blur_kernel", 41)),
+            detail_blur_kernel=int(lighting_cfg.get("highlight_detail_blur_kernel", 9)),
+        )
+        geometry_specular = compute_directional_specular(
+            surface_maps["normals"],
+            light_dir,
+            valid_mask=surface_maps["valid_mask"],
+            shininess=8.0 + highlight_t * 40.0,
+            blur_kernel=int(3 + round(float(lighting_cfg.get("light_softness", 55.0)) / 8.0) * 2),
+        )
+        highlight_map = np.clip(
+            geometry_specular * (0.75 + highlight_t * 0.55)
+            + diffuse_highlight * float(lighting_cfg.get("diffuse_highlight_strength", 0.25))
+            + detail_highlight * float(lighting_cfg.get("highlight_detail_strength", 0.35)),
+            0.0,
+            1.0,
+        )
         result = apply_specular_gloss(
-            result, assets.specular_map,
-            strength=specular_strength,
-            shininess=l.get("shininess", 20.0),
+            result,
+            highlight_map,
+            strength=specular_strength * (0.25 + highlight_t * 1.1),
+            shininess=lighting_cfg.get("shininess", 20.0),
         )
 
     return result

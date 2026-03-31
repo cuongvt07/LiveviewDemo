@@ -95,6 +95,44 @@ Vùng in được chuẩn hóa về hệ canonical:
 
 Việc chuẩn hóa này tách bài toán hình học mug ra khỏi kích thước ảnh thật.
 
+## 4A. Coarse-to-Fine Warp
+
+Kiến trúc mug hiện đã đi theo hướng coarse-to-fine:
+
+### Layer 1: Boundary / coarse transform
+
+Giữ 4 góc:
+
+- `top_left`
+- `top_right`
+- `bottom_right`
+- `bottom_left`
+
+Layer này chịu trách nhiệm:
+
+- scale
+- rotate
+- perspective cơ bản
+- canonical mapping của vùng in
+
+### Layer 2: Fine local mesh warp
+
+Nếu editor có `mesh_control_src` và `mesh_control_dst`, hệ chạy thêm một structured mesh post-warp.
+
+Ý nghĩa:
+
+- không phá hệ 4-corner cũ
+- chỉ thêm local control bên trong
+- migration an toàn cho template cũ vì nếu không có mesh thì kết quả giữ nguyên
+
+Hiện tại layer fine mesh của mug là:
+
+- structured lattice `4x4`, `5x5`, ...
+- auto-generate từ bề mặt cong hiện tại
+- warp cục bộ theo từng cell
+
+Nó nằm sau cylindrical warp, trước color/light/composite.
+
 ### 4.3 Design UV space
 
 Artwork sau cùng được sample từ không gian:
@@ -375,6 +413,38 @@ Sau đó warp bằng:
 - `gpuRemap(...)`
 - interpolation `cv2.INTER_LANCZOS4`
 
+## 11A. Structured mesh post-warp
+
+Sau cylindrical inverse mapping, mug hiện hỗ trợ thêm một mesh layer tùy chọn.
+
+Input:
+
+- `mesh_control_src`
+- `mesh_control_dst`
+
+Hai mảng này ở output pixel space, thường là lưới `4x4`.
+
+Thuật toán:
+
+1. xác định side của structured grid từ số điểm
+2. với mỗi cell `[(r,c) .. (r+1,c+1)]`
+3. lấy `src quad` và `dst quad`
+4. tính inverse homography local `dst -> src`
+5. ghi `map_x/map_y` riêng cho cell đó
+6. remap toàn ảnh bằng `gpuRemap`
+
+Đây là một local-control layer:
+
+- 4 corner vẫn giữ coarse geometry
+- mesh chỉ chỉnh nội bộ
+- phù hợp để fit miệng/đáy cốc, ellipse nhìn nghiêng, hoặc local drift
+
+Khác với TPS của clothes:
+
+- mug mesh hiện ưu tiên structured lattice
+- local warp đi theo từng cell
+- không thay thế cylindrical model
+
 ## 12. Curved clip mask
 
 Nếu chỉ remap rectangle rồi alpha-mask thô, biên trên/dưới sẽ không khớp đường cong grid đã khóa.
@@ -391,6 +461,42 @@ Kết quả:
 
 - đường viền artwork đúng theo shape đã lock trong editor
 - preview và render cuối đồng nhất hơn
+
+## 12A. Correction curve từ ảnh mockup thật
+
+Module mug hiện có thêm một lớp correction curve ở backend cho preview adhoc và render adhoc/final khi có mockup reference.
+
+Mục tiêu:
+
+- fit lại mép trên và mép dưới theo ảnh cốc thật
+- giảm floating gap ở biên
+- sửa phần sai số mà geometry lý thuyết không bám hết được
+
+Pipeline correction hiện tại:
+
+1. blur grayscale mockup
+2. chạy `cv2.Canny(50, 150)`
+3. lấy contour points trong ROI quanh print area
+4. với từng sample trên biên top/bottom base, tìm edge point gần nhất trong một search band
+5. fit polynomial bậc 3 theo `x -> y`
+6. blend:
+
+```math
+y_{final} = \alpha \cdot y_{fit} + (1 - \alpha) \cdot y_{base}
+```
+
+7. edge snapping:
+   - nếu biên blended đã ở đủ gần edge thật thì snap vào edge point gần nhất
+
+Các tham số mặc định hiện hành:
+
+- `curve_correction_alpha = 0.7`
+- `curve_snap_threshold_px = 2.0`
+
+Quan trọng:
+
+- layer này chỉnh biên clip cong, không đổi công thức UV bên trong
+- vì vậy nó sửa edge quality mà không kéo méo toàn bộ artwork như khi cố giải quyết bằng coordinate squeeze
 
 ## 13. Grid preview của mug
 
@@ -429,7 +535,50 @@ với clamp:
 - ô gần vuông vật lý hơn
 - nhìn grid trực quan hơn khi calibrate mug
 
-### 13.3 Vì sao frontend grid phải mirror exact math
+### 13.3 Edge-adaptive mesh density
+
+Ngoài số cột/hàng adaptive theo kích thước, hệ hiện có thêm một layer độc lập cho grid preview:
+
+- `mesh_density_strength`
+
+Mục tiêu của layer này:
+
+- tăng mật độ checker/lưới ở hai mép trái/phải
+- giữ vùng giữa thưa hơn
+- không làm méo artwork thật
+
+Nó không phải geometry warp. Nó chỉ phân phối lại vị trí chia cột của preview grid/checker.
+
+Khi `mesh_density_strength = 1.0`, lưới là uniform.
+
+Khi `mesh_density_strength > 1.0`, các vạch cột được remap theo hàm đối xứng quanh tâm:
+
+```math
+t \in [0,1]
+```
+
+```math
+u(t)=
+\begin{cases}
+0.5 \cdot (t / 0.5)^p & t \le 0.5 \\
+1 - 0.5 \cdot ((1-t)/0.5)^p & t > 0.5
+\end{cases}
+```
+
+với `p = mesh_density_strength`.
+
+Kết quả:
+
+- line gần mép dày hơn
+- vùng giữa thưa hơn
+- edge đầu/cuối vẫn lock đúng `0` và `1`
+
+Layer này hiện dùng cho:
+
+- checkerboard preview backend
+- SVG mug grid frontend nếu bật lớp grid hình học
+
+### 13.4 Vì sao frontend grid phải mirror exact math
 
 Frontend mug grid hiện không dùng Coons patch gần đúng cho hình học chính nữa. Nó dùng cùng hàm warp logic:
 
@@ -556,6 +705,7 @@ Các range UI hiện hành:
 - `edgeSqueeze`: `0..1`
 - `squeezePower`: `1..5`
 - `centerFocusWidth`: `-1..1`
+- `meshDensityStrength`: `1..3`
 
 ## 18. Debug và observability
 

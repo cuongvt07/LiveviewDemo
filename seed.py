@@ -33,10 +33,15 @@ async def seed():
                     'bottom_left': [300, 1300]
                 },
                 'lighting': {
-                    'shadow_strength': 0.0,
+                    'shadow_strength': 0.45,
                     'displacement_strength': 0.0,
                     'specular_strength': 0.3,
-                    'specular_threshold': 220
+                    'specular_threshold': 180,
+                    'cylinder_shading_strength': 0.28,
+                    'edge_darkening_strength': 0.12,
+                    'specular_line_strength': 0.65,
+                    'specular_line_position': 0.18,
+                    'specular_line_sigma': 0.12,
                 },
                 'color': {
                     'enable_color_match': True,

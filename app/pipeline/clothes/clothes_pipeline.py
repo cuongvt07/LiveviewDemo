@@ -34,6 +34,7 @@ def run_clothes_pipeline(
     """
     cfg = assets.config
     l = cfg.get("lighting", {})
+    color_cfg = cfg.get("color", {})
     W, H = assets.mockup.shape[1], assets.mockup.shape[0]
 
     design = decode_design(design_bytes)
@@ -135,12 +136,12 @@ def run_clothes_pipeline(
                 output_size=(W, H),
             )
 
-    if cfg.get("color", {}).get("enable_color_match", True):
+    if color_cfg.get("enable_color_match", True):
         warped = apply_color_match(
             warped,
             assets.mockup,
             assets.mask,
-            strength=cfg["color"].get("match_strength", 0.25),
+            strength=color_cfg.get("match_strength", 0.25),
         )
 
     warped = apply_fabric_multiply(

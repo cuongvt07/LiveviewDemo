@@ -4,6 +4,213 @@ import numpy as np
 from .cylinder_math import apply_horizontal_squeeze, compute_uv_cylindrical
 from ..shared.gpu_ops import gpuRemap
 
+DEFAULT_CURVE_CORRECTION_ALPHA = 0.0
+DEFAULT_CURVE_SNAP_THRESHOLD_PX = 2.0
+DEFAULT_BOUNDARY_DENSITY_POWER = 2.0
+
+
+def _compute_adaptive_boundary_samples(samples: int, density_power: float = DEFAULT_BOUNDARY_DENSITY_POWER) -> np.ndarray:
+    count = max(4, int(samples))
+    t = np.linspace(0.0, 1.0, count, dtype=np.float32)
+    power = max(1.0, float(density_power))
+    if power <= 1.0 + 1e-8:
+        return t
+
+    left_mask = t <= 0.5
+    out = np.empty_like(t)
+    out[left_mask] = 0.5 * np.power(t[left_mask] / 0.5, power)
+    out[~left_mask] = 1.0 - 0.5 * np.power((1.0 - t[~left_mask]) / 0.5, power)
+    out[0] = 0.0
+    out[-1] = 1.0
+    return np.maximum.accumulate(np.clip(out, 0.0, 1.0))
+
+
+def _extract_curve_edge_points(mockup_bgr: np.ndarray, bbox: tuple[int, int, int, int]) -> tuple[np.ndarray, np.ndarray]:
+    x0, y0, x1, y1 = bbox
+    h, w = mockup_bgr.shape[:2]
+    x0 = int(np.clip(x0, 0, w - 1))
+    x1 = int(np.clip(x1, 0, w - 1))
+    y0 = int(np.clip(y0, 0, h - 1))
+    y1 = int(np.clip(y1, 0, h - 1))
+    if x1 <= x0 or y1 <= y0:
+        return np.empty(0, dtype=np.float32), np.empty(0, dtype=np.float32)
+
+    gray = cv2.cvtColor(mockup_bgr, cv2.COLOR_BGR2GRAY) if mockup_bgr.ndim == 3 else mockup_bgr
+    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+    edges = cv2.Canny(blurred, 50, 150)
+    roi = edges[y0 : y1 + 1, x0 : x1 + 1]
+
+    contours, _ = cv2.findContours(roi, cv2.RETR_LIST, cv2.CHAIN_APPROX_NONE)
+    contour_sets: list[np.ndarray] = []
+    for contour in sorted(contours, key=lambda cnt: len(cnt), reverse=True)[:12]:
+        pts = contour.reshape(-1, 2).astype(np.float32)
+        if pts.shape[0] < 4:
+            continue
+        pts[:, 0] += x0
+        pts[:, 1] += y0
+        contour_sets.append(pts)
+
+    if contour_sets:
+        all_pts = np.concatenate(contour_sets, axis=0)
+        return all_pts[:, 0], all_pts[:, 1]
+
+    yy, xx = np.nonzero(roi)
+    if xx.size == 0:
+        return np.empty(0, dtype=np.float32), np.empty(0, dtype=np.float32)
+    return (xx.astype(np.float32) + x0), (yy.astype(np.float32) + y0)
+
+
+def _collect_boundary_candidates(
+    edge_x: np.ndarray,
+    edge_y: np.ndarray,
+    base_x: np.ndarray,
+    base_y: np.ndarray,
+    search_band_px: float,
+    x_window_px: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    sample_x: list[float] = []
+    sample_y: list[float] = []
+
+    for x0, y0 in zip(base_x, base_y):
+        near_x = np.abs(edge_x - x0) <= x_window_px
+        if not np.any(near_x):
+            continue
+        local_x = edge_x[near_x]
+        local_y = edge_y[near_x]
+        near_y = np.abs(local_y - y0) <= search_band_px
+        if not np.any(near_y):
+            continue
+        local_x = local_x[near_y]
+        local_y = local_y[near_y]
+        idx = int(np.argmin(np.abs(local_y - y0)))
+        sample_x.append(float(local_x[idx]))
+        sample_y.append(float(local_y[idx]))
+
+    if len(sample_x) < 4:
+        return np.empty(0, dtype=np.float32), np.empty(0, dtype=np.float32)
+
+    xs = np.round(np.asarray(sample_x, dtype=np.float32)).astype(np.int32)
+    ys = np.asarray(sample_y, dtype=np.float32)
+    unique_x, inverse = np.unique(xs, return_inverse=True)
+    mean_y = np.zeros_like(unique_x, dtype=np.float32)
+    counts = np.zeros_like(unique_x, dtype=np.float32)
+    np.add.at(mean_y, inverse, ys)
+    np.add.at(counts, inverse, 1.0)
+    mean_y /= np.maximum(counts, 1.0)
+    return unique_x.astype(np.float32), mean_y
+
+
+def _fit_boundary_curve(sample_x: np.ndarray, sample_y: np.ndarray, eval_x: np.ndarray, degree: int = 3) -> np.ndarray | None:
+    if sample_x.size < 4 or sample_y.size < 4:
+        return None
+    if np.allclose(sample_x.max(), sample_x.min()):
+        return None
+
+    deg = min(int(degree), int(sample_x.size - 1))
+    x_min = float(sample_x.min())
+    x_span = float(sample_x.max() - sample_x.min())
+    x_norm = ((sample_x - x_min) / max(x_span, 1e-6)) * 2.0 - 1.0
+    eval_norm = ((eval_x - x_min) / max(x_span, 1e-6)) * 2.0 - 1.0
+
+    coeffs = np.polyfit(x_norm, sample_y, deg=deg)
+    fitted = np.polyval(coeffs, eval_norm)
+    return fitted.astype(np.float32)
+
+
+def _blend_and_snap_curve(
+    base_y: np.ndarray,
+    fitted_y: np.ndarray | None,
+    sample_x: np.ndarray,
+    sample_y: np.ndarray,
+    eval_x: np.ndarray,
+    alpha: float,
+    snap_threshold_px: float,
+    x_window_px: float,
+) -> np.ndarray:
+    if fitted_y is None:
+        return base_y
+
+    corrected = (alpha * fitted_y + (1.0 - alpha) * base_y).astype(np.float32)
+    if sample_x.size == 0:
+        return corrected
+
+    for idx, (x0, y0) in enumerate(zip(eval_x, corrected)):
+        near_x = np.abs(sample_x - x0) <= x_window_px
+        if not np.any(near_x):
+            continue
+        nearby_y = sample_y[near_x]
+        nearest = float(nearby_y[np.argmin(np.abs(nearby_y - y0))])
+        if abs(nearest - y0) <= snap_threshold_px:
+            corrected[idx] = nearest
+    return corrected
+
+
+def _apply_mockup_curve_correction(
+    mockup_bgr: np.ndarray,
+    dst_corners: np.ndarray,
+    px_top: np.ndarray,
+    py_top: np.ndarray,
+    px_bottom: np.ndarray,
+    py_bottom: np.ndarray,
+    alpha: float,
+    snap_threshold_px: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    blend = float(np.clip(alpha, 0.0, 1.0))
+    if blend <= 1e-8:
+        return py_top, py_bottom
+
+    xs = dst_corners[:, 0]
+    ys = dst_corners[:, 1]
+    margin_x = max(6, int((xs.max() - xs.min()) * 0.08))
+    margin_y = max(6, int((ys.max() - ys.min()) * 0.12))
+    bbox = (
+        int(np.floor(xs.min() - margin_x)),
+        int(np.floor(ys.min() - margin_y)),
+        int(np.ceil(xs.max() + margin_x)),
+        int(np.ceil(ys.max() + margin_y)),
+    )
+
+    edge_x, edge_y = _extract_curve_edge_points(mockup_bgr, bbox)
+    if edge_x.size == 0:
+        return py_top, py_bottom
+
+    bbox_height = max(1.0, float(bbox[3] - bbox[1]))
+    bbox_width = max(1.0, float(bbox[2] - bbox[0]))
+    search_band_px = float(np.clip(bbox_height * 0.12, 6.0, 28.0))
+    x_window_px = float(np.clip(bbox_width / 96.0, 2.0, 6.0))
+
+    top_sample_x, top_sample_y = _collect_boundary_candidates(edge_x, edge_y, px_top, py_top, search_band_px, x_window_px)
+    bottom_sample_x, bottom_sample_y = _collect_boundary_candidates(edge_x, edge_y, px_bottom, py_bottom, search_band_px, x_window_px)
+
+    top_fit = _fit_boundary_curve(top_sample_x, top_sample_y, px_top)
+    bottom_fit = _fit_boundary_curve(bottom_sample_x, bottom_sample_y, px_bottom)
+
+    corrected_top = _blend_and_snap_curve(
+        py_top,
+        top_fit,
+        top_sample_x,
+        top_sample_y,
+        px_top,
+        blend,
+        snap_threshold_px,
+        x_window_px,
+    )
+    corrected_bottom = _blend_and_snap_curve(
+        py_bottom,
+        bottom_fit,
+        bottom_sample_x,
+        bottom_sample_y,
+        px_bottom,
+        blend,
+        snap_threshold_px,
+        x_window_px,
+    )
+
+    corrected_top = np.clip(corrected_top, 0, mockup_bgr.shape[0] - 1)
+    corrected_bottom = np.clip(corrected_bottom, 0, mockup_bgr.shape[0] - 1)
+    corrected_bottom = np.maximum(corrected_bottom, corrected_top + 1.0)
+    return corrected_top.astype(np.float32), corrected_bottom.astype(np.float32)
+
 
 def _local_warp_point(
     u: np.ndarray,
@@ -52,6 +259,8 @@ def _local_warp_point(
 
 
 def _build_curved_clip_mask(
+    mockup_bgr: np.ndarray | None,
+    dst_corners: np.ndarray,
     H: int,
     W: int,
     H_mat_output_to_canon: np.ndarray,
@@ -64,11 +273,13 @@ def _build_curved_clip_mask(
     edge_squeeze: float,
     squeeze_power: float,
     center_focus_width: float,
+    curve_correction_alpha: float = DEFAULT_CURVE_CORRECTION_ALPHA,
+    curve_snap_threshold_px: float = DEFAULT_CURVE_SNAP_THRESHOLD_PX,
     samples: int = 256,
 ) -> np.ndarray:
     H_inv = np.linalg.inv(H_mat_output_to_canon)
 
-    u = np.linspace(0.0, 1.0, samples, dtype=np.float32)
+    u = _compute_adaptive_boundary_samples(samples)
     v_top = np.zeros_like(u)
     v_bot = np.ones_like(u)
 
@@ -108,7 +319,32 @@ def _build_curved_clip_mask(
     proj /= proj[2:3, :]
     px = np.clip(proj[0], 0, W - 1)
     py = np.clip(proj[1], 0, H - 1)
-    poly = np.stack([px, py], axis=1).astype(np.int32)
+
+    split = u.shape[0]
+    px_top = px[:split]
+    py_top = py[:split]
+    px_bottom = px[split:][::-1]
+    py_bottom = py[split:][::-1]
+
+    if mockup_bgr is not None and float(curve_correction_alpha) > 1e-8:
+        py_top, py_bottom = _apply_mockup_curve_correction(
+            mockup_bgr=mockup_bgr,
+            dst_corners=dst_corners,
+            px_top=px_top,
+            py_top=py_top,
+            px_bottom=px_bottom,
+            py_bottom=py_bottom,
+            alpha=curve_correction_alpha,
+            snap_threshold_px=curve_snap_threshold_px,
+        )
+
+    poly = np.stack(
+        [
+            np.concatenate([px_top, px_bottom[::-1]]),
+            np.concatenate([py_top, py_bottom[::-1]]),
+        ],
+        axis=1,
+    ).astype(np.int32)
 
     mask = np.zeros((H, W), dtype=np.uint8)
     cv2.fillPoly(mask, [poly], 255, lineType=cv2.LINE_AA)
@@ -119,6 +355,7 @@ def cylindrical_warp(
     design: np.ndarray,
     print_area: dict,
     output_size: tuple[int, int],
+    reference_mockup: np.ndarray | None = None,
     theta_max_deg: float = 52.0,
     pitch: float = 0.0,
     smile_base: float = 0.08,
@@ -127,6 +364,8 @@ def cylindrical_warp(
     edge_squeeze: float = 0.0,
     squeeze_power: float = 2.0,
     center_focus_width: float = 0.0,
+    curve_correction_alpha: float = DEFAULT_CURVE_CORRECTION_ALPHA,
+    curve_snap_threshold_px: float = DEFAULT_CURVE_SNAP_THRESHOLD_PX,
 ) -> np.ndarray:
     """
     Warp a flat design to mug cylindrical space.
@@ -201,6 +440,8 @@ def cylindrical_warp(
     # Final clip by curved boundary so rendered print matches locked editor grid shape.
     if warped.ndim == 3 and warped.shape[2] == 4:
         curved_mask = _build_curved_clip_mask(
+            mockup_bgr=reference_mockup,
+            dst_corners=dst_corners,
             H=H,
             W=W,
             H_mat_output_to_canon=H_mat,
@@ -213,6 +454,8 @@ def cylindrical_warp(
             edge_squeeze=edge_squeeze,
             squeeze_power=squeeze_power,
             center_focus_width=center_focus_width,
+            curve_correction_alpha=curve_correction_alpha,
+            curve_snap_threshold_px=curve_snap_threshold_px,
         )
         warped[:, :, 3] = cv2.bitwise_and(warped[:, :, 3], curved_mask)
 

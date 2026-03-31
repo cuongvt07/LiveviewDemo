@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import uuid
+from pathlib import Path
 from typing import Optional
 
 import cv2
@@ -23,6 +24,7 @@ from app.pipeline.mugs.specular_gloss import extract_specular_from_mockup
 from app.pipeline.pipeline import run_pipeline
 from app.pipeline.shared.decode import decode_design
 from app.pipeline.shared.design_transform import apply_design_transform, estimate_print_area_canvas_size
+from app.pipeline.shared.smooth_mesh_warp import apply_smooth_mesh_warp
 from app.services import template_registry
 from app.services.vision import auto_detect_print_area_v2, bake_normal_map, create_soft_mask
 
@@ -31,6 +33,9 @@ router = APIRouter(tags=["render"])
 GRID_CELL_PX = 90
 MIN_GRID_DIVS = 4
 MAX_GRID_DIVS = 24
+DEFAULT_MESH_DENSITY_STRENGTH = 2.0
+DEFAULT_CURVE_CORRECTION_ALPHA = 0.7
+DEFAULT_CURVE_SNAP_THRESHOLD_PX = 2.0
 
 
 def _log_horizontal_squeeze_debug(
@@ -62,6 +67,9 @@ def _log_horizontal_squeeze_debug(
     )
 
 
+import gc
+
+
 class WarpPreviewRequest(BaseModel):
     mockup_width: int
     mockup_height: int
@@ -74,6 +82,9 @@ class WarpPreviewRequest(BaseModel):
     edge_squeeze: float = 0.0
     squeeze_power: float = 2.0
     center_focus_width: float = 0.0
+    mesh_density_strength: float = DEFAULT_MESH_DENSITY_STRENGTH
+    curve_correction_alpha: float = DEFAULT_CURVE_CORRECTION_ALPHA
+    curve_snap_threshold_px: float = DEFAULT_CURVE_SNAP_THRESHOLD_PX
     design_scale: float = 1.0
     design_offset_x: float = 0.0
     design_offset_y: float = 0.0
@@ -94,7 +105,7 @@ def _resolve_product_type(raw_product_type: Optional[str], warp_type: str, has_m
             return "clothes"
         if lowered in {"mug", "cylinder_ceramic", "cylinder_glass", "cylinder_travel"}:
             return "mug"
-    if warp_type == "tps" or has_manual_mesh:
+    if warp_type == "tps":
         return "clothes"
     return "mug"
 
@@ -112,6 +123,9 @@ def _build_default_adhoc_config(width: int, height: int) -> dict:
             "edge_squeeze": 0.0,
             "squeeze_power": 2.0,
             "center_focus_width": 0.0,
+            "mesh_density_strength": DEFAULT_MESH_DENSITY_STRENGTH,
+            "curve_correction_alpha": DEFAULT_CURVE_CORRECTION_ALPHA,
+            "curve_snap_threshold_px": DEFAULT_CURVE_SNAP_THRESHOLD_PX,
         },
         "mesh": {
             "n_points": 80,
@@ -129,11 +143,29 @@ def _build_default_adhoc_config(width: int, height: int) -> dict:
             "offset_y": 0.0,
         },
         "lighting": {
-            # Ad-hoc profile defaults to color fidelity over synthetic lighting.
-            "shadow_strength": 0.0,
+            # Ad-hoc mug defaults aim for realism instead of a flat raw overlay.
+            "shadow_strength": 0.45,
             "displacement_strength": 0.0,
-            "specular_strength": 0.0,
-            "specular_threshold": 245,
+            "specular_strength": 0.30,
+            "specular_threshold": 180,
+            "light_pos_x": 0.62,
+            "light_pos_y": 0.32,
+            "light_height": 55.0,
+            "light_contrast": 50.0,
+            "light_highlight": 60.0,
+            "light_softness": 55.0,
+            "cylinder_shading_strength": 0.28,
+            "edge_darkening_strength": 0.12,
+            "specular_line_strength": 0.65,
+            "specular_line_position": 0.18,
+            "specular_line_sigma": 0.12,
+            "specular_line_blur_kernel": 11,
+            "diffuse_highlight_strength": 0.25,
+            "highlight_detail_strength": 0.35,
+            "lighting_blur_kernel": 21,
+            "highlight_blur_kernel": 9,
+            "highlight_extract_blur_kernel": 41,
+            "highlight_detail_blur_kernel": 9,
         },
         "color": {
             "enable_color_match": False,
@@ -143,7 +175,7 @@ def _build_default_adhoc_config(width: int, height: int) -> dict:
             "feather_px": 0,
         },
         "render": {
-            "preserve_original_color": True,
+            "preserve_original_color": False,
         },
         "output": {
             "jpeg_quality": 90,
@@ -230,6 +262,15 @@ def _merge_adhoc_user_config(config: dict, config_json: Optional[str]) -> dict:
     config["cylinder"]["center_focus_width"] = float(
         user_warp.get("center_focus_width", config["cylinder"]["center_focus_width"])
     )
+    config["cylinder"]["mesh_density_strength"] = float(
+        user_warp.get("mesh_density_strength", config["cylinder"]["mesh_density_strength"])
+    )
+    config["cylinder"]["curve_correction_alpha"] = float(
+        user_warp.get("curve_correction_alpha", config["cylinder"]["curve_correction_alpha"])
+    )
+    config["cylinder"]["curve_snap_threshold_px"] = float(
+        user_warp.get("curve_snap_threshold_px", config["cylinder"]["curve_snap_threshold_px"])
+    )
 
     if "feather_radius" in user_warp:
         config["edge"]["feather_px"] = int(user_warp.get("feather_radius", config["edge"]["feather_px"]))
@@ -260,6 +301,78 @@ def _merge_adhoc_user_config(config: dict, config_json: Optional[str]) -> dict:
         if "specular_threshold" in user_lighting:
             config["lighting"]["specular_threshold"] = int(
                 user_lighting.get("specular_threshold", config["lighting"]["specular_threshold"])
+            )
+        if "light_pos_x" in user_lighting:
+            config["lighting"]["light_pos_x"] = float(
+                user_lighting.get("light_pos_x", config["lighting"]["light_pos_x"])
+            )
+        if "light_pos_y" in user_lighting:
+            config["lighting"]["light_pos_y"] = float(
+                user_lighting.get("light_pos_y", config["lighting"]["light_pos_y"])
+            )
+        if "light_height" in user_lighting:
+            config["lighting"]["light_height"] = float(
+                user_lighting.get("light_height", config["lighting"]["light_height"])
+            )
+        if "light_contrast" in user_lighting:
+            config["lighting"]["light_contrast"] = float(
+                user_lighting.get("light_contrast", config["lighting"]["light_contrast"])
+            )
+        if "light_highlight" in user_lighting:
+            config["lighting"]["light_highlight"] = float(
+                user_lighting.get("light_highlight", config["lighting"]["light_highlight"])
+            )
+        if "light_softness" in user_lighting:
+            config["lighting"]["light_softness"] = float(
+                user_lighting.get("light_softness", config["lighting"]["light_softness"])
+            )
+        if "cylinder_shading_strength" in user_lighting:
+            config["lighting"]["cylinder_shading_strength"] = float(
+                user_lighting.get("cylinder_shading_strength", config["lighting"]["cylinder_shading_strength"])
+            )
+        if "edge_darkening_strength" in user_lighting:
+            config["lighting"]["edge_darkening_strength"] = float(
+                user_lighting.get("edge_darkening_strength", config["lighting"]["edge_darkening_strength"])
+            )
+        if "specular_line_strength" in user_lighting:
+            config["lighting"]["specular_line_strength"] = float(
+                user_lighting.get("specular_line_strength", config["lighting"]["specular_line_strength"])
+            )
+        if "specular_line_position" in user_lighting:
+            config["lighting"]["specular_line_position"] = float(
+                user_lighting.get("specular_line_position", config["lighting"]["specular_line_position"])
+            )
+        if "specular_line_sigma" in user_lighting:
+            config["lighting"]["specular_line_sigma"] = float(
+                user_lighting.get("specular_line_sigma", config["lighting"]["specular_line_sigma"])
+            )
+        if "specular_line_blur_kernel" in user_lighting:
+            config["lighting"]["specular_line_blur_kernel"] = int(
+                user_lighting.get("specular_line_blur_kernel", config["lighting"]["specular_line_blur_kernel"])
+            )
+        if "diffuse_highlight_strength" in user_lighting:
+            config["lighting"]["diffuse_highlight_strength"] = float(
+                user_lighting.get("diffuse_highlight_strength", config["lighting"]["diffuse_highlight_strength"])
+            )
+        if "highlight_detail_strength" in user_lighting:
+            config["lighting"]["highlight_detail_strength"] = float(
+                user_lighting.get("highlight_detail_strength", config["lighting"]["highlight_detail_strength"])
+            )
+        if "lighting_blur_kernel" in user_lighting:
+            config["lighting"]["lighting_blur_kernel"] = int(
+                user_lighting.get("lighting_blur_kernel", config["lighting"]["lighting_blur_kernel"])
+            )
+        if "highlight_blur_kernel" in user_lighting:
+            config["lighting"]["highlight_blur_kernel"] = int(
+                user_lighting.get("highlight_blur_kernel", config["lighting"]["highlight_blur_kernel"])
+            )
+        if "highlight_extract_blur_kernel" in user_lighting:
+            config["lighting"]["highlight_extract_blur_kernel"] = int(
+                user_lighting.get("highlight_extract_blur_kernel", config["lighting"]["highlight_extract_blur_kernel"])
+            )
+        if "highlight_detail_blur_kernel" in user_lighting:
+            config["lighting"]["highlight_detail_blur_kernel"] = int(
+                user_lighting.get("highlight_detail_blur_kernel", config["lighting"]["highlight_detail_blur_kernel"])
             )
 
     user_render = user_config.get("render", {})
@@ -296,7 +409,6 @@ def _merge_adhoc_user_config(config: dict, config_json: Optional[str]) -> dict:
     if has_manual_mesh:
         config["mesh"]["control_src"] = mesh_src
         config["mesh"]["control_dst"] = mesh_dst
-        config["product_type"] = "clothes"
 
     return config
 
@@ -309,13 +421,39 @@ def _compute_adaptive_grid(width: int, height: int, cell_px: int = GRID_CELL_PX)
     return cols, rows
 
 
-def _build_preview_design_canvas(width: int, height: int, cell_px: int = GRID_CELL_PX) -> np.ndarray:
+def _compute_adaptive_axis_edges(divisions: int, density_strength: float = DEFAULT_MESH_DENSITY_STRENGTH) -> np.ndarray:
+    divs = max(1, int(divisions))
+    samples = np.linspace(0.0, 1.0, divs + 1, dtype=np.float32)
+    power = max(1.0, float(density_strength))
+    if power <= 1.0 + 1e-8:
+        return samples
+
+    edges = np.empty_like(samples)
+    left_mask = samples <= 0.5
+    left_samples = samples[left_mask] / 0.5
+    edges[left_mask] = 0.5 * np.power(left_samples, power)
+
+    right_samples = (1.0 - samples[~left_mask]) / 0.5
+    edges[~left_mask] = 1.0 - 0.5 * np.power(right_samples, power)
+
+    edges = np.clip(edges, 0.0, 1.0)
+    edges[0] = 0.0
+    edges[-1] = 1.0
+    return np.maximum.accumulate(edges)
+
+
+def _build_preview_design_canvas(
+    width: int,
+    height: int,
+    cell_px: int = GRID_CELL_PX,
+    mesh_density_strength: float = DEFAULT_MESH_DENSITY_STRENGTH,
+) -> np.ndarray:
     safe_w = max(1, int(width))
     safe_h = max(1, int(height))
     cols, rows = _compute_adaptive_grid(safe_w, safe_h, cell_px=cell_px)
     canvas = np.zeros((safe_h, safe_w, 4), dtype=np.uint8)
 
-    x_edges = np.linspace(0, safe_w, cols + 1, dtype=np.int32)
+    x_edges = np.rint(_compute_adaptive_axis_edges(cols, mesh_density_strength) * safe_w).astype(np.int32)
     y_edges = np.linspace(0, safe_h, rows + 1, dtype=np.int32)
 
     for r in range(rows):
@@ -337,7 +475,11 @@ def _build_preview_design_canvas(width: int, height: int, cell_px: int = GRID_CE
     return canvas
 
 
-def _render_warp_preview_image(req: WarpPreviewRequest, design_canvas: np.ndarray) -> np.ndarray:
+def _render_warp_preview_image(
+    req: WarpPreviewRequest,
+    design_canvas: np.ndarray,
+    reference_mockup: np.ndarray | None = None,
+) -> np.ndarray:
     from app.pipeline.clothes.tps_warp import tps_warp_design
     from app.pipeline.mugs.cylindrical_warp import cylindrical_warp
 
@@ -377,6 +519,7 @@ def _render_warp_preview_image(req: WarpPreviewRequest, design_canvas: np.ndarra
             design_canvas,
             pa,
             (w, h),
+            reference_mockup=reference_mockup,
             theta_max_deg=req.theta_max_deg,
             pitch=pitch_val,
             smile_base=smile_val,
@@ -385,7 +528,23 @@ def _render_warp_preview_image(req: WarpPreviewRequest, design_canvas: np.ndarra
             edge_squeeze=req.edge_squeeze,
             squeeze_power=req.squeeze_power,
             center_focus_width=req.center_focus_width,
+            curve_correction_alpha=req.curve_correction_alpha,
+            curve_snap_threshold_px=req.curve_snap_threshold_px,
         )
+        mesh_src = req.print_area.get("mesh_control_src", [])
+        mesh_dst = req.print_area.get("mesh_control_dst", [])
+        if (
+            isinstance(mesh_src, list)
+            and isinstance(mesh_dst, list)
+            and len(mesh_src) >= 4
+            and len(mesh_src) == len(mesh_dst)
+        ):
+            warped = apply_smooth_mesh_warp(
+                warped,
+                src_pts=np.float32(mesh_src),
+                dst_pts=np.float32(mesh_dst),
+                output_size=(w, h),
+            )
     elif req.warp_type == "tps":
         src_pts_px = np.float32(req.print_area.get("mesh_control_src", []))
         dst_pts = np.float32(req.print_area.get("mesh_control_dst", []))
@@ -511,16 +670,43 @@ async def renderMockup(
 
 @router.post("/mockup/render-adhoc")
 async def renderAdhoc(
-    mockup_image: UploadFile = File(...),
-    design_image: UploadFile = File(...),
+    mockup_image: Optional[UploadFile] = File(None),
+    design_image: Optional[UploadFile] = File(None),
+    mockup_url: Optional[str] = Form(None),
+    design_url: Optional[str] = Form(None),
     output_format: str = Form("jpg"),
     config_json: str = Form(None),
 ):
     request_id = f"req_{uuid.uuid4().hex[:8]}"
 
     try:
-        mockup_bytes = await mockup_image.read()
-        design_bytes = await design_image.read()
+        # 1. Resolve Mockup
+        if mockup_image:
+            mockup_bytes = await mockup_image.read()
+        elif mockup_url:
+            local_path = mockup_url
+            if local_path.startswith('/static/'):
+                local_path = local_path.replace('/static/', 'inputs/')
+            p = Path(local_path)
+            if not p.exists():
+                raise HTTPException(status_code=400, detail=f"Mockup URL {mockup_url} not found")
+            mockup_bytes = p.read_bytes()
+        else:
+            raise HTTPException(status_code=400, detail="Missing mockup_image or mockup_url")
+
+        # 2. Resolve Design
+        if design_image:
+            design_bytes = await design_image.read()
+        elif design_url:
+            local_path = design_url
+            if local_path.startswith('/static/'):
+                local_path = local_path.replace('/static/', 'inputs/')
+            p = Path(local_path)
+            if not p.exists():
+                raise HTTPException(status_code=400, detail=f"Design URL {design_url} not found")
+            design_bytes = p.read_bytes()
+        else:
+            raise HTTPException(status_code=400, detail="Missing design_image or design_url")
 
         buf = np.frombuffer(mockup_bytes, dtype=np.uint8)
         mockup = cv2.imdecode(buf, cv2.IMREAD_COLOR)
@@ -631,7 +817,11 @@ async def renderWarpPreview(req: WarpPreviewRequest):
         fallback_width=req.mockup_width,
         fallback_height=req.mockup_height,
     )
-    design_canvas = _build_preview_design_canvas(canvas_w, canvas_h)
+    design_canvas = _build_preview_design_canvas(
+        canvas_w,
+        canvas_h,
+        mesh_density_strength=req.mesh_density_strength,
+    )
     warped = _render_warp_preview_image(req, design_canvas)
 
     ok, buf = cv2.imencode(".png", warped)
@@ -657,6 +847,52 @@ async def renderWarpPreviewFile(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     ok, buf = cv2.imencode(".png", warped)
+    if not ok:
+        raise HTTPException(status_code=500, detail="encode_failed")
+    return Response(content=bytes(buf), media_type="image/png", headers={"Cache-Control": "no-cache"})
+
+
+@router.post("/mockup/warp-preview-adhoc")
+async def renderWarpPreviewAdhoc(
+    config_json: str = Form(...),
+    mockup_image: UploadFile = File(...),
+    design_image: UploadFile | None = File(None),
+):
+    try:
+        payload = json.loads(config_json)
+        req = WarpPreviewRequest(**payload)
+
+        mockup_bytes = await mockup_image.read()
+        mockup_buf = np.frombuffer(mockup_bytes, dtype=np.uint8)
+        mockup = cv2.imdecode(mockup_buf, cv2.IMREAD_COLOR)
+        if mockup is None:
+            raise HTTPException(status_code=400, detail="invalid_mockup")
+
+        if design_image is not None:
+            design_bytes = await design_image.read()
+            design_canvas = decode_design(design_bytes)
+        else:
+            canvas_w, canvas_h = estimate_print_area_canvas_size(
+                req.print_area,
+                fallback_width=req.mockup_width,
+                fallback_height=req.mockup_height,
+            )
+            design_canvas = _build_preview_design_canvas(
+                canvas_w,
+                canvas_h,
+                mesh_density_strength=req.mesh_density_strength,
+            )
+
+        warped = _render_warp_preview_image(req, design_canvas, reference_mockup=mockup)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    ok, buf = cv2.imencode(".png", warped)
+    del warped
+    gc.collect()
+
     if not ok:
         raise HTTPException(status_code=500, detail="encode_failed")
     return Response(content=bytes(buf), media_type="image/png", headers={"Cache-Control": "no-cache"})

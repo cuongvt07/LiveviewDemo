@@ -1,6 +1,8 @@
 import cv2
 import numpy as np
+
 from ..shared.colorspace import to_linear, to_srgb
+
 
 def apply_shadow_overlay(
     warped: np.ndarray,
@@ -8,25 +10,21 @@ def apply_shadow_overlay(
     strength: float = 0.45,
 ) -> np.ndarray:
     """
-    Overlay blend shadow cho men sứ.
-    Chỉ dùng cho Mugs.
+    Apply lighting-derived shadow to the warped design in linear space.
 
-    Men sứ: dùng Overlay (không phải Multiply) vì bề mặt bóng
-    phản xạ ánh sáng theo cả 2 chiều tối/sáng.
-    Tính toán trong Linear color space.
+    `shadow_map` can be in [0..1] or [0..255]. Brighter values preserve more of
+    the design, darker values attenuate it.
     """
     h, w = warped.shape[:2]
     result = warped.copy()
     rgb_linear = to_linear(result[:, :, :3])
 
-    s = cv2.resize(shadow_map, (w, h)).astype(np.float32) / 255.0
-    s_linear = to_linear(s[:, :, np.newaxis])
+    shadow = cv2.resize(shadow_map, (w, h)).astype(np.float32)
+    if shadow.max() > 1.0:
+        shadow /= 255.0
+    shadow = np.clip(shadow, 0.0, 1.0)
 
-    overlay = np.where(
-        s_linear < 0.5,
-        2 * rgb_linear * s_linear,
-        1 - 2 * (1 - rgb_linear) * (1 - s_linear),
-    )
-    rgb_out = rgb_linear + (overlay - rgb_linear) * strength
-    result[:, :, :3] = to_srgb(np.clip(rgb_out, 0, 1))
+    shadow_factor = 1.0 - (1.0 - shadow) * float(np.clip(strength, 0.0, 1.0))
+    rgb_out = rgb_linear * shadow_factor[:, :, np.newaxis]
+    result[:, :, :3] = to_srgb(np.clip(rgb_out, 0.0, 1.0))
     return result

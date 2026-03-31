@@ -13,6 +13,7 @@ interface MugCurvePreviewProps {
   edgeSqueeze: number;
   squeezePower: number;
   centerFocusWidth: number;
+  meshDensityStrength: number;
   hPx: number;
   wPx: number;
   showGrid: boolean;
@@ -40,6 +41,21 @@ function computeAdaptiveGrid(wPx: number, hPx: number): { cols: number; rows: nu
     cols: clampGridDivs(Math.round(wPx / GRID_CELL_PX)),
     rows: clampGridDivs(Math.round(hPx / GRID_CELL_PX)),
   };
+}
+
+function computeAdaptiveAxisEdges(divisions: number, meshDensityStrength: number): number[] {
+  const divs = Math.max(1, Math.floor(divisions));
+  const power = Math.max(1, meshDensityStrength);
+  return Array.from({ length: divs + 1 }, (_, index) => {
+    const t = index / divs;
+    if (power <= 1 + 1e-8) return t;
+    if (t <= 0.5) return 0.5 * Math.pow(t / 0.5, power);
+    return 1 - 0.5 * Math.pow((1 - t) / 0.5, power);
+  }).map((value, index, arr) => {
+    if (index === 0) return 0;
+    if (index === arr.length - 1) return 1;
+    return Math.max(0, Math.min(1, value));
+  });
 }
 
 function solve_homography(src: Point[], dst: Point[]): number[] {
@@ -176,6 +192,7 @@ export const MugCurvePreview: React.FC<MugCurvePreviewProps> = ({
   edgeSqueeze,
   squeezePower,
   centerFocusWidth,
+  meshDensityStrength,
   hPx,
   wPx,
   showGrid,
@@ -210,6 +227,7 @@ export const MugCurvePreview: React.FC<MugCurvePreviewProps> = ({
   const boundaryPath = pathParts.join(' ');
 
   const { cols, rows } = computeAdaptiveGrid(wPx, hPx);
+  const uEdges = computeAdaptiveAxisEdges(cols, meshDensityStrength);
   const lineSamples = Math.min(72, Math.max(24, Math.ceil(Math.max(cols, rows) * 2)));
 
   return (
@@ -224,8 +242,8 @@ export const MugCurvePreview: React.FC<MugCurvePreviewProps> = ({
         <g clipPath="url(#mug-clip-unified)">
           {Array.from({ length: rows }).flatMap((_, r) =>
             Array.from({ length: cols }).map((__, c) => {
-              const u0 = c / cols;
-              const u1 = (c + 1) / cols;
+              const u0 = uEdges[c];
+              const u1 = uEdges[c + 1];
               const v0 = r / rows;
               const v1 = (r + 1) / rows;
               const p00 = patchAt(u0, v0);
@@ -244,7 +262,7 @@ export const MugCurvePreview: React.FC<MugCurvePreviewProps> = ({
           )}
 
           {Array.from({ length: cols + 1 }).map((_, ci) => {
-            const u = ci / cols;
+            const u = uEdges[ci];
             const line: string[] = [];
             for (let s = 0; s <= lineSamples; s++) {
               const v = s / lineSamples;

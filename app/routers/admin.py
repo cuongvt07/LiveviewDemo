@@ -2,7 +2,10 @@
 
 import os
 import uuid
+import json
+import copy
 import shutil
+import logging
 import asyncio
 from pathlib import Path
 from fastapi import (
@@ -18,10 +21,11 @@ from sqlalchemy import select
 
 from app.db.database import async_session, getSession
 from app.db.models import Template, TemplateConfigHistory
-from app.schemas import TemplateCreate, TemplateConfigUpdate
+from app.schemas import TemplateCreate, TemplateConfigUpdate, LibraryItem, TemplateSaveAdhoc
 from app.services import template_registry
 
 router = APIRouter(tags=['admin'])
+logger = logging.getLogger('mockup_service')
 
 ASSET_BASE_DIR = os.getenv('ASSET_BASE_DIR', './templates')
 ADMIN_TOKEN = os.getenv('ADMIN_TOKEN', 'change-me-in-production')
@@ -34,6 +38,28 @@ def verifyAdmin(authorization: str = Header(None)):
     token = authorization.split(' ', 1)[1]
     if token != ADMIN_TOKEN:
         raise HTTPException(status_code=403, detail='Invalid token')
+
+
+def _normalize_saved_template_config(
+    raw_config: dict,
+    output_width: int,
+    output_height: int,
+    product_type_hint: str,
+) -> dict:
+    from app.routers.render import _build_default_adhoc_config, _merge_adhoc_user_config
+
+    payload = copy.deepcopy(raw_config) if isinstance(raw_config, dict) else {}
+    if not isinstance(payload.get('print_area'), dict):
+        payload['print_area'] = {}
+    if not isinstance(payload.get('warp'), dict):
+        payload['warp'] = {}
+
+    payload.setdefault('product_type', product_type_hint)
+    payload['print_area'].setdefault('product_type', product_type_hint)
+    payload['warp'].setdefault('product_type', product_type_hint)
+
+    default_config = _build_default_adhoc_config(output_width, output_height)
+    return _merge_adhoc_user_config(default_config, json.dumps(payload))
 
 
 @router.post('/templates')
@@ -86,7 +112,7 @@ async def createTemplate(
         dest.write_bytes(content)
 
     mockup_path = template_dir / 'mockup.jpg'
-    mask_path = maps_dir / 'mask.png'
+        mask_path = maps_dir / 'mask.jpg'
 
     await saveFile(mockup_file, mockup_path)
     await saveFile(mask_file, mask_path)
@@ -351,3 +377,161 @@ async def generateMaps(slug: str, _admin=Depends(verifyAdmin)):
         'slug': slug,
         'maps': str(maps_dir),
     }
+
+
+# --- Library Endpoints ---
+
+@router.get('/library/{lib_type}', response_model=list[LibraryItem])
+async def listLibrary(lib_type: str):
+    '''Liệt kê file trong thư viện (bases hoặc artworks).'''
+    if lib_type not in ['bases', 'artworks']:
+        raise HTTPException(status_code=400, detail='Invalid library type')
+    
+    lib_dir = Path(f'inputs/{lib_type}')
+    if not lib_dir.exists():
+        lib_dir.mkdir(parents=True, exist_ok=True)
+    
+    items = []
+    for f in lib_dir.iterdir():
+        if f.is_file() and f.suffix.lower() in ['.jpg', '.jpeg', '.png', '.webp']:
+            stat = f.stat()
+            items.append(LibraryItem(
+                name=f.name,
+                url=f'/static/{lib_type}/{f.name}',
+                size_bytes=stat.st_size,
+                modified_at=str(datetime.fromtimestamp(stat.st_mtime))
+            ))
+    
+    # Sắp xếp theo thời gian mới nhất
+    items.sort(key=lambda x: x.modified_at, reverse=True)
+    return items
+
+
+@router.post('/library/{lib_type}/upload')
+async def uploadToLibrary(
+    lib_type: str,
+    file: UploadFile = File(...),
+):
+    '''Upload file vào thư viện.'''
+    if lib_type not in ['bases', 'artworks']:
+        raise HTTPException(status_code=400, detail='Invalid library type')
+    
+    lib_dir = Path(f'inputs/{lib_type}')
+    lib_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Tránh trùng tên bằng cách thêm uuid nếu cần, hoặc ghi đè
+    dest = lib_dir / file.filename
+    content = await file.read()
+    dest.write_bytes(content)
+    
+    return {
+        'name': file.filename,
+        'url': f'/static/{lib_type}/{file.filename}',
+        'message': f'Uploaded to {lib_type} library'
+    }
+
+
+@router.post('/templates/save-adhoc')
+async def saveAdhocTemplate(
+    body: TemplateSaveAdhoc,
+):
+    '''Tạo template mới từ kết quả calibrate adhoc.'''
+    # 1. Kiểm tra slug trùng
+    async with async_session() as session:
+        exists = await session.execute(
+            select(Template).where(Template.slug == body.slug)
+        )
+        if exists.scalar_one_or_none():
+            raise HTTPException(status_code=409, detail={'message': f'Slug \'{body.slug}\' đã tồn tại'})
+
+    # 2. Xác định ảnh gốc (từ library hoặc path)
+    # Hỗ trợ URL /static/bases/filename.jpg -> inputs/bases/filename.jpg
+    mockup_path_str = body.mockup_url
+    if mockup_path_str.startswith('/static/bases/'):
+        mockup_path_str = mockup_path_str.replace('/static/bases/', 'inputs/bases/')
+    
+    mockup_path = Path(mockup_path_str)
+    if not mockup_path.exists():
+         raise HTTPException(status_code=400, detail={'message': f'Mockup path \'{mockup_path_str}\' không tồn tại trên server'})
+
+    # 3. Chuẩn bị thư mục template
+    template_dir = Path(ASSET_BASE_DIR) / body.slug
+    maps_dir = template_dir / 'maps'
+    maps_dir.mkdir(parents=True, exist_ok=True)
+
+    normalized_config = _normalize_saved_template_config(
+        body.config,
+        body.output_width,
+        body.output_height,
+        body.product_type,
+    )
+
+    # Copy ảnh mockup vào thư mục template để làm "bản chính"
+    shutil.copy2(mockup_path, template_dir / 'mockup.jpg')
+    
+    # 4. Tạo mặt nạ (mask) từ config nếu có mask_points
+    # (Tạm thời giả định frontend đã calibrate xong và gởi config đầy đủ)
+    # Chúng ta sẽ cần tạo file mask.png. Nếu không có mask_points, copy mask trắng
+    # Nhưng quy trình này thường cần mask.png. 
+    # TODO: Implement auto-mask generation from mask_points if missing.
+    # Hiện tại giả định frontend gởi config chứa print_area.
+    
+    # Để đơn giản và "render nhanh", chúng ta sẽ chạy generate-maps ngay
+    from scripts.generate_maps_from_photo import generate_all_maps
+    
+    # Tạo mask.png (giả định mask trắng toàn bộ nếu chưa có logic tách nền)
+    # Hoặc nếu user đã vẽ mask_points, chúng ta dùng nó để tạo mask.png
+        mask_path = maps_dir / 'mask.jpg'
+    
+    # Dummy mask generator (trắng) - logic thật nên dùng cv2 vẽ mask_points
+    import cv2
+    import numpy as np
+    img = cv2.imread(str(mockup_path))
+    h, w = img.shape[:2]
+    mask = np.zeros((h, w), dtype=np.uint8)
+    
+    mask_points = normalized_config.get('print_area', {}).get('mask_points')
+    if mask_points:
+        pts = np.array(mask_points, dtype=np.int32)
+        cv2.fillPoly(mask, [pts], 255)
+    else:
+        # Nếu ko vẽ mask, coi như cả vùng in là mask (hoặc lấy quad)
+        quad = normalized_config.get('print_area', {}).get('quad')
+        if quad:
+             pts = np.array(quad, dtype=np.int32)
+             cv2.fillPoly(mask, [pts], 255)
+        else:
+             mask.fill(255) # Fallback trắng xóa
+             
+        # Convert to 3-channel before saving JPEG (grayscale -> BGR)
+        mask_bgr = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
+        # Save with reasonable quality
+        cv2.imwrite(str(mask_path), mask_bgr, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
+
+    # 5. Sinh Maps
+    try:
+        await asyncio.to_thread(generate_all_maps, str(template_dir / 'mockup.jpg'), str(maps_dir))
+    except Exception as e:
+        logger.error(f'Failed to generate maps: {e}')
+
+    # 6. Lưu DB
+    template = Template(
+        slug=body.slug,
+        name=body.name,
+        product_type=body.product_type,
+        mockup_path=str(template_dir / 'mockup.jpg'),
+        mask_path=str(mask_path),
+        shadow_map_path=str(maps_dir / 'shadow_map.png') if (maps_dir / 'shadow_map.png').exists() else None,
+        normal_map_path=str(maps_dir / 'normal_map.png') if (maps_dir / 'normal_map.png').exists() else None,
+        specular_path=str(maps_dir / 'specular_map.png') if (maps_dir / 'specular_map.png').exists() else None,
+        config=normalized_config,
+        output_width=body.output_width,
+        output_height=body.output_height,
+        status='active'
+    )
+
+    async with async_session() as session:
+        session.add(template)
+        await session.commit()
+    
+    return {'message': 'Template saved from adhoc', 'slug': body.slug}
