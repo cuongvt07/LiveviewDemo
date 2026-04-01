@@ -12,6 +12,7 @@ def run_pipeline(
     assets,                    # MugAssets | ClothesAssets
     output_format: str = "jpg",
     jpeg_quality: int = 90,
+    optimize_jpeg: bool = True,
 ) -> tuple[bytes, dict]:
     """
     Entry point chung — dispatch theo product_type trong config.
@@ -35,7 +36,7 @@ def run_pipeline(
         ok, buf = cv2.imencode(
             ".jpg", result_bgr,
             [cv2.IMWRITE_JPEG_QUALITY, jpeg_quality,
-             cv2.IMWRITE_JPEG_OPTIMIZE, 1]
+             cv2.IMWRITE_JPEG_OPTIMIZE, 1 if optimize_jpeg else 0]
         )
         content_type = "image/jpeg"
 

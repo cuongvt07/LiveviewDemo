@@ -3,6 +3,11 @@ import numpy as np
 
 from .cylinder_math import apply_horizontal_squeeze, compute_uv_cylindrical
 from ..shared.gpu_ops import gpuRemap
+from ..shared.liveview_cache import (
+    get_cylindrical_map_cache,
+    make_cylindrical_map_cache_key,
+    set_cylindrical_map_cache,
+)
 
 DEFAULT_CURVE_CORRECTION_ALPHA = 0.0
 DEFAULT_CURVE_SNAP_THRESHOLD_PX = 2.0
@@ -351,6 +356,140 @@ def _build_curved_clip_mask(
     return mask
 
 
+def _compute_and_cache_cylindrical_map(
+    print_area: dict,
+    output_size: tuple[int, int],
+    design_size: tuple[int, int],
+    theta_max_deg: float,
+    pitch: float,
+    smile_base: float,
+    curve_top: float | None,
+    curve_bottom: float | None,
+    edge_squeeze: float,
+    squeeze_power: float,
+    center_focus_width: float,
+    reference_mockup: np.ndarray | None = None,
+    curve_correction_alpha: float = 0.0,
+    curve_snap_threshold_px: float = 2.0,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray | None]:
+    """Compute map_x/map_y (heavy math) and write to liveview cache.
+
+    Returns (map_x, map_y, H_mat) where H_mat is the homography used to build
+    curved mask (may be None if homography couldn't be estimated).
+    """
+    W, H = int(output_size[0]), int(output_size[1])
+    dw, dh = int(design_size[0]), int(design_size[1])
+
+    cache_key = make_cylindrical_map_cache_key(
+        print_area=print_area,
+        output_size=(W, H),
+        design_size=(dw, dh),
+        theta_max_deg=theta_max_deg,
+        pitch=pitch,
+        smile_base=smile_base,
+        curve_top=curve_top,
+        curve_bottom=curve_bottom,
+        edge_squeeze=edge_squeeze,
+        squeeze_power=squeeze_power,
+        center_focus_width=center_focus_width,
+    )
+
+    # If another thread already filled the cache, return it
+    existing = get_cylindrical_map_cache(cache_key)
+    if existing is not None:
+        return existing["map_x"], existing["map_y"], None
+
+    src_canonical = np.float32([
+        [-1, -1],
+        [1, -1],
+        [1, 1],
+        [-1, 1],
+    ])
+    try:
+        dst_corners = np.float32([
+            print_area["top_left"],
+            print_area["top_right"],
+            print_area["bottom_right"],
+            print_area["bottom_left"],
+        ])
+    except Exception:
+        dst_corners = src_canonical
+
+    H_mat, _ = cv2.findHomography(dst_corners, src_canonical)
+
+    ys, xs = np.mgrid[0:H, 0:W].astype(np.float32)
+    pts = np.stack([xs.ravel(), ys.ravel(), np.ones(H * W)], axis=0)
+    proj = H_mat @ pts
+    proj /= proj[2:3, :]
+    X_proj = proj[0].reshape(H, W)
+    Y_proj = proj[1].reshape(H, W)
+
+    U, V = compute_uv_cylindrical(
+        X_proj,
+        Y_proj,
+        theta_max_deg=theta_max_deg,
+        pitch=pitch,
+        hr_ratio=max(1e-6, float(abs(print_area.get("bottom_left", [0, 0])[1] - print_area.get("top_left", [0, 0])[1]) / (abs(print_area.get("top_right", [0, 0])[0] - print_area.get("top_left", [0, 0])[0]) + 1e-6))),
+        smile_base=smile_base,
+        curve_top=curve_top,
+        curve_bottom=curve_bottom,
+        edge_squeeze=edge_squeeze,
+        squeeze_power=squeeze_power,
+        center_focus_width=center_focus_width,
+        clamp_v=False,
+    )
+
+    map_x = (np.clip(U, 0.0, 1.0) * (dw - 1)).astype(np.float32)
+    map_y = (np.clip(V, 0.0, 1.0) * (dh - 1)).astype(np.float32)
+
+    outside = (
+        (X_proj < -1.0)
+        | (X_proj > 1.0)
+        | (U < 0.0)
+        | (U > 1.0)
+        | (V < 0.0)
+        | (V > 1.0)
+    )
+    map_x[outside] = -1
+    map_y[outside] = -1
+
+    curved_mask = None
+    if reference_mockup is not None and float(curve_correction_alpha) > 1e-8:
+        try:
+            curved_mask = _build_curved_clip_mask(
+                mockup_bgr=reference_mockup,
+                dst_corners=dst_corners,
+                H=H,
+                W=W,
+                H_mat_output_to_canon=H_mat,
+                theta_max_deg=theta_max_deg,
+                pitch=pitch,
+                hr_ratio=max(1e-6, float(abs(print_area.get("bottom_left", [0, 0])[1] - print_area.get("top_left", [0, 0])[1]) / (abs(print_area.get("top_right", [0, 0])[0] - print_area.get("top_left", [0, 0])[0]) + 1e-6))),
+                smile_base=smile_base,
+                curve_top=curve_top,
+                curve_bottom=curve_bottom,
+                edge_squeeze=edge_squeeze,
+                squeeze_power=squeeze_power,
+                center_focus_width=center_focus_width,
+                curve_correction_alpha=curve_correction_alpha,
+                curve_snap_threshold_px=curve_snap_threshold_px,
+            )
+        except Exception:
+            curved_mask = None
+
+    # Store into LRU cache
+    set_cylindrical_map_cache(
+        cache_key,
+        {
+            "map_x": map_x,
+            "map_y": map_y,
+            "curved_mask": curved_mask,
+        },
+    )
+
+    return map_x, map_y, H_mat
+
+
 def cylindrical_warp(
     design: np.ndarray,
     print_area: dict,
@@ -380,83 +519,106 @@ def cylindrical_warp(
         pa["bottom_right"],
         pa["bottom_left"],
     ])
-    src_canonical = np.float32([
-        [-1, -1],
-        [1, -1],
-        [1, 1],
-        [-1, 1],
-    ])
-    H_mat, _ = cv2.findHomography(dst_corners, src_canonical)
-
-    ys, xs = np.mgrid[0:H, 0:W].astype(np.float32)
-    pts = np.stack([xs.ravel(), ys.ravel(), np.ones(H * W)], axis=0)
-    proj = H_mat @ pts
-    proj /= proj[2:3, :]
-    X_proj = proj[0].reshape(H, W)
-    Y_proj = proj[1].reshape(H, W)
 
     bh_px = abs(pa["bottom_left"][1] - pa["top_left"][1])
     bw_px = abs(pa["top_right"][0] - pa["top_left"][0])
     hr_ratio = bh_px / (bw_px + 1e-6)
 
-    U, V = compute_uv_cylindrical(
-        X_proj,
-        Y_proj,
+    cache_key = make_cylindrical_map_cache_key(
+        print_area=pa,
+        output_size=(W, H),
+        design_size=(dw, dh),
         theta_max_deg=theta_max_deg,
         pitch=pitch,
-        hr_ratio=hr_ratio,
         smile_base=smile_base,
         curve_top=curve_top,
         curve_bottom=curve_bottom,
         edge_squeeze=edge_squeeze,
         squeeze_power=squeeze_power,
         center_focus_width=center_focus_width,
-        clamp_v=False,
     )
+    cached_bundle = get_cylindrical_map_cache(cache_key)
+    map_x: np.ndarray
+    map_y: np.ndarray
+    H_mat: np.ndarray | None = None
 
-    # Keep sampling in range but invalidate out-of-domain pixels later.
-    map_x = (np.clip(U, 0.0, 1.0) * (dw - 1)).astype(np.float32)
-    map_y = (np.clip(V, 0.0, 1.0) * (dh - 1)).astype(np.float32)
-
-    # Use curved domain validity so output boundary follows locked grid shape.
-    outside = (
-        (X_proj < -1.0)
-        | (X_proj > 1.0)
-        | (U < 0.0)
-        | (U > 1.0)
-        | (V < 0.0)
-        | (V > 1.0)
-    )
-    map_x[outside] = -1
-    map_y[outside] = -1
-
-    warped = gpuRemap(
-        design,
-        map_x,
-        map_y,
-        interpolation=cv2.INTER_LANCZOS4,
-    )
-
-    # Final clip by curved boundary so rendered print matches locked editor grid shape.
-    if warped.ndim == 3 and warped.shape[2] == 4:
-        curved_mask = _build_curved_clip_mask(
-            mockup_bgr=reference_mockup,
-            dst_corners=dst_corners,
-            H=H,
-            W=W,
-            H_mat_output_to_canon=H_mat,
+    if cached_bundle is not None:
+        map_x = cached_bundle["map_x"]
+        map_y = cached_bundle["map_y"]
+    else:
+        map_x, map_y, H_mat = _compute_and_cache_cylindrical_map(
+            print_area=pa,
+            output_size=(W, H),
+            design_size=(dw, dh),
             theta_max_deg=theta_max_deg,
             pitch=pitch,
-            hr_ratio=hr_ratio,
             smile_base=smile_base,
             curve_top=curve_top,
             curve_bottom=curve_bottom,
             edge_squeeze=edge_squeeze,
             squeeze_power=squeeze_power,
             center_focus_width=center_focus_width,
+            reference_mockup=reference_mockup,
             curve_correction_alpha=curve_correction_alpha,
             curve_snap_threshold_px=curve_snap_threshold_px,
         )
+        # refresh cached bundle reference for curved_mask lookup
+        cached_bundle = get_cylindrical_map_cache(cache_key)
+
+    interpolation = cv2.INTER_LANCZOS4
+    if W <= 1000:
+        interpolation = cv2.INTER_LINEAR
+    elif W <= 2000:
+        interpolation = cv2.INTER_CUBIC
+
+    warped = gpuRemap(
+        design,
+        map_x,
+        map_y,
+        interpolation=interpolation,
+    )
+
+    # Final clip by curved boundary so rendered print matches locked editor grid shape.
+    if warped.ndim == 3 and warped.shape[2] == 4:
+        can_reuse_cached_mask = reference_mockup is None or float(curve_correction_alpha) <= 1e-8
+        curved_mask = cached_bundle.get("curved_mask") if (cached_bundle and can_reuse_cached_mask) else None
+        if curved_mask is None:
+            if H_mat is None:
+                src_canonical = np.float32([
+                    [-1, -1],
+                    [1, -1],
+                    [1, 1],
+                    [-1, 1],
+                ])
+                H_mat, _ = cv2.findHomography(dst_corners, src_canonical)
+
+            curved_mask = _build_curved_clip_mask(
+                mockup_bgr=reference_mockup,
+                dst_corners=dst_corners,
+                H=H,
+                W=W,
+                H_mat_output_to_canon=H_mat,
+                theta_max_deg=theta_max_deg,
+                pitch=pitch,
+                hr_ratio=hr_ratio,
+                smile_base=smile_base,
+                curve_top=curve_top,
+                curve_bottom=curve_bottom,
+                edge_squeeze=edge_squeeze,
+                squeeze_power=squeeze_power,
+                center_focus_width=center_focus_width,
+                curve_correction_alpha=curve_correction_alpha,
+                curve_snap_threshold_px=curve_snap_threshold_px,
+            )
+            if can_reuse_cached_mask:
+                cached_bundle = set_cylindrical_map_cache(
+                    cache_key,
+                    {
+                        "map_x": map_x,
+                        "map_y": map_y,
+                        "curved_mask": curved_mask,
+                    },
+                )
         warped[:, :, 3] = cv2.bitwise_and(warped[:, :, 3], curved_mask)
 
     return warped

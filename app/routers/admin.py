@@ -32,6 +32,7 @@ from app.schemas import (
 )
 from app.services import template_registry
 from app.services.url_analysis import (
+    DEFAULT_MOCKUP_VIEW_ORDER,
     analyze_and_ingest_url,
     build_url_lookup_context,
     list_available_mockup_views,
@@ -91,6 +92,33 @@ def _extract_template_url_analysis_meta(template: Template) -> dict:
     cfg = template.config if isinstance(template.config, dict) else {}
     meta = cfg.get('url_analysis')
     return meta if isinstance(meta, dict) else {}
+
+
+def _build_template_lookup_item(template: Template) -> dict:
+    meta = _extract_template_url_analysis_meta(template)
+    return {
+        'slug': template.slug,
+        'name': template.name,
+        'template_id': template.slug,
+        'preview_url': _template_preview_url(template.slug),
+        'mockup_view': meta.get('mockup_view'),
+        'mockup_url': meta.get('mockup_url'),
+        'design_url': meta.get('design_url'),
+        'design_lookup_key': meta.get('design_lookup_key'),
+        'mockup_family_key': meta.get('mockup_family_key'),
+        'mockup_policy_key': meta.get('mockup_policy_key'),
+    }
+
+
+def _sort_template_lookup_items(items: list[dict]) -> list[dict]:
+    view_order = {view: index for index, view in enumerate(DEFAULT_MOCKUP_VIEW_ORDER)}
+    return sorted(
+        items,
+        key=lambda item: (
+            view_order.get(str(item.get('mockup_view') or '').lower(), len(view_order)),
+            str(item.get('slug') or ''),
+        ),
+    )
 
 
 def _write_preview_data_url(preview_data_url: str, destination: Path) -> None:
@@ -496,20 +524,22 @@ async def importFromAnalyzedUrl(body: UrlAnalysisImportRequest):
                 family_templates.append(template)
 
         if existing_template is not None:
-            meta = _extract_template_url_analysis_meta(existing_template)
+            matching_templates = _sort_template_lookup_items(
+                [
+                    _build_template_lookup_item(template)
+                    for template in active_templates
+                    if _extract_template_url_analysis_meta(template).get('design_lookup_key') == context['design_lookup_key']
+                ]
+            )
             return {
                 'template_found': True,
                 'source_url': body.source_url,
                 'parsed': context['parsed'].to_dict(),
                 'design_lookup_key': context['design_lookup_key'],
                 'mockup_family_key': context['mockup_family_key'],
-                'existing_template': {
-                    'slug': existing_template.slug,
-                    'name': existing_template.name,
-                    'template_id': existing_template.slug,
-                    'preview_url': _template_preview_url(existing_template.slug),
-                    'mockup_view': meta.get('mockup_view'),
-                },
+                'existing_template': _build_template_lookup_item(existing_template),
+                'matching_templates': matching_templates,
+                'template_count': len(matching_templates),
             }
 
         available_views = [item['view'] for item in list_available_mockup_views(context['parsed'])]
@@ -528,6 +558,53 @@ async def importFromAnalyzedUrl(body: UrlAnalysisImportRequest):
         raise HTTPException(status_code=400, detail={'message': str(exc)}) from exc
     except Exception as exc:
         logger.exception('URL analysis import failed')
+        raise HTTPException(status_code=502, detail={'message': str(exc)}) from exc
+
+
+@router.post('/url-analysis/template-matches')
+async def lookupTemplatesFromUrl(body: UrlAnalysisImportRequest):
+    try:
+        context = build_url_lookup_context(body.source_url)
+        analyzed = analyze_and_ingest_url(body.source_url)
+
+        async with async_session() as session:
+            result = await session.execute(
+                select(Template).where(Template.status == 'active')
+            )
+            active_templates = result.scalars().all()
+
+        matching_templates = _sort_template_lookup_items(
+            [
+                _build_template_lookup_item(template)
+                for template in active_templates
+                if _extract_template_url_analysis_meta(template).get('design_lookup_key') == context['design_lookup_key']
+            ]
+        )
+        first_match = matching_templates[0] if matching_templates else None
+
+        return {
+            'template_found': bool(matching_templates),
+            'source_url': body.source_url,
+            'parsed': analyzed.get('parsed'),
+            'product_type': analyzed.get('product_type'),
+            'design_lookup_key': context['design_lookup_key'],
+            'mockup_family_key': context['mockup_family_key'],
+            'design_url': analyzed.get('design_url'),
+            'design_source_url': analyzed.get('design_source_url'),
+            'design_source_mode': analyzed.get('design_source_mode'),
+            'available_views': analyzed.get('available_views', []),
+            'warning': analyzed.get('warning'),
+            'matching_templates': matching_templates,
+            'template_count': len(matching_templates),
+            'selected_template_id': first_match.get('template_id') if first_match else None,
+            'selected_preview_url': first_match.get('preview_url') if first_match else None,
+        }
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail={'message': str(exc)}) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail={'message': str(exc)}) from exc
+    except Exception as exc:
+        logger.exception('Template URL lookup failed')
         raise HTTPException(status_code=502, detail={'message': str(exc)}) from exc
 
 

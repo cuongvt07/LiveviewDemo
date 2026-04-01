@@ -5,6 +5,7 @@ opencv-contrib-python-headless>=4.9.0
 numpy>=1.26.0
 Pillow>=10.2.0
 scikit-image>=0.22.0
+scipy>=1.10.0
 sqlalchemy>=2.0.0
 asyncpg>=0.29.0
 alembic>=1.13.0

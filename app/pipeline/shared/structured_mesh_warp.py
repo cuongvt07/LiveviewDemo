@@ -134,11 +134,17 @@ def apply_structured_mesh_warp(
     map_x = np.clip(map_x, 0, iw - 1)
     map_y = np.clip(map_y, 0, ih - 1)
 
+    interpolation = cv2.INTER_LANCZOS4
+    if iw <= 1000:
+        interpolation = cv2.INTER_LINEAR
+    elif iw <= 2000:
+        interpolation = cv2.INTER_CUBIC
+
     warped = gpuRemap(
         image,
         map_x.astype(np.float32),
         map_y.astype(np.float32),
-        interpolation=cv2.INTER_LANCZOS4,
+        interpolation=interpolation,
     )
 
     stale_mask = (src_coverage > 0) & (dst_coverage == 0)

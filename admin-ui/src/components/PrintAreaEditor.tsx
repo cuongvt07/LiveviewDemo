@@ -1,4 +1,5 @@
-﻿import React, { useState, useRef, useEffect, useCallback, useLayoutEffect } from 'react';
+import React, { useState, useRef, useEffect, useCallback, useLayoutEffect } from 'react';
+import t from '../i18n/translate'
 import { MugCurvePreview } from './MugCurvePreview';
 import { WarpGridPreview } from './WarpGridPreview';
 
@@ -482,7 +483,7 @@ function ControlAdjuster({
           className="stepper-btn"
           onMouseDown={(e) => e.preventDefault()}
           onClick={() => nudge(-1)}
-          aria-label={`Giảm ${label}`}
+          aria-label={t('print_area.nudge.decrease', { label })}
         >
           {'<'}
         </button>
@@ -501,12 +502,12 @@ function ControlAdjuster({
           className="stepper-btn"
           onMouseDown={(e) => e.preventDefault()}
           onClick={() => nudge(1)}
-          aria-label={`Tăng ${label}`}
+          aria-label={t('print_area.nudge.increase', { label })}
         >
           {'>'}
         </button>
       </div>
-      <div className="ctrl-step">Bước chỉnh: {step.toFixed(precision)}{unit}</div>
+      <div className="ctrl-step">{t('print_area.nudge.step_prefix')} {step.toFixed(precision)}{unit}</div>
       {description && <div className="ctrl-help">{description}</div>}
     </div>
   );
@@ -596,6 +597,10 @@ export default function PrintAreaEditor(props: PrintAreaEditorProps) {
   const overlayAlphaCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const designPreviewRequestSeqRef = useRef(0);
   const gridPreviewRequestSeqRef = useRef(0);
+  const lastGridPreviewSignatureRef = useRef('');
+  const activeGridPreviewSignatureRef = useRef('');
+  const lastDesignPreviewSignatureRef = useRef('');
+  const activeDesignPreviewSignatureRef = useRef('');
   const calibPts = applyCalibration(basePoints, tilt, rotate, perspective);
 
   const imageW = naturalSize.w || 1000;
@@ -617,6 +622,9 @@ export default function PrintAreaEditor(props: PrintAreaEditorProps) {
   const pitchHandle = apply_homography(H_mat, localPitch.x, localPitch.y);
   const lightHandle = apply_homography(H_mat, lightPosX, lightPosY);
   const designPreviewSource = designFile || resolvedDesignBlob;
+  const designPreviewIdentity = designFile
+    ? `file:${designFile.name}:${designFile.size}:${designFile.lastModified}`
+    : (designUrl ? `url:${designUrl}` : (resolvedDesignBlob ? `blob:${resolvedDesignBlob.size}:${resolvedDesignBlob.type}` : 'none'));
   const wantsDesignOverlay = Boolean(designFile || designUrl);
   const isCylinderProduct = productType.includes('cylinder');
   const resolvedWarpType = isCylinderProduct ? 'cylinder' : (meshPoints.length > 0 ? 'tps' : 'perspective');
@@ -1088,9 +1096,17 @@ export default function PrintAreaEditor(props: PrintAreaEditorProps) {
       mask_points: pa.mask_points,
       template_id: templateId,
     };
+    const payloadSignature = JSON.stringify(payload);
+    if (
+      payloadSignature === lastGridPreviewSignatureRef.current
+      || payloadSignature === activeGridPreviewSignatureRef.current
+    ) {
+      return;
+    }
 
     const requestSeq = ++gridPreviewRequestSeqRef.current;
     const controller = new AbortController();
+    activeGridPreviewSignatureRef.current = payloadSignature;
     const timer = setTimeout(async () => {
       try {
         const response = await fetch('/v1/mockup/warp-preview', {
@@ -1106,11 +1122,16 @@ export default function PrintAreaEditor(props: PrintAreaEditorProps) {
         if (controller.signal.aborted || requestSeq !== gridPreviewRequestSeqRef.current) return;
         const blob = await response.blob();
         if (controller.signal.aborted || requestSeq !== gridPreviewRequestSeqRef.current) return;
+        lastGridPreviewSignatureRef.current = payloadSignature;
+        activeGridPreviewSignatureRef.current = '';
         setGridOverlayUrl(prev => {
           if (prev) URL.revokeObjectURL(prev);
           return URL.createObjectURL(blob);
         });
       } catch (e: any) {
+        if (activeGridPreviewSignatureRef.current === payloadSignature) {
+          activeGridPreviewSignatureRef.current = '';
+        }
         if (controller.signal.aborted || e?.name === 'AbortError') return;
         console.error('Warp Grid Preview Error:', e);
         if (requestSeq === gridPreviewRequestSeqRef.current) {
@@ -1122,6 +1143,9 @@ export default function PrintAreaEditor(props: PrintAreaEditorProps) {
     return () => {
       clearTimeout(timer);
       controller.abort();
+      if (activeGridPreviewSignatureRef.current === payloadSignature) {
+        activeGridPreviewSignatureRef.current = '';
+      }
     };
   }, [basePoints, tilt, rotate, perspective, curvePct, curveTop, curveBot, edgeSqueeze, squeezePower, centerFocusWidth, meshDensityStrength, designScale, designOffsetX, designOffsetY, designFitMode, productType, maskPoints, meshPoints, naturalSize, imageUrl, showGrid]);
 
@@ -1129,6 +1153,8 @@ export default function PrintAreaEditor(props: PrintAreaEditorProps) {
     if (naturalSize.w === 0) return;
     if (!designPreviewSource) {
       setApiError(null);
+      lastDesignPreviewSignatureRef.current = '';
+      activeDesignPreviewSignatureRef.current = '';
       setPreviewOverlayUrl(prev => {
         if (prev) URL.revokeObjectURL(prev);
         return null;
@@ -1217,6 +1243,16 @@ export default function PrintAreaEditor(props: PrintAreaEditorProps) {
         mask_points: pa.mask_points,
         template_id: templateId,
       };
+      const payloadSignature = JSON.stringify({
+        payload,
+        designPreviewIdentity,
+      });
+      if (
+        payloadSignature === lastDesignPreviewSignatureRef.current
+        || payloadSignature === activeDesignPreviewSignatureRef.current
+      ) {
+        return;
+      }
 
       if (payload.warp_type === 'cylinder' && (Math.abs(centerFocusWidth) > 1e-8 || edgeSqueeze > 0)) {
         console.info('[Warp Preview] request payload', {
@@ -1229,6 +1265,7 @@ export default function PrintAreaEditor(props: PrintAreaEditorProps) {
       }
 
       try {
+        activeDesignPreviewSignatureRef.current = payloadSignature;
         const formData = new FormData();
         formData.append('config_json', JSON.stringify(payload));
         formData.append(
@@ -1255,11 +1292,16 @@ export default function PrintAreaEditor(props: PrintAreaEditorProps) {
         if (controller.signal.aborted || requestSeq !== designPreviewRequestSeqRef.current) {
           return;
         }
+        lastDesignPreviewSignatureRef.current = payloadSignature;
+        activeDesignPreviewSignatureRef.current = '';
         setPreviewOverlayUrl(prev => {
           if (prev) URL.revokeObjectURL(prev);
           return URL.createObjectURL(blob);
         });
       } catch (e: any) {
+        if (activeDesignPreviewSignatureRef.current === payloadSignature) {
+          activeDesignPreviewSignatureRef.current = '';
+        }
         if (controller.signal.aborted || e?.name === 'AbortError') {
           return;
         }
@@ -1272,8 +1314,11 @@ export default function PrintAreaEditor(props: PrintAreaEditorProps) {
     return () => {
       clearTimeout(timer);
       controller.abort();
+      if (activeDesignPreviewSignatureRef.current) {
+        activeDesignPreviewSignatureRef.current = '';
+      }
     };
-  }, [basePoints, tilt, rotate, perspective, curvePct, curveTop, curveBot, edgeSqueeze, squeezePower, centerFocusWidth, meshDensityStrength, designScale, designOffsetX, designOffsetY, designFitMode, featherRadius, productType, maskPoints, meshPoints, naturalSize, editorMode, imageUrl, designFile, designUrl, designPreviewSource, lightPosX, lightPosY, lightHeight, lightContrast, lightHighlight, lightSoftness]);
+  }, [basePoints, tilt, rotate, perspective, curvePct, curveTop, curveBot, edgeSqueeze, squeezePower, centerFocusWidth, meshDensityStrength, designScale, designOffsetX, designOffsetY, designFitMode, featherRadius, productType, maskPoints, meshPoints, naturalSize, editorMode, imageUrl, designFile, designUrl, designPreviewSource, designPreviewIdentity, lightPosX, lightPosY, lightHeight, lightContrast, lightHighlight, lightSoftness]);
 
   const lastPointerPos = useRef({ x: 0, y: 0 });
   const wasDraggingRef = useRef(false);
@@ -1435,16 +1480,8 @@ export default function PrintAreaEditor(props: PrintAreaEditorProps) {
     setDraggingIdx(null);
   }, [draggingIdx]);
 
-  const handleWheel = (e: React.WheelEvent) => {
-    e.preventDefault();
-    const delta = -e.deltaY;
-    const factor = delta > 0 ? 1.1 : 0.9;
-    if (designFile && !e.altKey) {
-      setDesignScale(prev => Math.max(0.1, Math.min(5, prev * factor)));
-    } else {
-      setZoom(prev => Math.max(0.5, Math.min(10, prev * factor)));
-    }
-  };
+
+
 
   const handleContainerMouseDown = (e: React.MouseEvent) => {
     if (e.button === 1 || (e.button === 0 && e.altKey)) setIsPanning(true);
@@ -1453,6 +1490,24 @@ export default function PrintAreaEditor(props: PrintAreaEditorProps) {
     if (isPanning) setPan(prev => ({ x: prev.x + e.movementX, y: prev.y + e.movementY }));
   };
   const handleContainerMouseUp = () => setIsPanning(false);
+
+  // Attach a non-passive native wheel listener so preventDefault() works reliably
+  useEffect(() => {
+    const el = containerRef.current;
+    if (!el) return;
+    const onWheelNative = (ev: WheelEvent) => {
+      ev.preventDefault();
+      const delta = -ev.deltaY;
+      const factor = delta > 0 ? 1.1 : 0.9;
+      if (designFile && !ev.altKey) {
+        setDesignScale(prev => Math.max(0.1, Math.min(5, prev * factor)));
+      } else {
+        setZoom(prev => Math.max(0.5, Math.min(10, prev * factor)));
+      }
+    };
+    el.addEventListener('wheel', onWheelNative, { passive: false });
+    return () => el.removeEventListener('wheel', onWheelNative);
+  }, [designFile]);
 
   const handleCanvasClick = (e: React.MouseEvent) => {
     if (!containerRef.current || draggingIdx) return;
@@ -1527,7 +1582,12 @@ export default function PrintAreaEditor(props: PrintAreaEditorProps) {
     });
   };
 
-  const make4x4Mesh = () => {
+  const makeDenseDefaultMesh = () => {
+    // Default dense mesh: cols=12, rows=8 -> points per side = cols+1=13, rows+1=9
+    setMeshPoints(buildMeshGrid(9, 13));
+  };
+
+  const makeLegacy4x4Mesh = () => {
     setMeshPoints(buildMeshGrid(4, 4));
   };
 
@@ -1551,7 +1611,7 @@ export default function PrintAreaEditor(props: PrintAreaEditorProps) {
   useEffect(() => {
     if (editorMode !== 'CALIBRATE' || activeMode !== 'mesh') return;
     if (meshPoints.length > 0) return;
-    setMeshPoints(buildMeshGrid(4, 4));
+    setMeshPoints(buildMeshGrid(9, 13));
   }, [
     activeMode,
     calibPts,
@@ -1572,7 +1632,7 @@ export default function PrintAreaEditor(props: PrintAreaEditorProps) {
     if (isSwitchingDevice) return;
     const target = renderDevice === 'gpu' ? 'cpu' : 'gpu';
     if (target === 'gpu' && !gpuAvailable) {
-      setApiError('GPU/OpenCL không khả dụng trên máy hiện tại.');
+      setApiError(t('print_area.error.gpu_unavailable'));
       return;
     }
     setIsSwitchingDevice(true);
@@ -1582,13 +1642,13 @@ export default function PrintAreaEditor(props: PrintAreaEditorProps) {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ device: target }),
       });
-      if (!res.ok) throw new Error(`Device switch failed (${res.status})`);
+      if (!res.ok) throw new Error(t('print_area.error.device_switch_failed'));
       const data = await res.json();
       if (data?.device === 'gpu' || data?.device === 'cpu') setRenderDevice(data.device);
       if (typeof data?.opencl_available === 'boolean') setGpuAvailable(data.opencl_available);
       setApiError(null);
     } catch (e: any) {
-      setApiError(e?.message || 'Không thể chuyển CPU/GPU');
+      setApiError(e?.message || t('print_area.error.device_switch_failed'));
     } finally {
       setIsSwitchingDevice(false);
     }
@@ -1596,11 +1656,22 @@ export default function PrintAreaEditor(props: PrintAreaEditorProps) {
   const renderControls = () => {
     const productSelector = !productTypeProp && (
       <div className="product-selector-top glass-panel" style={{ padding: '5px', marginBottom: '8px', border: '1px solid #1e2d44', background: '#111827', borderRadius: '8px' }}>
-        <div className="ctrl-header" style={{ marginBottom: '6px' }}><span className="ctrl-label" style={{ color: '#60a5fa', fontSize: '9px' }}>Bước 1: Chọn loại sản phẩm</span></div>
+        <div className="ctrl-header" style={{ marginBottom: '6px' }}><span className="ctrl-label" style={{ color: '#60a5fa', fontSize: '9px' }}>{t('print_area.step.1')}</span></div>
         <select className="select" style={{ width: '100%', fontSize: '0.9rem', padding: '5px' }} value={productType} onChange={e => setProductType(e.target.value)}>
-          <optgroup label="CỐC"><option value="cylinder_ceramic">Cốc sứ</option><option value="cylinder_glass">Cốc thủy tinh</option><option value="cylinder_travel">Ly giữ nhiệt</option></optgroup>
-          <optgroup label="QUẦN ÁO"><option value="apparel_cotton">Áo thun</option><option value="apparel_hoodie">Áo hoodie</option><option value="apparel_totebag">Túi tote</option></optgroup>
-          <optgroup label="KHÁC"><option value="flat_print">In phẳng</option><option value="plastic_case">Ốp điện thoại</option></optgroup>
+          <optgroup label={t('print_area.products.groups.mugs')}>
+            <option value="cylinder_ceramic">{t('print_area.products.mugs.ceramic')}</option>
+            <option value="cylinder_glass">{t('print_area.products.mugs.glass')}</option>
+            <option value="cylinder_travel">{t('print_area.products.mugs.travel')}</option>
+          </optgroup>
+          <optgroup label={t('print_area.products.groups.clothes')}>
+            <option value="apparel_cotton">{t('print_area.products.clothes.tshirt')}</option>
+            <option value="apparel_hoodie">{t('print_area.products.clothes.hoodie')}</option>
+            <option value="apparel_totebag">{t('print_area.products.clothes.totebag')}</option>
+          </optgroup>
+          <optgroup label={t('print_area.products.groups.others')}>
+            <option value="flat_print">{t('print_area.products.others.flat')}</option>
+            <option value="plastic_case">{t('print_area.products.others.phone_case')}</option>
+          </optgroup>
         </select>
       </div>
     );
@@ -1610,30 +1681,30 @@ export default function PrintAreaEditor(props: PrintAreaEditorProps) {
     availableGroups.push('blend', 'edge', 'advanced');
 
     const selectedTypeLabelMap: Record<string, string> = {
-      base: 'Góc vùng in',
-      mesh: 'Điểm lưới',
-      mask: 'Điểm mặt nạ',
-      light: 'Điểm sáng',
-      smile: 'Điểm cong trên',
-      pitch: 'Điểm cong dưới',
+      base: t('print_area.labels.base'),
+      mesh: t('print_area.labels.mesh'),
+      mask: t('print_area.labels.mask'),
+      light: t('print_area.labels.light'),
+      smile: t('print_area.labels.smile'),
+      pitch: t('print_area.labels.pitch'),
     };
     const selectedPointLabel = selectedHandle
-      ? `${selectedTypeLabelMap[selectedHandle.type] || 'Điểm'} #${selectedHandle.id + 1}`
-      : 'Chưa chọn điểm';
+      ? `${selectedTypeLabelMap[selectedHandle.type] || t('print_area.point_label')} #${selectedHandle.id + 1}`
+      : t('print_area.selected_point_default');
     const selectedPointXPercent = selectedPointPosition ? selectedPointPosition.x * 100 : 0;
     const selectedPointYPercent = selectedPointPosition ? selectedPointPosition.y * 100 : 0;
     const pointNudgePanel = (
       <div className="point-nudge-panel">
         <div className="ctrl-header">
-          <span className="ctrl-label">Di chuyển điểm bằng nút</span>
+          <span className="ctrl-label">{t('print_area.nudge.title')}</span>
           <span className="ctrl-value">{selectedPointLabel}</span>
         </div>
-        <p className="mode-hint">Chọn một điểm trên vùng in, sau đó bấm các nút hướng hoặc phím mũi tên để căn chính xác. Giữ `Shift` để dịch nhanh hơn.</p>
+        <p className="mode-hint">{t('print_area.nudge.hint')}</p>
         {selectedPointPosition && canNudgeSelectedHandle && (
           <div className="ctrl-grid ctrl-grid-two">
             <ControlAdjuster
-              label="Tọa độ X"
-              description="Nhập trực tiếp tọa độ ngang của điểm (0-100%)."
+              label={t('print_area.coord.x_label')}
+              description={t('print_area.coord.x_desc')}
               value={selectedPointXPercent}
               min={0}
               max={100}
@@ -1642,8 +1713,8 @@ export default function PrintAreaEditor(props: PrintAreaEditorProps) {
               onChange={(v) => setSelectedPointPosition(v / 100, selectedPointPosition.y)}
             />
             <ControlAdjuster
-              label="Tọa độ Y"
-              description="Nhập trực tiếp tọa độ dọc của điểm (0-100%)."
+              label={t('print_area.coord.y_label')}
+              description={t('print_area.coord.y_desc')}
               value={selectedPointYPercent}
               min={0}
               max={100}
@@ -1654,8 +1725,8 @@ export default function PrintAreaEditor(props: PrintAreaEditorProps) {
           </div>
         )}
         <ControlAdjuster
-          label="Bước nudge điểm"
-          description="Bước nhỏ hơn giúp canh mép chính xác hơn."
+          label={t('print_area.nudge.step_label')}
+          description={t('print_area.nudge.step_desc')}
           value={pointNudgeStep * 100}
           min={0.01}
           max={2}
@@ -1665,11 +1736,11 @@ export default function PrintAreaEditor(props: PrintAreaEditorProps) {
         />
         <div className="nudge-grid">
           <span />
-          <button className="btn-ghost nudge-btn" onClick={() => nudgeSelectedPoint(0, -pointNudgeStep)} disabled={!canNudgeSelectedHandle}>Lên</button>
+          <button className="btn-ghost nudge-btn" onClick={() => nudgeSelectedPoint(0, -pointNudgeStep)} disabled={!canNudgeSelectedHandle}>{t('print_area.nudge.up')}</button>
           <span />
-          <button className="btn-ghost nudge-btn" onClick={() => nudgeSelectedPoint(-pointNudgeStep, 0)} disabled={!canNudgeSelectedHandle}>Trái</button>
-          <button className="btn-ghost nudge-btn" onClick={() => nudgeSelectedPoint(0, pointNudgeStep)} disabled={!canNudgeSelectedHandle}>Xuống</button>
-          <button className="btn-ghost nudge-btn" onClick={() => nudgeSelectedPoint(pointNudgeStep, 0)} disabled={!canNudgeSelectedHandle}>Phải</button>
+          <button className="btn-ghost nudge-btn" onClick={() => nudgeSelectedPoint(-pointNudgeStep, 0)} disabled={!canNudgeSelectedHandle}>{t('print_area.nudge.left')}</button>
+          <button className="btn-ghost nudge-btn" onClick={() => nudgeSelectedPoint(0, pointNudgeStep)} disabled={!canNudgeSelectedHandle}>{t('print_area.nudge.down')}</button>
+          <button className="btn-ghost nudge-btn" onClick={() => nudgeSelectedPoint(pointNudgeStep, 0)} disabled={!canNudgeSelectedHandle}>{t('print_area.nudge.right')}</button>
         </div>
       </div>
     );
@@ -1677,29 +1748,29 @@ export default function PrintAreaEditor(props: PrintAreaEditorProps) {
     if (editorMode === 'DESIGN') return (
       <div className="ctrl-section" ref={controlSectionRef} onScroll={captureControlScroll}>
         {productSelector}
-        {designFile && <p className="mode-hint">Kéo trực tiếp trên ảnh in 2D để đổi vị trí. Lăn chuột để zoom ảnh in, `Alt + wheel` để zoom canvas.</p>}
-        <div className="ctrl-header"><span className="ctrl-label">Chỉnh ảnh in</span></div>
+        {designFile && <p className="mode-hint">{t('print_area.design_hint')}</p>}
+        <div className="ctrl-header"><span className="ctrl-label">{t('print_area.design.title')}</span></div>
         <div className="btn-row">
           <button
             className={designFitMode === 'contain' ? 'btn-primary' : 'btn-ghost'}
             onClick={() => applyArtworkFitPreset('contain')}
           >
-            Vừa khung lưới in
+            {t('print_area.design.fit_contain')}
           </button>
           <button
             className={designFitMode === 'cover' ? 'btn-primary' : 'btn-ghost'}
             onClick={() => applyArtworkFitPreset('cover')}
           >
-            Phủ kín vùng in
+            {t('print_area.design.fit_cover')}
           </button>
         </div>
         <p className="mode-hint">
-          `Vừa khung lưới in` dùng kiểu object-fit contain để ảnh nằm gọn trong vùng in. Cấu hình này sẽ được lưu cùng template.
+          {t('print_area.design.fit_hint')}
         </p>
         <div className="ctrl-grid ctrl-grid-two">
-          <ControlAdjuster label="Phóng to ảnh in" description="Zoom tương đối trên nền fit hiện tại. Nếu đang `Vừa khung`, giá trị 1.0 sẽ giữ ảnh nằm gọn trong vùng in." value={designScale} min={0.1} max={5} step={0.1} unit="x" onChange={setDesignScale} />
-          <ControlAdjuster label="Dịch ngang" description="Dời ảnh in sang trái hoặc phải bên trong vùng in." value={designOffsetX} min={-1} max={1} step={0.1} onChange={setDesignOffsetX} />
-          <ControlAdjuster label="Dịch dọc" description="Dời ảnh in lên hoặc xuống bên trong vùng in." value={designOffsetY} min={-1} max={1} step={0.1} onChange={setDesignOffsetY} />
+          <ControlAdjuster label={t('print_area.design.scale_label')} description={t('print_area.design.scale_desc')} value={designScale} min={0.1} max={5} step={0.1} unit="x" onChange={setDesignScale} />
+          <ControlAdjuster label={t('print_area.design.offset_x_label')} description={t('print_area.design.offset_x_desc')} value={designOffsetX} min={-1} max={1} step={0.1} onChange={setDesignOffsetX} />
+          <ControlAdjuster label={t('print_area.design.offset_y_label')} description={t('print_area.design.offset_y_desc')} value={designOffsetY} min={-1} max={1} step={0.1} onChange={setDesignOffsetY} />
         </div>
       </div>
     );
@@ -1707,20 +1778,20 @@ export default function PrintAreaEditor(props: PrintAreaEditorProps) {
     if (activeMode === 'mesh') return (
       <div className="ctrl-section" ref={controlSectionRef} onScroll={captureControlScroll}>
         {productSelector}
-        <p className="mode-hint">Kéo trực tiếp các điểm trên lưới cong để tinh chỉnh biến dạng bề mặt.</p>
-        <div className="btn-row">
-          <button className="btn-primary" onClick={make4x4Mesh}>Lưới 4x4</button>
-          <button className="btn-ghost" onClick={make4x4Mesh}>Đặt lại lưới</button>
-        </div>
+        <p className="mode-hint">{t('print_area.mesh.hint')}</p>
+          <div className="btn-row">
+            <button className="btn-primary" onClick={makeDenseDefaultMesh}>{t('print_area.mesh.default_mesh')}</button>
+            <button className="btn-ghost" onClick={makeLegacy4x4Mesh}>{t('print_area.mesh.legacy_mesh')}</button>
+          </div>
         {pointNudgePanel}
       </div>
     );
     if (activeMode === 'mask') return (
       <div className="ctrl-section" ref={controlSectionRef} onScroll={captureControlScroll}>
         {productSelector}
-        <p className="mode-hint">Nhấp để vẽ vùng mặt nạ. Đóng vòng để hoàn thành.</p>
+        <p className="mode-hint">{t('print_area.mask.hint')}</p>
         <div className="btn-row">
-          <button className="btn-ghost" onClick={() => setMaskPoints([])}>Xóa mặt nạ</button>
+          <button className="btn-ghost" onClick={() => setMaskPoints([])}>{t('print_area.mask.clear')}</button>
         </div>
         {pointNudgePanel}
       </div>
@@ -1729,71 +1800,71 @@ export default function PrintAreaEditor(props: PrintAreaEditorProps) {
     return (
       <div className="ctrl-section" ref={controlSectionRef} onScroll={captureControlScroll}>
         {productSelector}
-        {designFile && activeMode === 'calibrate' && <p className="mode-hint">Ảnh in là ảnh ngang 2D. Kéo chỉ tác động lên ảnh in, không kéo mockup gốc.</p>}
+        {designFile && activeMode === 'calibrate' && <p className="mode-hint">{t('print_area.calibrate_hint')}</p>}
         <div className="group-tabs">
           {availableGroups.map(g => (
             <button key={g} className={`group-tab ${activeGroup === g ? 'active' : ''}`} onClick={() => setActiveGroup(g)}>
-              {{ geometry: 'Hình học', wrap: 'Ôm cong', blend: 'Ánh sáng', edge: 'Viền', advanced: 'Nâng cao' }[g]}
+              {{ geometry: t('print_area.tabs.geometry'), wrap: t('print_area.tabs.wrap'), blend: t('print_area.tabs.blend'), edge: t('print_area.tabs.edge'), advanced: t('print_area.tabs.advanced') }[g]}
             </button>
           ))}
         </div>
         {activeGroup === 'geometry' && (
           <>
           <div className="ctrl-grid ctrl-grid-two">
-            <ControlAdjuster label="Nghiêng" description="Giả góc chụp bằng cách đẩy mép trên theo chiều ngang." value={tilt} min={-45} max={45} unit="°" onChange={setTilt} />
-            <ControlAdjuster label="Xoay" description="Xoay toàn bộ vùng in quanh tâm." value={rotate} min={-30} max={30} unit="°" onChange={setRotate} />
-            <ControlAdjuster label="Phối cảnh" description="Làm phần trên hoặc dưới hẹp lại để giống ảnh chụp xiên." value={perspective} min={-50} max={50} onChange={setPerspective} />
+            <ControlAdjuster label={t('print_area.geometry.tilt_label')} description={t('print_area.geometry.tilt_desc')} value={tilt} min={-45} max={45} unit="°" onChange={setTilt} />
+            <ControlAdjuster label={t('print_area.geometry.rotate_label')} description={t('print_area.geometry.rotate_desc')} value={rotate} min={-30} max={30} unit="°" onChange={setRotate} />
+            <ControlAdjuster label={t('print_area.geometry.persp_label')} description={t('print_area.geometry.persp_desc')} value={perspective} min={-50} max={50} onChange={setPerspective} />
           </div>
-          <div style={{ display: 'flex', justifyContent: 'flex-end', marginTop: 8 }}><button className="btn btn-ghost" onClick={resetGeometry}>Reset Hình học</button></div>
+          <div style={{ display: 'flex', justifyContent: 'flex-end', marginTop: 8 }}><button className="btn btn-ghost" onClick={resetGeometry}>{t('print_area.geometry.reset')}</button></div>
           </>
         )}
         {activeGroup === 'wrap' && (
           <>
           <div className="ctrl-grid ctrl-grid-two">
-            <ControlAdjuster label="Độ ôm ngang" description="Tăng để vùng in quấn sang hai bên thân cốc nhiều hơn." value={curvePct} min={0} max={100} unit="%" onChange={setCurvePct} />
-            <ControlAdjuster label="Cong mép trên" description="Bẻ đường mép trên lên hoặc xuống để khớp miệng cốc." value={curveTop} min={-100} max={100} unit="%" onChange={setCurveTop} />
-            <ControlAdjuster label="Cong mép dưới" description="Bẻ đường mép dưới lên hoặc xuống để khớp đáy cốc." value={-curveBot} min={-100} max={100} unit="%" onChange={(v) => setCurveBot(-v)} />
-            <ControlAdjuster label="Cường độ ép mép" description="Cuộn dải gần hai mép vào trong. Vùng giữa gần như giữ nguyên, chỉ phần rìa bị ép mạnh hơn." value={edgeSqueeze} min={0} max={1} step={0.1} onChange={setEdgeSqueeze} />
-            <ControlAdjuster label="Độ mạnh chuyển tiếp" description="Điều khiển độ gắt của vùng cuộn mép. Cao hơn thì hiệu ứng dồn sát về mép rõ hơn." value={squeezePower} min={1} max={5} step={0.1} onChange={setSqueezePower} />
-            <ControlAdjuster label="Độ rộng vùng giữa" description="Số dương: nới băng giữa, làm các ô ở giữa rộng ra và hai mép hẹp lại. Số âm: đảo chiều, siết băng giữa và dồn độ rộng ra hai mép." value={centerFocusWidth} min={-1} max={1} step={0.1} onChange={setCenterFocusWidth} />
-            <ControlAdjuster label="Mật độ mép lưới" description="Tăng để lưới xem trước dày hơn ở hai mép. Tham số này chỉ tăng độ mịn phần mép xem trước, không bóp ảnh in." value={meshDensityStrength} min={1} max={4} step={0.1} onChange={setMeshDensityStrength} />
+            <ControlAdjuster label={t('print_area.wrap.curve_label')} description={t('print_area.wrap.curve_desc')} value={curvePct} min={0} max={100} unit="%" onChange={setCurvePct} />
+            <ControlAdjuster label={t('print_area.wrap.top_label')} description={t('print_area.wrap.top_desc')} value={curveTop} min={-100} max={100} unit="%" onChange={setCurveTop} />
+            <ControlAdjuster label={t('print_area.wrap.bot_label')} description={t('print_area.wrap.bot_desc')} value={-curveBot} min={-100} max={100} unit="%" onChange={(v) => setCurveBot(-v)} />
+            <ControlAdjuster label={t('print_area.wrap.edge_sq_label')} description={t('print_area.wrap.edge_sq_desc')} value={edgeSqueeze} min={0} max={1} step={0.1} onChange={setEdgeSqueeze} />
+            <ControlAdjuster label={t('print_area.wrap.sq_pow_label')} description={t('print_area.wrap.sq_pow_desc')} value={squeezePower} min={1} max={5} step={0.1} onChange={setSqueezePower} />
+            <ControlAdjuster label={t('print_area.wrap.center_focus_label')} description={t('print_area.wrap.center_focus_desc')} value={centerFocusWidth} min={-1} max={1} step={0.1} onChange={setCenterFocusWidth} />
+            <ControlAdjuster label={t('print_area.wrap.mesh_dens_label')} description={t('print_area.wrap.mesh_dens_desc')} value={meshDensityStrength} min={1} max={4} step={0.1} onChange={setMeshDensityStrength} />
           </div>
-          <div style={{ display: 'flex', justifyContent: 'flex-end', marginTop: 8 }}><button className="btn btn-ghost" onClick={resetWrap}>Reset Ôm cong</button></div>
+          <div style={{ display: 'flex', justifyContent: 'flex-end', marginTop: 8 }}><button className="btn btn-ghost" onClick={resetWrap}>{t('print_area.wrap.reset')}</button></div>
           </>
         )}
         {activeGroup === 'blend' && (
           <>
-            <p className="mode-hint">Kéo chấm vàng trên vùng in để đổi hướng nguồn sáng. Các thanh bên dưới chỉ map về `light_dir`, `light_field` và `specular` nội bộ, không render thêm một lớp giả riêng.</p>
+            <p className="mode-hint">{t('print_area.blend.hint')}</p>
             <div className="ctrl-grid ctrl-grid-two">
-              <ControlAdjuster label="Nguồn sáng ngang" description="Dịch điểm sáng từ trái sang phải trên thân cốc." value={lightPosX * 100} min={0} max={100} step={1} unit="%" onChange={(v) => setLightPosX(v / 100)} />
-              <ControlAdjuster label="Nguồn sáng dọc" description="Dịch điểm sáng từ trên xuống dưới theo bề mặt vùng in." value={lightPosY * 100} min={0} max={100} step={1} unit="%" onChange={(v) => setLightPosY(v / 100)} />
-              <ControlAdjuster label="Chiều cao sáng" description="UI 0-100, nội bộ map sang trục Z để tránh nguồn sáng bị chết." value={lightHeight} min={1} max={100} step={1} onChange={setLightHeight} />
-              <ControlAdjuster label="Độ tương phản" description="Tăng chênh sáng tối của light field; thấp hơn thì ánh sáng phẳng hơn." value={lightContrast} min={0} max={100} step={1} onChange={setLightContrast} />
-              <ControlAdjuster label="Độ bóng" description="Tăng độ bóng/specular của men sứ trên composite cuối." value={lightHighlight} min={0} max={100} step={1} onChange={setLightHighlight} />
-              <ControlAdjuster label="Độ mềm sáng" description="Làm vùng sáng loe rộng và mềm hơn; thấp hơn thì peak gắt hơn." value={lightSoftness} min={0} max={100} step={1} onChange={setLightSoftness} />
-              <ControlAdjuster label="Làm mềm viền" description="Làm mượt mép vùng in khi ghép lên mockup." value={featherRadius} min={0} max={12} unit="px" onChange={setFeatherRadius} />
+              <ControlAdjuster label={t('print_area.blend.light_x_label')} description={t('print_area.blend.light_x_desc')} value={lightPosX * 100} min={0} max={100} step={1} unit="%" onChange={(v) => setLightPosX(v / 100)} />
+              <ControlAdjuster label={t('print_area.blend.light_y_label')} description={t('print_area.blend.light_y_desc')} value={lightPosY * 100} min={0} max={100} step={1} unit="%" onChange={(v) => setLightPosY(v / 100)} />
+              <ControlAdjuster label={t('print_area.blend.light_height_label')} description={t('print_area.blend.light_height_desc')} value={lightHeight} min={1} max={100} step={1} onChange={setLightHeight} />
+              <ControlAdjuster label={t('print_area.blend.contrast_label')} description={t('print_area.blend.contrast_desc')} value={lightContrast} min={0} max={100} step={1} onChange={setLightContrast} />
+              <ControlAdjuster label={t('print_area.blend.highlight_label')} description={t('print_area.blend.highlight_desc')} value={lightHighlight} min={0} max={100} step={1} onChange={setLightHighlight} />
+              <ControlAdjuster label={t('print_area.blend.softness_label')} description={t('print_area.blend.softness_desc')} value={lightSoftness} min={0} max={100} step={1} onChange={setLightSoftness} />
+              <ControlAdjuster label={t('print_area.blend.feather_label')} description={t('print_area.blend.feather_desc')} value={featherRadius} min={0} max={12} unit="px" onChange={setFeatherRadius} />
             </div>
-            <div style={{ display: 'flex', justifyContent: 'flex-end', marginTop: 8 }}><button className="btn btn-ghost" onClick={resetBlend}>Reset Ánh sáng</button></div>
+            <div style={{ display: 'flex', justifyContent: 'flex-end', marginTop: 8 }}><button className="btn btn-ghost" onClick={resetBlend}>{t('print_area.blend.reset')}</button></div>
           </>
         )}
         {activeGroup === 'edge' && (
           <div className="ctrl-grid">
-            <ControlAdjuster label="Độ rộng viền" description="Tỉ lệ băng fade ở rìa (fraction of width)" value={edgeWidth} min={0} max={0.5} step={0.01} onChange={setEdgeWidth} />
-            <ControlAdjuster label="Độ cong falloff" description="Power curve cho falloff" value={edgePower} min={0.5} max={3} step={0.1} onChange={setEdgePower} />
-            <ControlAdjuster label="Giảm saturation" description="Giảm saturation tại viền" value={edgeSatLift} min={0} max={1} step={0.01} onChange={setEdgeSatLift} />
-            <ControlAdjuster label="Lift bóng (black)" description="Tăng black level tại viền" value={edgeBlackLift} min={0} max={0.2} step={0.01} onChange={setEdgeBlackLift} />
-            <ControlAdjuster label="Cường độ shadow" description="Inner shadow strength" value={edgeShadowStr} min={0} max={1} step={0.01} onChange={setEdgeShadowStr} />
-            <ControlAdjuster label="Falloff shadow" description="Shadow falloff" value={edgeShadowFall} min={0.5} max={6} step={0.1} onChange={setEdgeShadowFall} />
+            <ControlAdjuster label={t('print_area.edge.width_label')} description={t('print_area.edge.width_desc')} value={edgeWidth} min={0} max={0.5} step={0.01} onChange={setEdgeWidth} />
+            <ControlAdjuster label={t('print_area.edge.power_label')} description={t('print_area.edge.power_desc')} value={edgePower} min={0.5} max={3} step={0.1} onChange={setEdgePower} />
+            <ControlAdjuster label={t('print_area.edge.sat_label')} description={t('print_area.edge.sat_desc')} value={edgeSatLift} min={0} max={1} step={0.01} onChange={setEdgeSatLift} />
+            <ControlAdjuster label={t('print_area.edge.black_label')} description={t('print_area.edge.black_desc')} value={edgeBlackLift} min={0} max={0.2} step={0.01} onChange={setEdgeBlackLift} />
+            <ControlAdjuster label={t('print_area.edge.shadow_str_label')} description={t('print_area.edge.shadow_str_desc')} value={edgeShadowStr} min={0} max={1} step={0.01} onChange={setEdgeShadowStr} />
+            <ControlAdjuster label={t('print_area.edge.shadow_fall_label')} description={t('print_area.edge.shadow_fall_desc')} value={edgeShadowFall} min={0.5} max={6} step={0.1} onChange={setEdgeShadowFall} />
             <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
-              <label className="btn btn-outline">Upload Normal Map<input style={{ display: 'none' }} type="file" accept="image/*" onChange={e => { const f = e.target.files?.[0] || null; setNormalMapUrl(f ? URL.createObjectURL(f) : null); }} /></label>
-              {normalMapUrl && <button className="btn btn-ghost" onClick={() => { URL.revokeObjectURL(normalMapUrl); setNormalMapUrl(null); }}>Remove</button>}
-              <button className="btn btn-ghost" onClick={resetEdge} style={{ marginLeft: 8 }}>Reset Viền</button>
+              <label className="btn btn-outline">{t('print_area.edge.upload_normal')}<input style={{ display: 'none' }} type="file" accept="image/*" onChange={e => { const f = e.target.files?.[0] || null; setNormalMapUrl(f ? URL.createObjectURL(f) : null); }} /></label>
+              {normalMapUrl && <button className="btn btn-ghost" onClick={() => { URL.revokeObjectURL(normalMapUrl); setNormalMapUrl(null); }}>{t('print_area.edge.remove')}</button>}
+              <button className="btn btn-ghost" onClick={resetEdge} style={{ marginLeft: 8 }}>{t('print_area.edge.reset')}</button>
             </div>
           </div>
         )}
         {activeGroup === 'advanced' && (
           <div className="ctrl-grid">
-            <button className="btn-ghost" style={{ marginTop: 8 }} onClick={() => { setTilt(0); setRotate(0); setPerspective(0); setCurveTop(0); setCurveBot(0); setEdgeSqueeze(0); setSqueezePower(2); setCenterFocusWidth(0); setMeshDensityStrength(DEFAULT_MESH_DENSITY_STRENGTH); setDesignScale(1); setDesignOffsetX(0); setDesignOffsetY(0); setLightPosX(0.62); setLightPosY(0.32); setLightHeight(55); setLightContrast(50); setLightHighlight(60); setLightSoftness(55); }}>Đặt lại tất cả</button>
+            <button className="btn-ghost" style={{ marginTop: 8 }} onClick={() => { setTilt(0); setRotate(0); setPerspective(0); setCurveTop(0); setCurveBot(0); setEdgeSqueeze(0); setSqueezePower(2); setCenterFocusWidth(0); setMeshDensityStrength(DEFAULT_MESH_DENSITY_STRENGTH); setDesignScale(1); setDesignOffsetX(0); setDesignOffsetY(0); setLightPosX(0.62); setLightPosY(0.32); setLightHeight(55); setLightContrast(50); setLightHighlight(60); setLightSoftness(55); }}>{t('print_area.advanced.reset_all')}</button>
           </div>
         )}
         {pointNudgePanel}
@@ -1816,11 +1887,11 @@ export default function PrintAreaEditor(props: PrintAreaEditorProps) {
     >
       <div className="toolbar">
         <div className="toolbar-left">
-          <div className="logo-badge">Trình Chỉnh Vùng In</div>
+          <div className="logo-badge">{t('print_area.toolbar.title')}</div>
           <div className="mode-sub-pills" style={{ marginLeft: 20, display: 'flex', gap: 6, visibility: editorMode === 'CALIBRATE' ? 'visible' : 'hidden' }}>
             {(['calibrate', 'mesh', 'mask'] as const).map(m => (
               <button key={m} className={`pill pill-sm ${activeMode === m ? 'active' : ''}`} onClick={() => setActiveMode(m)}>
-                {{ calibrate: 'Căn chỉnh', mesh: 'Lưới', mask: 'Mặt nạ' }[m]}
+                {{ calibrate: t('print_area.toolbar.mode_calibrate'), mesh: t('print_area.toolbar.mode_mesh'), mask: t('print_area.toolbar.mode_mask') }[m]}
               </button>
             ))}
           </div>
@@ -1830,14 +1901,14 @@ export default function PrintAreaEditor(props: PrintAreaEditorProps) {
             className={`icon-btn ${renderDevice === 'gpu' ? 'active' : ''}`}
             onClick={toggleRenderDevice}
             disabled={isSwitchingDevice || (renderDevice === 'cpu' && !gpuAvailable)}
-            title={gpuAvailable ? 'Bật/tắt GPU runtime' : 'GPU/OpenCL không khả dụng'}
+            title={gpuAvailable ? t('print_area.toolbar.gpu_available_tip') : t('print_area.toolbar.gpu_unavailable_tip')}
           >
-            {isSwitchingDevice ? 'Đang chuyển...' : (renderDevice === 'gpu' ? 'GPU ON' : 'CPU')}
+            {isSwitchingDevice ? t('print_area.toolbar.switching') : (renderDevice === 'gpu' ? t('print_area.toolbar.gpu_on') : t('print_area.toolbar.cpu_on'))}
           </button>
-          <button className={`icon-btn ${showGrid ? 'active' : ''}`} onClick={() => setShowGrid(v => !v)}>Lưới</button>
-          <button className="btn-detect" onClick={handleAutoDetect} disabled={isDetecting}>{isDetecting ? 'Đang dò...' : 'Dò tự động'}</button>
+          <button className={`icon-btn ${showGrid ? 'active' : ''}`} onClick={() => setShowGrid(v => !v)}>{t('print_area.toolbar.grid')}</button>
+          <button className="btn-detect" onClick={handleAutoDetect} disabled={isDetecting}>{isDetecting ? t('print_area.toolbar.detecting') : t('print_area.toolbar.auto_detect')}</button>
           <div className="workflow-status">
-            {editorMode === 'CALIBRATE' ? <button className="btn-confirm-lock" onClick={() => setEditorMode('DESIGN')}>Chốt vùng in</button> : <button className="btn-unlock" onClick={() => setEditorMode('CALIBRATE')}>Mở khóa</button>}
+            {editorMode === 'CALIBRATE' ? <button className="btn-confirm-lock" onClick={() => setEditorMode('DESIGN')}>{t('print_area.toolbar.lock')}</button> : <button className="btn-unlock" onClick={() => setEditorMode('CALIBRATE')}>{t('print_area.toolbar.unlock')}</button>}
           </div>
         </div>
       </div>
@@ -1848,9 +1919,9 @@ export default function PrintAreaEditor(props: PrintAreaEditorProps) {
         </aside>
 
         <main className="canvas-section">
-          <div className="canvas-wrap" ref={containerRef} onPointerMove={handlePointerMove} onPointerUp={handlePointerUp} onWheel={handleWheel} onMouseDown={handleContainerMouseDown} onMouseMove={handleContainerMouseMove} onMouseUp={handleContainerMouseUp} onMouseLeave={handleContainerMouseUp} onClick={handleCanvasClick} style={{ cursor: isPanning || draggingIdx?.type === 'design' ? 'grabbing' : (canDragArtwork ? 'grab' : (activeMode !== 'calibrate' ? 'crosshair' : 'default')), overflow: 'hidden' }}>
+          <div className="canvas-wrap" ref={containerRef} onPointerMove={handlePointerMove} onPointerUp={handlePointerUp} onMouseDown={handleContainerMouseDown} onMouseMove={handleContainerMouseMove} onMouseUp={handleContainerMouseUp} onMouseLeave={handleContainerMouseUp} onClick={handleCanvasClick} style={{ cursor: isPanning || draggingIdx?.type === 'design' ? 'grabbing' : (canDragArtwork ? 'grab' : (activeMode !== 'calibrate' ? 'crosshair' : 'default')), overflow: 'hidden' }}>
             <div className="canvas-container" style={{ transform: `translate(${pan.x}px, ${pan.y}px) scale(${zoom})`, transformOrigin: '0 0', width: '100%', height: '100%', position: 'relative', ['--zoom' as any]: zoom }}>
-                <img src={imageUrl} alt="Mockup" className="mockup-img" onLoad={e => setNaturalSize({ w: e.currentTarget.naturalWidth, h: e.currentTarget.naturalHeight })} />
+                <img src={imageUrl} alt={t('print_area.mockup_alt')} className="mockup-img" onLoad={e => setNaturalSize({ w: e.currentTarget.naturalWidth, h: e.currentTarget.naturalHeight })} />
                 {showGridOverlay && gridOverlayUrl && !showDesignOverlay && (
                   <img
                     src={gridOverlayUrl}
@@ -1873,7 +1944,7 @@ export default function PrintAreaEditor(props: PrintAreaEditorProps) {
                     alt=""
                   />
                 )}
-                <svg className="overlay-svg" viewBox="0 0 100 100" preserveAspectRatio="none">
+                <svg className="overlay-svg" viewBox="0 0 100 100" preserveAspectRatio="xMidYMid meet">
                   {isCylinderProduct
                     ? <MugCurvePreview calibPts={calibPts} curvePct={curvePct} curveTop={curveTop} curveBot={curveBot} edgeSqueeze={edgeSqueeze} squeezePower={squeezePower} centerFocusWidth={centerFocusWidth} meshDensityStrength={meshDensityStrength} hPx={H_px} wPx={W_px} showGrid={showEditorGridLayer} onSmileDrag={setCurveTop} onPitchDrag={setCurveBot} />
                     : <WarpGridPreview meshPoints={meshPoints} showGrid={showEditorGridLayer} />}
@@ -1896,7 +1967,7 @@ export default function PrintAreaEditor(props: PrintAreaEditorProps) {
         </main>
       </div>
 
-      {apiError && <div className="error-toast"><span>Cảnh báo: {apiError}</span><button className="btn-ghost" onClick={() => setApiError(null)}>Đóng</button></div>}
+      {apiError && <div className="error-toast"><span>{t('print_area.warning')} {apiError}</span><button className="btn-ghost" onClick={() => setApiError(null)}>{t('print_area.close')}</button></div>}
       <style>{`
         @import url('https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=Syne:wght@400;600;700;800&display=swap');
 
@@ -2132,68 +2203,41 @@ export default function PrintAreaEditor(props: PrintAreaEditorProps) {
 
         /* Handles */
         .handle {
-          position: absolute; cursor: pointer; z-index: 100;
-          display: flex; align-items: center; justify-content: center;
+          position: absolute;
+          cursor: pointer;
+          z-index: 1100;
+          display: flex;
+          align-items: center;
+          justify-content: center;
           transition: transform 0.1s;
           transform: translate(-50%, -50%) scale(calc(1 / var(--zoom, 1)));
           background: transparent;
         }
-        .handle.selected {
-          filter: drop-shadow(0 0 6px rgba(147, 197, 253, 0.85));
-        }
+        .handle.selected { filter: drop-shadow(0 0 6px rgba(147, 197, 253, 0.85)); }
         .handle:hover { transform: translate(-50%, -50%) scale(calc(1.4 / var(--zoom, 1))); }
+
         .handle-corner-dot { width: 14px; height: 14px; }
         .handle-corner-dot::after {
           content: ''; width: 5px; height: 5px; background: #00f2ff;
-          border-radius: 50%; border: 1px solid rgba(255,255,255,0.6);
+          border-radius: 50%; border: 1px solid rgba(255,255,255,0.85);
           box-shadow: 0 0 3px rgba(0,242,255,0.5);
         }
+
         .handle-smile-dot { width: 16px; height: 16px; }
-        .handle-smile-dot::after {
-          content: ''; width: 5px; height: 5px; background: #00f2ff;
-          border-radius: 50%; border: 1px solid white;
-        }
+        .handle-smile-dot::after { content: ''; width: 6px; height: 6px; background: #00f2ff; border-radius: 50%; border: 1px solid white; }
+
         .handle-pitch-dot { width: 16px; height: 16px; }
-        .handle-pitch-dot::after {
-          content: ''; width: 5px; height: 5px; background: #f59e0b;
-          border-radius: 50%; border: 1px solid white;
-        }
+        .handle-pitch-dot::after { content: ''; width: 6px; height: 6px; background: #f59e0b; border-radius: 50%; border: 1px solid white; }
+
         .handle-light-dot { width: 20px; height: 20px; }
-        .handle-light-dot::before {
-          content: '';
-          position: absolute;
-          inset: 2px;
-          border-radius: 50%;
-          border: 1px solid rgba(253, 224, 71, 0.95);
-          box-shadow: 0 0 12px rgba(250, 204, 21, 0.45);
-        }
-        .handle-light-dot::after {
-          content: '';
-          width: 8px;
-          height: 8px;
-          background: #facc15;
-          border-radius: 50%;
-          border: 1px solid rgba(255,255,255,0.9);
-        }
-        .handle-mask {
-          width: 14px; height: 14px; background: #059669;
-          border: 2px solid #6ee7b7; border-radius: 3px;
-        }
-        .handle-mesh {
-          width: 14px;
-          height: 14px;
-          border-radius: 50%;
-          background: transparent;
-        }
-        .handle-mesh::after {
-          content: '';
-          width: 5px;
-          height: 5px;
-          background: #050505;
-          border-radius: 50%;
-          border: 1px solid rgba(255, 255, 255, 0.72);
-          box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.35);
-        }
+        .handle-light-dot::before { content: ''; position: absolute; inset: 2px; border-radius: 50%; border: 1px solid rgba(253,224,71,0.95); box-shadow: 0 0 12px rgba(250,204,21,0.45); }
+        .handle-light-dot::after { content: ''; width: 8px; height: 8px; background: #facc15; border-radius: 50%; border: 1px solid rgba(255,255,255,0.9); }
+
+        .handle-mask { width: 14px; height: 14px; background: #059669; border: 2px solid #6ee7b7; border-radius: 3px; }
+
+        /* Small mesh handle: subtle black dot with light border for visibility */
+        .handle-mesh { width: 6px; height: 6px; border-radius: 50%; background: transparent; }
+        .handle-mesh::after { content: ''; width: 4px; height: 4px; background: #000; border-radius: 50%; border: 1px solid rgba(255,255,255,0.15); box-shadow: none; }
 
         /* Misc */
         .select {

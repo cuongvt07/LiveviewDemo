@@ -116,10 +116,10 @@ export const WarpGridPreview: React.FC<WarpGridPreviewProps> = ({ meshPoints, sh
             return (
               <line
                 key={`edge-${edge}`}
-                x1={`${p0.x * 100}%`}
-                y1={`${p0.y * 100}%`}
-                x2={`${p1.x * 100}%`}
-                y2={`${p1.y * 100}%`}
+                x1={`${p0.x * 100}`}
+                y1={`${p0.y * 100}`}
+                x2={`${p1.x * 100}`}
+                y2={`${p1.y * 100}`}
                 className="grid-line tps-grid"
               />
             );

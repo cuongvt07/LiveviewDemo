@@ -1,0 +1,318 @@
+{
+  "vi": {
+    "error": {
+      "render": "Lỗi Render: {msg}",
+      "connection": "Lỗi kết nối: {msg}",
+      "no_job_id": "Server không trả về job id cho render bất đồng bộ"
+    },
+    "success": {
+      "template_saved": "Đã lưu cấu hình thành Template thành công!"
+    },
+    "lookup": {
+      "template_url_error": "Lỗi tra template theo URL: {msg}",
+      "import_error": "Lỗi phân tích URL: {msg}"
+    },
+    "save": {
+      "error": "Lỗi: {msg}",
+      "default": "Lỗi khi lưu template"
+    },
+    "app": {
+      "title": "POD Liveview Admin",
+      "version": "Mug Mockup Service v{version}",
+      "nav": {
+        "preview": "Live Preview",
+        "templates": "Templates",
+        "maps_editor": "Maps Editor (Dev)"
+      }
+    },
+    "template_manager": {
+      "title": "Active Templates",
+      "description": "Quản lý và cấu hình các template 3D (Cốc, Áo, v.v)",
+      "add_button": "+ Thêm Template",
+      "config": "Cấu hình",
+      "history": "Lịch sử",
+      "modal_title": "Lịch sử cấu hình: {slug}",
+      "loading_history": "Đang tải lịch sử...",
+      "no_history": "Không tìm thấy lịch sử.",
+      "rollback_confirm": "Rollback template {slug} về phiên bản #{id}?",
+      "rollback_button": "Rollback về phiên bản này",
+      "no_templates": "Chưa có template nào được active.",
+      "loading": "Đang tải...",
+      "slug": "Slug:",
+      "size": "Kích thước:",
+      "no_note": "Không có ghi chú"
+    },
+    "print_area": {
+      "labels": {
+        "base": "Góc vùng in",
+        "mesh": "Điểm lưới",
+        "mask": "Điểm mặt nạ",
+        "light": "Điểm sáng",
+        "smile": "Điểm cong trên",
+        "pitch": "Điểm cong dưới"
+      },
+      "selected_point_default": "Chưa chọn điểm",
+      "point_label": "Điểm",
+      "design_hint": "Kéo trực tiếp trên ảnh in 2D để đổi vị trí. Lăn chuột để zoom ảnh in, `Alt + wheel` để zoom canvas.",
+      "calibrate_hint": "Ảnh in là ảnh ngang 2D. Kéo chỉ tác động lên ảnh in, không kéo mockup gốc.",
+      "warning": "Cảnh báo:",
+      "close": "Đóng",
+      "mockup_alt": "Ảnh Mockup",
+      "error": {
+        "gpu_unavailable": "GPU/OpenCL không khả dụng trên máy hiện tại.",
+        "device_switch_failed": "Không thể chuyển CPU/GPU"
+      },
+      "step": {
+        "1": "Bước 1: Chọn loại sản phẩm"
+      },
+      "products": {
+        "groups": {
+          "mugs": "CỐC",
+          "clothes": "QUẦN ÁO",
+          "others": "KHÁC"
+        },
+        "mugs": {
+          "ceramic": "Cốc sứ",
+          "glass": "Cốc thủy tinh",
+          "travel": "Ly giữ nhiệt"
+        },
+        "clothes": {
+          "tshirt": "Áo thun",
+          "hoodie": "Áo hoodie",
+          "totebag": "Túi tote"
+        },
+        "others": {
+          "flat": "In phẳng",
+          "phone_case": "Ốp điện thoại"
+        }
+      },
+      "nudge": {
+        "title": "Di chuyển điểm bằng nút",
+        "hint": "Chọn một điểm trên vùng in, sau đó bấm các nút hướng hoặc phím mũi tên để căn chính xác. Giữ `Shift` để dịch nhanh hơn.",
+        "step_label": "Bước nudge điểm",
+        "step_desc": "Bước nhỏ hơn giúp canh mép chính xác hơn.",
+        "up": "Lên",
+        "left": "Trái",
+        "down": "Xuống",
+        "right": "Phải",
+        "decrease": "Giảm {label}",
+        "increase": "Tăng {label}",
+        "step_prefix": "Bước chỉnh:"
+      },
+      "coord": {
+        "x_label": "Tọa độ X",
+        "x_desc": "Nhập trực tiếp tọa độ ngang của điểm (0-100%).",
+        "y_label": "Tọa độ Y",
+        "y_desc": "Nhập trực tiếp tọa độ dọc của điểm (0-100%)."
+      },
+      "design": {
+        "title": "Chỉnh ảnh in",
+        "fit_contain": "Vừa khung lưới in",
+        "fit_cover": "Phủ kín vùng in",
+        "fit_hint": "`Vừa khung lưới in` dùng kiểu object-fit contain để ảnh nằm gọn trong vùng in. Cấu hình này sẽ được lưu cùng template.",
+        "scale_label": "Phóng to ảnh in",
+        "scale_desc": "Zoom tương đối trên nền fit hiện tại. Nếu đang `Vừa khung`, giá trị 1.0 sẽ giữ ảnh nằm gọn trong vùng in.",
+        "offset_x_label": "Dịch ngang",
+        "offset_x_desc": "Dời ảnh in sang trái hoặc phải bên trong vùng in.",
+        "offset_y_label": "Dịch dọc",
+        "offset_y_desc": "Dời ảnh in lên hoặc xuống bên trong vùng in."
+      },
+      "mesh": {
+        "hint": "Kéo trực tiếp các điểm trên lưới cong để tinh chỉnh biến dạng bề mặt.",
+        "default_mesh": "Lưới mặc định (13×9)",
+        "legacy_mesh": "Chuyển sang 4×4 (legacy)"
+      },
+      "mask": {
+        "hint": "Nhấp để vẽ vùng mặt nạ. Đóng vòng để hoàn thành.",
+        "clear": "Xóa mặt nạ"
+      },
+      "tabs": {
+        "geometry": "Hình học",
+        "wrap": "Ôm cong",
+        "blend": "Ánh sáng",
+        "edge": "Viền",
+        "advanced": "Nâng cao"
+      },
+      "geometry": {
+        "tilt_label": "Nghiêng",
+        "tilt_desc": "Giả góc chụp bằng cách đẩy mép trên theo chiều ngang.",
+        "rotate_label": "Xoay",
+        "rotate_desc": "Xoay toàn bộ vùng in quanh tâm.",
+        "persp_label": "Phối cảnh",
+        "persp_desc": "Làm phần trên hoặc dưới hẹp lại để giống ảnh chụp xiên.",
+        "reset": "Reset Hình học"
+      },
+      "wrap": {
+        "curve_label": "Độ ôm ngang",
+        "curve_desc": "Tăng để vùng in quấn sang hai bên thân cốc nhiều hơn.",
+        "top_label": "Cong mép trên",
+        "top_desc": "Bẻ đường mép trên lên hoặc xuống để khớp miệng cốc.",
+        "bot_label": "Cong mép dưới",
+        "bot_desc": "Bẻ đường mép dưới lên hoặc xuống để khớp đáy cốc.",
+        "edge_sq_label": "Cường độ ép mép",
+        "edge_sq_desc": "Cuộn dải gần hai mép vào trong. Vùng giữa gần như giữ nguyên, chỉ phần rìa bị ép mạnh hơn.",
+        "sq_pow_label": "Độ mạnh chuyển tiếp",
+        "sq_pow_desc": "Điều khiển độ gắt của vùng cuộn mép. Cao hơn thì hiệu ứng dồn sát về mép rõ hơn.",
+        "center_focus_label": "Độ rộng vùng giữa",
+        "center_focus_desc": "Số dương: nới băng giữa, làm các ô ở giữa rộng ra và hai mép hẹp lại. Số âm: đảo chiều, siết băng giữa và dồn độ rộng ra hai mép.",
+        "mesh_dens_label": "Mật độ mép lưới",
+        "mesh_dens_desc": "Tăng để lưới xem trước dày hơn ở hai mép. Tham số này chỉ tăng độ mịn phần mép xem trước, không bóp ảnh in.",
+        "reset": "Reset Ôm cong"
+      },
+      "blend": {
+        "hint": "Kéo chấm vàng trên vùng in để đổi hướng nguồn sáng. Các thanh bên dưới chỉ map về `light_dir`, `light_field` và `specular` nội bộ, không render thêm một lớp giả riêng.",
+        "light_x_label": "Nguồn sáng ngang",
+        "light_x_desc": "Dịch điểm sáng từ trái sang phải trên thân cốc.",
+        "light_y_label": "Nguồn sáng dọc",
+        "light_y_desc": "Dịch điểm sáng từ trên xuống dưới theo bề mặt vùng in.",
+        "light_height_label": "Chiều cao sáng",
+        "light_height_desc": "Z-axis source height.",
+        "contrast_label": "Độ tương phản",
+        "contrast_desc": "Tăng chênh sáng tối của light field.",
+        "highlight_label": "Độ bóng",
+        "highlight_desc": "Tăng độ bóng/specular của men sứ.",
+        "softness_label": "Độ mềm sáng",
+        "softness_desc": "Làm vùng sáng loe rộng và mềm hơn.",
+        "feather_label": "Làm mềm viền",
+        "feather_desc": "Làm mượt mép vùng in.",
+        "reset": "Reset Ánh sáng"
+      },
+      "edge": {
+        "width_label": "Độ rộng viền",
+        "width_desc": "Tỉ lệ băng fade ở rìa",
+        "power_label": "Độ cong falloff",
+        "power_desc": "Power curve cho falloff",
+        "sat_label": "Giảm saturation",
+        "sat_desc": "Giảm saturation tại viền",
+        "black_label": "Lift bóng (black)",
+        "black_desc": "Tăng black level tại viền",
+        "shadow_str_label": "Cường độ shadow",
+        "shadow_str_desc": "Inner shadow strength",
+        "shadow_fall_label": "Falloff shadow",
+        "shadow_fall_desc": "Shadow falloff",
+        "upload_normal": "Upload Normal Map",
+        "remove": "Remove",
+        "reset": "Reset Viền"
+      },
+      "advanced": {
+        "reset_all": "Đặt lại tất cả"
+      },
+      "toolbar": {
+        "title": "Trình Chỉnh Vùng In",
+        "mode_calibrate": "Căn chỉnh",
+        "mode_mesh": "Lưới",
+        "mode_mask": "Mặt nạ",
+        "gpu_on": "GPU ON",
+        "cpu_on": "CPU",
+        "switching": "Đang chuyển...",
+        "gpu_available_tip": "Bật/tắt GPU runtime",
+        "gpu_unavailable_tip": "GPU/OpenCL không khả dụng",
+        "grid": "Lưới",
+        "detecting": "Đang dò...",
+        "auto_detect": "Dò tự động",
+        "lock": "Chốt vùng in",
+        "unlock": "Mở khóa"
+      }
+    },
+    "live_preview": {
+      "upload": {
+        "upload_error": "Upload mockup lên thư viện thất bại",
+        "no_mockup": "Chưa có ảnh mockup. Vui lòng upload hoặc chọn từ thư viện.",
+        "loading_history": "Đang tải lịch sử..."
+      },
+      "url_lookup": {
+        "sending": "Đang tra...",
+        "send_button": "Gửi URL"
+      },
+      "prompt": {
+        "slug": "Nhập slug cho template mới (ví dụ: my-mug-01):",
+        "name": "Nhập tên hiển thị cho template:"
+      },
+      "mode": {
+        "from_template": "Từ Template",
+        "adhoc": "Tự Cấu Hình"
+      },
+      "placeholder": {
+        "cdn_url": "Dán URL CDN Printerval để tự fill mockup và artwork"
+      },
+      "gen": {
+        "button": "Gen Mockup",
+        "loading": "Đang xử lý...",
+        "empty_hint": "Bấm Gen Mockup để xem thiết bị hiển thị"
+      },
+      "modal": {
+        "save_template": "Lưu Template",
+        "editor_title": "Trình Chỉnh Vùng In & Mesh",
+        "upload_artwork": "Upload Artwork",
+        "change_mockup": "Đổi Ảnh Gốc",
+        "gen_test": "Gen Thử Mockup",
+        "close_editor": "Đóng Trình Chỉnh",
+        "quick_preview_title": "Xem nhanh kết quả",
+        "quick_preview_hint": "Bấm Gen Thử"
+      },
+      "render_settings": "Cấu hình Render",
+      "url_label": "URL LiveView / CDN",
+      "step": {
+        "1": "Step 1: Chọn loại sản phẩm (Module)",
+        "2": "Step 2: Chọn ảnh gốc (Mockup Base)",
+        "3": "Step 3: Upload Design (Artwork)"
+      },
+      "matches": {
+        "title": "Template khớp URL",
+        "no_preview": "No preview",
+        "loading": "Đang tải..."
+      },
+      "result": {
+        "title": "Result",
+        "loading_hint": "Đang tự render mockup...",
+        "alt": "Kết quả Mockup"
+      },
+      "or_manual": "Hoặc chọn tay",
+      "select_template_placeholder": "-- Chọn template --",
+      "help": {
+        "url_analysis": "Dán URL LiveView/CDN để tự động phân tích mockup và artwork tham chiếu."
+      },
+      "module_groups": {
+        "mugs": "Mugs",
+        "clothes": "Clothes"
+      },
+      "preview": {
+        "time_label": "Thời gian render: {ms} ms",
+        "configured": "✔ Đã cấu hình Mesh & Print Area",
+        "needs_calibrate": "✖ Cần Calibrate Area"
+      },
+      "error": {
+        "cannot_read_preview": "Không thể đọc ảnh preview"
+      },
+      "template_color": "Màu sắc:",
+      "template_count": "Số lượng template:",
+      "lookup_key": "Mã tra cứu:",
+      "template_found": "Đã tìm thấy template:",
+      "template_image": "Ảnh template:",
+      "template_view": "Góc nhìn:",
+      "template": "Template:",
+      "color": "Màu sắc:",
+      "mockup_policy": "Chính sách mockup:",
+      "mockup_view": "Góc nhìn mockup:",
+      "mockup_local": "Mockup local:",
+      "artwork_local": "Artwork local:",
+      "print_area_preset": "Preset vùng in:",
+      "design_source_mode": "Chế độ artwork:",
+      "step1_select_module": "Bước 1: Chọn loại sản phẩm (Module)",
+      "select_module_placeholder": "-- Chọn Module --",
+      "url_analysis_hint": "URL sẽ được phân tích để chọn mockup local trong `public/mockups` và tải artwork tham chiếu về local.",
+      "slug_label": "Slug:",
+      "view_label": "Góc nhìn:",
+      "lib_button": "Lib",
+      "edit_button": "Sửa",
+      "step_2_label": "Step 2: Chọn ảnh gốc (Mockup Base)"
+    },
+    "library_picker": {
+      "title_bases": "Base Mockup Library",
+      "title_artworks": "Artwork Library",
+      "search_placeholder": "Search items...",
+      "loading": "Loading library...",
+      "no_items": "No items found."
+    }
+  }
+}

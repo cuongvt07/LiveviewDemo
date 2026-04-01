@@ -1,5 +1,6 @@
 import { useState, useEffect } from 'react';
 import { Image as ImageIcon, X } from 'lucide-react';
+import t from '../i18n/translate'
 
 interface LibraryItem {
   name: string;
@@ -48,9 +49,9 @@ export default function LibraryPicker({ type, onSelect, onClose }: LibraryPicker
         boxShadow: '0 20px 50px rgba(0,0,0,0.5)'
       }}>
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1.5rem' }}>
-          <h3 style={{ margin: 0, display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+            <h3 style={{ margin: 0, display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
             <ImageIcon size={20} />
-            {type === 'bases' ? 'Base Mockup Library' : 'Artwork Library'}
+              {type === 'bases' ? t('library_picker.title_bases') : t('library_picker.title_artworks')}
           </h3>
           <button className="btn-icon" onClick={onClose} style={{ background: 'transparent', border: 'none', color: 'var(--text-secondary)' }}>
             <X size={24} />
@@ -60,7 +61,7 @@ export default function LibraryPicker({ type, onSelect, onClose }: LibraryPicker
         <div style={{ marginBottom: '1rem' }}>
           <input 
             type="text" 
-            placeholder="Search items..." 
+            placeholder={t('library_picker.search_placeholder')} 
             className="input-field" 
             value={filter}
             onChange={(e) => setFilter(e.target.value)}
@@ -69,10 +70,10 @@ export default function LibraryPicker({ type, onSelect, onClose }: LibraryPicker
 
         <div style={{ flex: 1, overflowY: 'auto', display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(150px, 1fr))', gap: '1rem', paddingRight: '0.5rem' }}>
           {loading ? (
-            <div style={{ gridColumn: '1/-1', textAlign: 'center', padding: '2rem' }}>Loading library...</div>
+            <div style={{ gridColumn: '1/-1', textAlign: 'center', padding: '2rem' }}>{t('library_picker.loading')}</div>
           ) : filteredItems.length === 0 ? (
             <div style={{ gridColumn: '1/-1', textAlign: 'center', padding: '2rem', opacity: 0.5 }}>
-              No items found.
+              {t('library_picker.no_items')}
             </div>
           ) : filteredItems.map(item => (
             <div 

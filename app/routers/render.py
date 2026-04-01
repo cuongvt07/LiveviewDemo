@@ -23,12 +23,19 @@ from app.pipeline.mugs.cylinder_math import summarize_horizontal_squeeze
 from app.pipeline.mugs.mug_pipeline import MugAssets
 from app.pipeline.mugs.specular_gloss import extract_specular_from_mockup
 from app.pipeline.pipeline import run_pipeline
-from app.pipeline.shared.decode import decode_design
+from app.pipeline.shared.decode import decode_design, decode_design_preview
 from app.pipeline.shared.design_transform import apply_design_transform, estimate_print_area_canvas_size
+from app.pipeline.shared.liveview_cache import (
+    get_preview_canvas_cache,
+    make_preview_canvas_cache_key,
+    set_preview_canvas_cache,
+)
 from app.pipeline.shared.smooth_mesh_warp import apply_smooth_mesh_warp
 from app.services import template_registry
+from app.services.render_persist import persistRenderResult
 from app.services.url_analysis import resolve_local_asset_path
 from app.services.vision import auto_detect_print_area_v2, bake_normal_map, create_soft_mask
+from app.services.render_queue import enqueue_adhoc_render, get_job
 
 router = APIRouter(tags=["render"])
 
@@ -38,6 +45,7 @@ MAX_GRID_DIVS = 24
 DEFAULT_MESH_DENSITY_STRENGTH = 2.0
 DEFAULT_CURVE_CORRECTION_ALPHA = 0.7
 DEFAULT_CURVE_SNAP_THRESHOLD_PX = 2.0
+PREVIEW_PNG_COMPRESSION = 1
 
 
 def _log_horizontal_squeeze_debug(
@@ -461,6 +469,15 @@ def _build_preview_design_canvas(
 ) -> np.ndarray:
     safe_w = max(1, int(width))
     safe_h = max(1, int(height))
+    cache_key = make_preview_canvas_cache_key(
+        width=safe_w,
+        height=safe_h,
+        mesh_density_strength=mesh_density_strength,
+    )
+    cached_canvas = get_preview_canvas_cache(cache_key)
+    if cached_canvas is not None:
+        return cached_canvas
+
     cols, rows = _compute_adaptive_grid(safe_w, safe_h, cell_px=cell_px)
     canvas = np.zeros((safe_h, safe_w, 4), dtype=np.uint8)
 
@@ -483,7 +500,18 @@ def _build_preview_design_canvas(
     for y in y_edges:
         yi = int(np.clip(y, 0, safe_h - 1))
         cv2.line(canvas, (0, yi), (safe_w - 1, yi), (255, 255, 255, 170), 1, cv2.LINE_AA)
-    return canvas
+    return set_preview_canvas_cache(cache_key, canvas)
+
+
+def _encode_preview_png(image: np.ndarray) -> bytes:
+    ok, buf = cv2.imencode(
+        ".png",
+        image,
+        [int(cv2.IMWRITE_PNG_COMPRESSION), PREVIEW_PNG_COMPRESSION],
+    )
+    if not ok:
+        raise HTTPException(status_code=500, detail="encode_failed")
+    return bytes(buf)
 
 
 def _render_warp_preview_image(
@@ -693,13 +721,17 @@ async def renderMockup(
             detail={"error": "render_failed", "message": str(exc), "request_id": request_id},
         ) from exc
 
+    # Persist result in background if the design came from a URL
+    if design_url:
+        asyncio.create_task(persistRenderResult(design_url, image_bytes, output_format))
+
     return Response(
         content=image_bytes,
-        media_type=meta["content_type"],
+        media_type=meta['content_type'],
         headers={
-            "X-Processing-Time-Ms": str(meta["processing_time_ms"]),
-            "X-Template-Id": template_id,
-            "X-Request-Id": request_id,
+            'X-Processing-Time-Ms': str(meta['processing_time_ms']),
+            'X-Template-Id': template_id,
+            'X-Request-Id': request_id,
         },
     )
 
@@ -818,25 +850,29 @@ async def renderAdhoc(
                 config=config,
             )
 
-        image_bytes, meta = await asyncio.to_thread(run_pipeline, design_bytes, assets, output_format, 90)
+        image_bytes, meta = await asyncio.to_thread(run_pipeline, design_bytes, assets, output_format, 90, False)
+
+        # Persist result in background if the design came from a URL
+        if design_url:
+            asyncio.create_task(persistRenderResult(design_url, image_bytes, output_format))
 
         return Response(
             content=image_bytes,
-            media_type=meta["content_type"],
+            media_type=meta['content_type'],
             headers={
-                "X-Processing-Time-Ms": str(meta["processing_time_ms"]),
-                "X-Template-Id": "adhoc",
-                "X-Request-Id": request_id,
+                'X-Processing-Time-Ms': str(meta['processing_time_ms']),
+                'X-Template-Id': 'adhoc',
+                'X-Request-Id': request_id,
             },
         )
     except Exception as exc:
         import traceback
 
-        logger = logging.getLogger("mockup_service")
-        logger.error(f"Render-adhoc failed: {traceback.format_exc()}")
+        logger = logging.getLogger('mockup_service')
+        logger.error(f'Render-adhoc failed: {traceback.format_exc()}')
         raise HTTPException(
             status_code=400,
-            detail={"error": "render_failed", "message": str(exc), "request_id": request_id},
+            detail={'error': 'render_failed', 'message': str(exc), 'request_id': request_id},
         ) from exc
 
 
@@ -853,11 +889,91 @@ async def renderWarpPreview(req: WarpPreviewRequest):
         mesh_density_strength=req.mesh_density_strength,
     )
     warped = _render_warp_preview_image(req, design_canvas)
+    return Response(content=_encode_preview_png(warped), media_type="image/png", headers={"Cache-Control": "no-cache"})
 
-    ok, buf = cv2.imencode(".png", warped)
-    if not ok:
-        raise HTTPException(status_code=500, detail="encode_failed")
-    return Response(content=bytes(buf), media_type="image/png", headers={"Cache-Control": "no-cache"})
+
+@router.post('/mockup/render-async-adhoc')
+async def render_adhoc_async(
+    mockup_image: Optional[UploadFile] = File(None),
+    design_image: Optional[UploadFile] = File(None),
+    mockup_url: Optional[str] = Form(None),
+    design_url: Optional[str] = Form(None),
+    config_json: str = Form(None),
+    output_format: str = Form('png'),
+):
+    request_id = f"req_{uuid.uuid4().hex[:8]}"
+    try:
+        if mockup_image:
+            mockup_bytes = await mockup_image.read()
+        elif mockup_url:
+            p = resolve_local_asset_path(mockup_url)
+            if not p.exists():
+                raise HTTPException(status_code=400, detail=f"Mockup URL {mockup_url} not found")
+            mockup_bytes = p.read_bytes()
+        else:
+            raise HTTPException(status_code=400, detail="Missing mockup_image or mockup_url")
+
+        if design_image:
+            design_bytes = await design_image.read()
+        elif design_url:
+            p = resolve_local_asset_path(design_url)
+            if not p.exists():
+                raise HTTPException(status_code=400, detail=f"Design URL {design_url} not found")
+            design_bytes = p.read_bytes()
+        else:
+            raise HTTPException(status_code=400, detail="Missing design_image or design_url")
+
+        import json as _json
+        try:
+            cfg = _json.loads(config_json) if config_json else {}
+        except Exception:
+            cfg = {}
+
+        # Keep async adhoc render config identical to synchronous /render-adhoc:
+        # normalize user payload into full pipeline config before enqueue.
+        mockup_buf = np.frombuffer(mockup_bytes, dtype=np.uint8)
+        mockup = cv2.imdecode(mockup_buf, cv2.IMREAD_COLOR)
+        if mockup is None:
+            raise HTTPException(status_code=400, detail="invalid_mockup")
+        mh, mw = mockup.shape[:2]
+        effective_cfg = _build_default_adhoc_config(mw, mh)
+        effective_cfg = _merge_adhoc_user_config(
+            effective_cfg,
+            _json.dumps(cfg) if cfg else None,
+        )
+
+        job_id = enqueue_adhoc_render(design_bytes, mockup_bytes, effective_cfg, output_format=output_format)
+        return {"job_id": job_id, "request_id": request_id, "status": "queued"}
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail={'error': 'enqueue_failed', 'message': str(exc), 'request_id': request_id}) from exc
+
+
+@router.get('/mockup/render-status/{job_id}')
+async def render_status(job_id: str):
+    job = get_job(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail={'error': 'not_found'})
+    res = {
+        'id': job['id'],
+        'status': job.get('status'),
+        'phase': job.get('phase'),
+        'created_at': job.get('created_at'),
+        'updated_at': job.get('updated_at'),
+        'error': job.get('error'),
+        'result': {},
+    }
+    if job.get('result'):
+        final = job['result'].get('final_path')
+        preview = job['result'].get('preview_path')
+        if preview:
+            res['result']['preview_url'] = f"/static/renders/{Path(preview).name}"
+        if final:
+            res['result']['final_url'] = f"/static/renders/{Path(final).name}"
+        res['result']['content_type'] = job['result'].get('content_type')
+        res['result']['processing_time_ms'] = job['result'].get('processing_time_ms')
+    return res
 
 
 @router.post("/mockup/warp-preview-file")
@@ -869,17 +985,14 @@ async def renderWarpPreviewFile(
         payload = json.loads(config_json)
         req = WarpPreviewRequest(**payload)
         design_bytes = await design_image.read()
-        design_canvas = decode_design(design_bytes)
+        design_canvas = decode_design_preview(design_bytes)
         warped = _render_warp_preview_image(req, design_canvas)
     except HTTPException:
         raise
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    ok, buf = cv2.imencode(".png", warped)
-    if not ok:
-        raise HTTPException(status_code=500, detail="encode_failed")
-    return Response(content=bytes(buf), media_type="image/png", headers={"Cache-Control": "no-cache"})
+    return Response(content=_encode_preview_png(warped), media_type="image/png", headers={"Cache-Control": "no-cache"})
 
 
 @router.post("/mockup/warp-preview-adhoc")
@@ -900,7 +1013,7 @@ async def renderWarpPreviewAdhoc(
 
         if design_image is not None:
             design_bytes = await design_image.read()
-            design_canvas = decode_design(design_bytes)
+            design_canvas = decode_design_preview(design_bytes)
         else:
             canvas_w, canvas_h = estimate_print_area_canvas_size(
                 req.print_area,
@@ -919,13 +1032,10 @@ async def renderWarpPreviewAdhoc(
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    ok, buf = cv2.imencode(".png", warped)
+    png_bytes = _encode_preview_png(warped)
     del warped
     gc.collect()
-
-    if not ok:
-        raise HTTPException(status_code=500, detail="encode_failed")
-    return Response(content=bytes(buf), media_type="image/png", headers={"Cache-Control": "no-cache"})
+    return Response(content=png_bytes, media_type="image/png", headers={"Cache-Control": "no-cache"})
 
 
 @router.post("/mockup/detect-region")

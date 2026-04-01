@@ -7,8 +7,40 @@ from app.pipeline.shared.asset_manager import (
     get_tps_mesh_cache,
     set_tps_mesh_cache
 )
+from typing import Any
+
+try:
+    from app.pipeline.mugs.mesh_migration import migrate_4x4_to_dense
+    from app.pipeline.mugs.mesh_config import MugMeshConfig
+except Exception:
+    migrate_4x4_to_dense = None
+    MugMeshConfig = None
 
 def load_template(slug: str, record: dict):
+    """Load template assets; migrate old 4x4 mesh configs to dense mesh automatically."""
+    cfg: dict[str, Any] = record.get('config', {}) if isinstance(record, dict) else {}
+    # Detect legacy 4x4 grid: points list of length 25 (5x5)
+    try:
+        pts = cfg.get('points')
+        if migrate_4x4_to_dense and isinstance(pts, list) and len(pts) == 25:
+            new_cfg = migrate_4x4_to_dense({'cols': 4, 'rows': 4, 'points': pts})
+            # attach new mesh under cfg['mesh'] for backward compatibility
+            mesh_payload = {
+                'enabled': True,
+                'cols': new_cfg.cols,
+                'rows': new_cfg.rows,
+                'spacing': new_cfg.spacing,
+                'tension': new_cfg.tension,
+                'corner_blend_radius': new_cfg.corner_blend_radius,
+                'symmetry_lock': new_cfg.symmetry_lock,
+                'max_displacement': new_cfg.max_displacement,
+                'points': [[p.u, p.v, bool(p.locked)] for p in new_cfg.points],
+            }
+            cfg['mesh'] = mesh_payload
+            record['config'] = cfg
+    except Exception:
+        pass
+
     return load_template_assets(slug, record)
 
 def get(slug: str):

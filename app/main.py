@@ -9,7 +9,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-from app.routers import render, admin
+from app.routers import render, admin, resolve
 
 logger = logging.getLogger('mockup_service')
 logging.basicConfig(level=logging.INFO)
@@ -62,6 +62,80 @@ async def lifespan(app: FastAPI):
             except Exception as e:
                 logger.warning(f'Failed to load template {t.slug}: {e}')
 
+            # Warm-up: precompute cylindrical warp maps for mug templates
+            try:
+                assets = template_registry.get(t.slug)
+                if assets is not None and assets.config.get('product_type', 'mug') == 'mug':
+                    from app.pipeline.mugs.cylindrical_warp import _compute_and_cache_cylindrical_map
+                    from app.pipeline.shared.design_transform import estimate_print_area_canvas_size
+
+                    canvas_w, canvas_h = estimate_print_area_canvas_size(
+                        assets.config.get('print_area'),
+                        fallback_width=assets.mockup.shape[1],
+                        fallback_height=assets.mockup.shape[0],
+                    )
+                    cyl = assets.config.get('cylinder', {})
+                    try:
+                        _compute_and_cache_cylindrical_map(
+                            print_area=assets.config.get('print_area', {}),
+                            output_size=(assets.mockup.shape[1], assets.mockup.shape[0]),
+                            design_size=(canvas_w, canvas_h),
+                            theta_max_deg=cyl.get('theta_max_deg', 52.0),
+                            pitch=cyl.get('pitch', 0.0),
+                            smile_base=cyl.get('smile_base', 0.08),
+                            curve_top=cyl.get('curve_top'),
+                            curve_bottom=cyl.get('curve_bottom'),
+                            edge_squeeze=cyl.get('edge_squeeze', 0.0),
+                            squeeze_power=cyl.get('squeeze_power', 2.0),
+                            center_focus_width=cyl.get('center_focus_width', 0.0),
+                            reference_mockup=assets.mockup,
+                            curve_correction_alpha=cyl.get('curve_correction_alpha', 0.0),
+                            curve_snap_threshold_px=cyl.get('curve_snap_threshold_px', 2.0),
+                        )
+                        logger.info(f'Warmed warp maps for template: {t.slug}')
+                    except Exception as e:
+                        logger.info(f'Could not warm warp maps for {t.slug}: {e}')
+            except Exception:
+                pass
+
+        # Warm-up mesh-based warp maps for templates that provide mesh config
+        try:
+            from app.pipeline.mugs.warp_cache import WarpMapRegistry
+            from app.pipeline.mugs.mesh_config import MugMeshConfig, MeshPoint
+
+            sku_configs = {}
+            for t in templates:
+                try:
+                    assets = template_registry.get(t.slug)
+                    if not assets:
+                        continue
+                    mesh_cfg = assets.config.get('mesh', {})
+                    if isinstance(mesh_cfg, dict) and mesh_cfg.get('enabled', False):
+                        mcfg = MugMeshConfig(
+                            cols=int(mesh_cfg.get('cols', 12)),
+                            rows=int(mesh_cfg.get('rows', 8)),
+                            spacing=str(mesh_cfg.get('spacing', 'cosine')),
+                            tension=float(mesh_cfg.get('tension', 0.35)),
+                            corner_blend_radius=float(mesh_cfg.get('corner_blend_radius', 0.08)),
+                            symmetry_lock=bool(mesh_cfg.get('symmetry_lock', True)),
+                            max_displacement=float(mesh_cfg.get('max_displacement', 0.15)),
+                        )
+                        pts = mesh_cfg.get('points')
+                        if isinstance(pts, list) and len(pts) == (mcfg.rows + 1) * (mcfg.cols + 1):
+                            mcfg.points = [MeshPoint(u=float(p[0]), v=float(p[1]), locked=bool(p[2]) if len(p) > 2 else False) for p in pts]
+                        sku_configs[t.slug] = mcfg
+                except Exception:
+                    continue
+
+            if sku_configs:
+                try:
+                    WarpMapRegistry().warmup(sku_configs)
+                    logger.info(f'Started mesh warp warmup for {len(sku_configs)} templates')
+                except Exception as e:
+                    logger.warning(f'Failed to start mesh warp warmup: {e}')
+        except Exception:
+            pass
+
         logger.info(f'Loaded {loaded}/{len(templates)} templates')
     except Exception as e:
         logger.warning(f'Could not load templates from DB: {e}')
@@ -106,6 +180,8 @@ if os.path.exists('inputs/artworks'):
     app.mount('/static/artworks', StaticFiles(directory='inputs/artworks'), name='artworks')
 if os.path.exists('public/mockups'):
     app.mount('/static/mockups', StaticFiles(directory='public/mockups'), name='mockups')
+os.makedirs('output/renders', exist_ok=True)
+app.mount('/static/renders', StaticFiles(directory='output/renders'), name='renders')
 
 from fastapi import Request
 import time
@@ -120,6 +196,7 @@ async def log_requests(request: Request, call_next):
 
 # Routers
 app.include_router(render.router, prefix='/v1')
+app.include_router(resolve.router, prefix='/v1')
 app.include_router(admin.router, prefix='/admin')
 
 

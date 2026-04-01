@@ -117,3 +117,9 @@ class TemplateSaveAdhoc(BaseModel):
 
 class UrlAnalysisImportRequest(BaseModel):
     source_url: str = Field(..., min_length=8, max_length=2000)
+
+class UrlResolveResponse(BaseModel):
+    found: bool
+    url: Optional[str] = None
+    slug: Optional[str] = None
+    created_at: Optional[str] = None

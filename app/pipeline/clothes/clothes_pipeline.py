@@ -78,11 +78,17 @@ def run_clothes_pipeline(
                 print_area_cfg["bottom_left"],
             ]
         )
+        interpolation = cv2.INTER_LANCZOS4
+        if W <= 1000:
+            interpolation = cv2.INTER_LINEAR
+        elif W <= 2000:
+            interpolation = cv2.INTER_CUBIC
+
         base = cv2.warpPerspective(
             design,
             cv2.getPerspectiveTransform(src_rect, quad),
             (W, H),
-            flags=cv2.INTER_LANCZOS4,
+            flags=interpolation,
             borderMode=cv2.BORDER_CONSTANT,
             borderValue=(0, 0, 0, 0),
         )
@@ -107,11 +113,17 @@ def run_clothes_pipeline(
                     print_area_cfg["bottom_left"],
                 ]
             )
+            interpolation = cv2.INTER_LANCZOS4
+            if W <= 1000:
+                interpolation = cv2.INTER_LINEAR
+            elif W <= 2000:
+                interpolation = cv2.INTER_CUBIC
+
             warped = cv2.warpPerspective(
                 design,
                 cv2.getPerspectiveTransform(src_rect, quad),
                 (W, H),
-                flags=cv2.INTER_LANCZOS4,
+                flags=interpolation,
                 borderMode=cv2.BORDER_CONSTANT,
                 borderValue=(0, 0, 0, 0),
             )

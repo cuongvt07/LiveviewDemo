@@ -51,7 +51,13 @@ def tps_warp_design(
     map_x = np.clip(mapped[:, :, 0], 0, dw - 1)
     map_y = np.clip(mapped[:, :, 1], 0, dh - 1)
 
+    interpolation = cv2.INTER_LANCZOS4
+    if W <= 1000:
+        interpolation = cv2.INTER_LINEAR
+    elif W <= 2000:
+        interpolation = cv2.INTER_CUBIC
+
     return gpuRemap(
         design, map_x, map_y,
-        interpolation=cv2.INTER_LANCZOS4,
+        interpolation=interpolation,
     )

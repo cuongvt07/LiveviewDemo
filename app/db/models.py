@@ -88,3 +88,15 @@ class TemplateConfigHistory(Base):
         'Template',
         back_populates='config_history',
     )
+
+class RenderedResult(Base):
+    __tablename__ = 'rendered_results'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    url_slug = Column(String(500), nullable=False, index=True)
+    image_path = Column(String(500), nullable=False)
+    created_at = Column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        index=True
+    )

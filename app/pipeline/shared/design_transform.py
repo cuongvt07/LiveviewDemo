@@ -80,11 +80,17 @@ def apply_design_transform(
     ty = ((dst_h - scaled_h) * 0.5) + (offset_y * overflow_y * 0.5)
     mat = np.array([[total_scale, 0.0, tx], [0.0, total_scale, ty]], dtype=np.float32)
 
+    interpolation = cv2.INTER_LANCZOS4
+    if dst_w <= 1000:
+        interpolation = cv2.INTER_LINEAR
+    elif dst_w <= 2000:
+        interpolation = cv2.INTER_CUBIC
+
     return cv2.warpAffine(
         design,
         mat,
         (dst_w, dst_h),
-        flags=cv2.INTER_LANCZOS4,
+        flags=interpolation,
         borderMode=cv2.BORDER_CONSTANT,
         borderValue=(0, 0, 0, 0),
     )

@@ -1,4 +1,5 @@
 import { useState, useEffect } from 'react'
+import t from '../i18n/translate'
 
 export default function TemplateManager() {
   const [templates, setTemplates] = useState<any[]>([])
@@ -33,7 +34,7 @@ export default function TemplateManager() {
   };
 
   const handleRollback = (slug: string, historyId: number) => {
-    if (!window.confirm(`Rollback template ${slug} to version #${historyId}?`)) return;
+    if (!window.confirm(t('template_manager.rollback_confirm', { slug, id: historyId }))) return;
     
     fetch(`/v1/templates/${slug}/rollback/${historyId}`, {
       method: 'POST',
@@ -52,10 +53,10 @@ export default function TemplateManager() {
     <div style={{ height: '100%', display: 'flex', flexDirection: 'column' }}>
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '2rem' }}>
         <div>
-          <h2 style={{ margin: 0, fontSize: '1.5rem' }}>Active Templates</h2>
-          <p style={{ margin: '0.5rem 0 0', color: 'var(--text-secondary)' }}>Quản lý và cấu hình các template 3D (Cốc, Áo, v.v)</p>
+          <h2 style={{ margin: 0, fontSize: '1.5rem' }}>{t('template_manager.title')}</h2>
+          <p style={{ margin: '0.5rem 0 0', color: 'var(--text-secondary)' }}>{t('template_manager.description')}</p>
         </div>
-        <button className="btn btn-primary">+ Add Template</button>
+        <button className="btn btn-primary">{t('template_manager.add_button')}</button>
       </div>
 
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(300px, 1fr))', gap: '1.5rem' }}>
@@ -73,12 +74,12 @@ export default function TemplateManager() {
             }}></div>
             <h3 style={{ margin: '0 0 0.5rem', fontSize: '1.125rem' }}>{t.name}</h3>
             <div style={{ fontSize: '0.875rem', color: 'var(--text-secondary)', marginBottom: '1rem' }}>
-              Slug: {t.id} <br />
-              Size: {t.output_size[0]}x{t.output_size[1]}
+              {t('template_manager.slug')} {t.id} <br />
+              {t('template_manager.size')} {t.output_size[0]}x{t.output_size[1]}
             </div>
             <div style={{ display: 'flex', gap: '0.5rem' }}>
-               <button className="btn btn-outline" style={{ flex: 1, padding: '0.5rem' }}>Config</button>
-               <button className="btn btn-outline" style={{ flex: 1, padding: '0.5rem' }} onClick={() => showHistory(t.id)}>History</button>
+               <button className="btn btn-outline" style={{ flex: 1, padding: '0.5rem' }}>{t('template_manager.config')}</button>
+               <button className="btn btn-outline" style={{ flex: 1, padding: '0.5rem' }} onClick={() => showHistory(t.id)}>{t('template_manager.history')}</button>
             </div>
           </div>
         ))}
@@ -90,12 +91,12 @@ export default function TemplateManager() {
           }}>
             <div className="glass-panel" style={{ width: '500px', maxHeight: '80vh', overflowY: 'auto', padding: '1.5rem' }}>
               <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '1rem' }}>
-                <h3 style={{ margin: 0 }}>Config History: {selectedHistory.slug}</h3>
+                <h3 style={{ margin: 0 }}>{t('template_manager.modal_title', { slug: selectedHistory.slug })}</h3>
                 <button className="btn-mini" onClick={() => setSelectedHistory(null)}>✕</button>
               </div>
               <div style={{ display: 'flex', flexDirection: 'column', gap: '0.75rem' }}>
                 {loadingHistory ? (
-                  <p>Loading history...</p>
+                  <p>{t('template_manager.loading_history')}</p>
                 ) : (
                   <>
                     {selectedHistory.history.map((h: any) => (
@@ -104,11 +105,11 @@ export default function TemplateManager() {
                           <span style={{ color: '#60a5fa' }}>#{h.id}</span>
                           <span style={{ color: '#666' }}>{new Date(h.changed_at).toLocaleString()}</span>
                         </div>
-                        <div style={{ fontSize: '0.9rem', marginBottom: '8px' }}>{h.change_note || 'No note'}</div>
-                        <button className="btn btn-mini" style={{ width: '100%' }} onClick={() => handleRollback(selectedHistory.slug, h.id)}>Rollback to this</button>
+                        <div style={{ fontSize: '0.9rem', marginBottom: '8px' }}>{h.change_note || t('template_manager.no_note')}</div>
+                        <button className="btn btn-mini" style={{ width: '100%' }} onClick={() => handleRollback(selectedHistory.slug, h.id)}>{t('template_manager.rollback_button')}</button>
                       </div>
                     ))}
-                    {selectedHistory.history.length === 0 && <p>No history found.</p>}
+                    {selectedHistory.history.length === 0 && <p>{t('template_manager.no_history')}</p>}
                   </>
                 )}
               </div>
@@ -117,7 +118,7 @@ export default function TemplateManager() {
         )}
         {templates.length === 0 && (
           <div className="glass-panel" style={{ padding: '2rem', textAlign: 'center', gridColumn: '1 / -1' }}>
-            <p style={{ color: 'var(--text-secondary)' }}>Chưa có template nào được active.</p>
+            <p style={{ color: 'var(--text-secondary)' }}>{t('template_manager.no_templates')}</p>
           </div>
         )}
       </div>

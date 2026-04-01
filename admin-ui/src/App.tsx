@@ -1,5 +1,6 @@
 import { useState } from 'react'
 import { Monitor, FileImage, LayoutTemplate, Zap, Menu, ChevronLeft, ChevronRight } from 'lucide-react'
+import t from './i18n/translate'
 import LivePreview from './components/LivePreview'
 import TemplateManager from './components/TemplateManager'
 
@@ -22,11 +23,11 @@ function App() {
             <div style={{ background: 'var(--accent-color)', padding: '0.5rem', borderRadius: '8px' }}>
               <Zap size={20} color="white" />
             </div>
-            <h1 style={{ margin: 0, fontSize: '1.25rem', fontWeight: 600 }}>POD Liveview Admin</h1>
+            <h1 style={{ margin: 0, fontSize: '1.25rem', fontWeight: 600 }}>{t('app.title')}</h1>
           </div>
         </div>
         <div style={{ fontSize: '0.875rem', color: 'var(--text-secondary)' }}>
-          Mug Mockup Service v1.2
+          {t('app.version', { version: '1.2' })}
         </div>
       </header>
 
@@ -36,24 +37,24 @@ function App() {
             <div 
               className={`nav-link ${activeTab === 'preview' ? 'active' : ''}`}
               onClick={() => setActiveTab('preview')}
-              title="Live Preview"
+              title={t('app.nav.preview')}
             >
-              <Monitor size={18} /> <span>Live Preview</span>
+              <Monitor size={18} /> <span>{t('app.nav.preview')}</span>
             </div>
             <div 
               className={`nav-link ${activeTab === 'templates' ? 'active' : ''}`}
               onClick={() => setActiveTab('templates')}
-              title="Templates"
+              title={t('app.nav.templates')}
             >
-              <LayoutTemplate size={18} /> <span>Templates</span>
+              <LayoutTemplate size={18} /> <span>{t('app.nav.templates')}</span>
             </div>
             <div 
               className={`nav-link ${activeTab === 'assets' ? 'active' : ''}`}
               onClick={() => setActiveTab('assets')}
-              title="Maps Editor (Dev)"
+              title={t('app.nav.maps_editor')}
               style={{ opacity: 0.5, pointerEvents: 'none' }}
             >
-              <FileImage size={18} /> <span>Maps Editor (Dev)</span>
+              <FileImage size={18} /> <span>{t('app.nav.maps_editor')}</span>
             </div>
           </nav>
 

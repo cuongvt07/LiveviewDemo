@@ -8,6 +8,8 @@ from ..shared.decode import decode_design
 from ..shared.design_transform import apply_design_transform, estimate_print_area_canvas_size
 from ..shared.smooth_mesh_warp import apply_smooth_mesh_warp
 from .cylindrical_warp import cylindrical_warp
+from .renderer import render_mug_final, render_mug_preview
+from .mesh_config import MugMeshConfig
 from .lighting_extract import (
     build_cylinder_surface_maps,
     build_light_direction,
@@ -20,7 +22,7 @@ from .lighting_extract import (
     normalize_masked_field,
 )
 from .shadow_overlay import apply_shadow_overlay
-from .specular_gloss import apply_specular_gloss
+from .specular_gloss import apply_specular_gloss, apply_mug_lighting
 
 
 @dataclass
@@ -70,23 +72,67 @@ def run_mug_pipeline(
         target_height=canvas_h,
     )
 
-    cyl = cfg.get("cylinder", {})
-    warped = cylindrical_warp(
-        design,
-        print_area=cfg["print_area"],
-        output_size=(out_w, out_h),
-        reference_mockup=assets.mockup,
-        theta_max_deg=cyl.get("theta_max_deg", 52.0),
-        pitch=cyl.get("pitch", 0.0),
-        smile_base=cyl.get("smile_base", 0.08),
-        curve_top=cyl.get("curve_top"),
-        curve_bottom=cyl.get("curve_bottom"),
-        edge_squeeze=cyl.get("edge_squeeze", 0.0),
-        squeeze_power=cyl.get("squeeze_power", 2.0),
-        center_focus_width=cyl.get("center_focus_width", 0.0),
-        curve_correction_alpha=cyl.get("curve_correction_alpha", 0.0),
-        curve_snap_threshold_px=cyl.get("curve_snap_threshold_px", 2.0),
-    )
+    # If template provides a dense mesh config, prefer mesh-based warp renderer.
+    mesh_cfg = cfg.get("mesh", {})
+    if isinstance(mesh_cfg, dict) and mesh_cfg.get("enabled", False):
+        try:
+            mcfg = MugMeshConfig(
+                cols=int(mesh_cfg.get("cols", 12)),
+                rows=int(mesh_cfg.get("rows", 8)),
+                spacing=str(mesh_cfg.get("spacing", "cosine")),
+                tension=float(mesh_cfg.get("tension", 0.35)),
+                corner_blend_radius=float(mesh_cfg.get("corner_blend_radius", 0.08)),
+                symmetry_lock=bool(mesh_cfg.get("symmetry_lock", True)),
+                max_displacement=float(mesh_cfg.get("max_displacement", 0.15)),
+            )
+            # If points provided, override
+            pts = mesh_cfg.get("points")
+            if isinstance(pts, list) and len(pts) == (mcfg.rows + 1) * (mcfg.cols + 1):
+                from .mesh_config import MeshPoint
+                mcfg.points = [
+                    MeshPoint(u=float(p[0]), v=float(p[1]), locked=bool(p[2]) if len(p) > 2 else False)
+                    for p in pts
+                ]
+
+            # Use full renderer for final output
+            warped = render_mug_final(design, mcfg, out_w=out_w, out_h=out_h)
+        except Exception:
+            # fallback to cylindrical
+            cyl = cfg.get("cylinder", {})
+            warped = cylindrical_warp(
+                design,
+                print_area=cfg["print_area"],
+                output_size=(out_w, out_h),
+                reference_mockup=assets.mockup,
+                theta_max_deg=cyl.get("theta_max_deg", 52.0),
+                pitch=cyl.get("pitch", 0.0),
+                smile_base=cyl.get("smile_base", 0.08),
+                curve_top=cyl.get("curve_top"),
+                curve_bottom=cyl.get("curve_bottom"),
+                edge_squeeze=cyl.get("edge_squeeze", 0.0),
+                squeeze_power=cyl.get("squeeze_power", 2.0),
+                center_focus_width=cyl.get("center_focus_width", 0.0),
+                curve_correction_alpha=cyl.get("curve_correction_alpha", 0.0),
+                curve_snap_threshold_px=cyl.get("curve_snap_threshold_px", 2.0),
+            )
+    else:
+        cyl = cfg.get("cylinder", {})
+        warped = cylindrical_warp(
+            design,
+            print_area=cfg["print_area"],
+            output_size=(out_w, out_h),
+            reference_mockup=assets.mockup,
+            theta_max_deg=cyl.get("theta_max_deg", 52.0),
+            pitch=cyl.get("pitch", 0.0),
+            smile_base=cyl.get("smile_base", 0.08),
+            curve_top=cyl.get("curve_top"),
+            curve_bottom=cyl.get("curve_bottom"),
+            edge_squeeze=cyl.get("edge_squeeze", 0.0),
+            squeeze_power=cyl.get("squeeze_power", 2.0),
+            center_focus_width=cyl.get("center_focus_width", 0.0),
+            curve_correction_alpha=cyl.get("curve_correction_alpha", 0.0),
+            curve_snap_threshold_px=cyl.get("curve_snap_threshold_px", 2.0),
+        )
 
     mesh_src = cfg.get("print_area", {}).get("mesh_control_src")
     mesh_dst = cfg.get("print_area", {}).get("mesh_control_dst")
@@ -189,39 +235,21 @@ def run_mug_pipeline(
         0.28 + 0.72 * lighting_map,
         0.0,
     ).astype(np.float32)
-    del photo_lighting, extracted_lighting
 
-    shadow_strength = float(lighting_cfg.get("shadow_strength", 0.45))
-    if (not preserve_original_color) and shadow_strength > 0:
-        warped = apply_shadow_overlay(
-            warped,
-            lighting_map,
-            strength=shadow_strength,
-        )
-
-    result = composite(
-        assets.mockup,
-        warped,
-        assets.mask,
-        feather_px=cfg.get("edge", {}).get("feather_px", 6),
-    )
-
+    # Precompute specular/highlight maps early so we can apply them to the warped
+    # design before compositing. This separates diffuse (multiply) and specular
+    # (additive in linear space).
     specular_strength = float(lighting_cfg.get("specular_strength", 0.0))
+    highlight_map = None
     if (not preserve_original_color) and specular_strength > 0:
-        # Tái tạo lại extracted_lighting riêng cho highlight để hạn chế RAM đỉnh
-        extracted_lighting_hl = extract_masked_lighting(
-            assets.mockup,
-            lighting_mask,
-            blur_kernel=int(lighting_cfg.get("lighting_blur_kernel", 21)),
-        )
+        # Reuse extracted_lighting to build diffuse highlight map
         light_highlight = float(lighting_cfg.get("light_highlight", 60.0))
         highlight_t = np.clip(light_highlight / 100.0, 0.0, 1.0)
         diffuse_highlight = derive_highlight_map(
-            extracted_lighting_hl,
+            extracted_lighting,
             threshold=float(lighting_cfg.get("specular_threshold", 180)),
             blur_kernel=int(lighting_cfg.get("highlight_blur_kernel", 9)),
         )
-        del extracted_lighting_hl
         detail_highlight = extract_masked_highlight_detail(
             assets.mockup,
             lighting_mask,
@@ -242,11 +270,30 @@ def run_mug_pipeline(
             0.0,
             1.0,
         )
-        result = apply_specular_gloss(
-            result,
-            highlight_map,
-            strength=specular_strength * (0.25 + highlight_t * 1.1),
-            shininess=lighting_cfg.get("shininess", 20.0),
+
+    shadow_strength = float(lighting_cfg.get("shadow_strength", 0.45))
+    if (not preserve_original_color) and shadow_strength > 0:
+        warped = apply_shadow_overlay(
+            warped,
+            lighting_map,
+            strength=shadow_strength,
         )
+
+    # Apply separated mug lighting (diffuse * lighting_map + additive specular)
+    if (not preserve_original_color) and (highlight_map is not None):
+        warped = apply_mug_lighting(
+            warped,
+            light_map=lighting_map,
+            specular_mask=highlight_map,
+            specular_strength=specular_strength,
+            shininess=float(lighting_cfg.get("shininess", 20.0)),
+        )
+
+    result = composite(
+        assets.mockup,
+        warped,
+        assets.mask,
+        feather_px=cfg.get("edge", {}).get("feather_px", 6),
+    )
 
     return result
