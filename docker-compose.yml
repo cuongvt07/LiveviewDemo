@@ -9,7 +9,6 @@ services:
       - DATABASE_URL=postgresql+asyncpg://postgres:postgres@postgres:5432/mockup_service
       - ASSET_BASE_DIR=/app/templates
       - REDIS_URL=redis://redis:6379/0
-      - ADMIN_TOKEN=${ADMIN_TOKEN:-change-me-in-production}
       - RENDER_DEVICE=${RENDER_DEVICE:-cpu}
     volumes:
       - ./templates:/app/templates

@@ -48,7 +48,6 @@ router = APIRouter(tags=['admin'])
 logger = logging.getLogger('mockup_service')
 
 ASSET_BASE_DIR = os.getenv('ASSET_BASE_DIR', './templates')
-ADMIN_TOKEN = os.getenv('ADMIN_TOKEN', 'change-me-in-production')
 
 
 def _read_int_env(name: str, default: int) -> int:

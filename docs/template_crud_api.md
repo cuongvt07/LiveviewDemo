@@ -9,7 +9,7 @@ Mục tiêu: cung cấp tài liệu hướng dẫn để thêm API CRUD cho `Tem
 - `PUT /admin/templates/{slug}` — cập nhật config/ảnh/metadata
 - `DELETE /admin/templates/{slug}` — xóa template (mềm hoặc cứng)
 
-Tất cả endpoint admin phải bảo vệ bằng header `Authorization: Bearer <ADMIN_TOKEN>` (hiện dùng `verifyAdmin` trong `app/routers/admin.py`).
+
 
 ---
 
@@ -66,7 +66,7 @@ Tạo file: `app/routers/templates.py` hoặc thêm vào `app/routers/admin.py`.
   - mark record status='deleted' (soft delete) and/or remove files if hard
   - return 204 no-content
 
-All endpoints should call `verifyAdmin` header dependency.
+
 
 ---
 
@@ -78,14 +78,12 @@ When updating `config` that contains `print_area.mesh_control_*` ensure pixel co
 
 ---
 
-## 4. Example curl requests
-Replace `ADMIN_TOKEN` với token thực tế (env `ADMIN_TOKEN`).
+Example curl requests:
 
 Create (POST):
 
 ```bash
 curl -X POST "http://localhost:8040/admin/templates" \
-  -H "Authorization: Bearer $ADMIN_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{
     "slug":"my-mug-01",
@@ -99,26 +97,25 @@ curl -X POST "http://localhost:8040/admin/templates" \
 
 Get list:
 ```bash
-curl -H "Authorization: Bearer $ADMIN_TOKEN" "http://localhost:8040/admin/templates"
+curl "http://localhost:8040/admin/templates"
 ```
 
 Update (PUT):
 ```bash
 curl -X PUT "http://localhost:8040/admin/templates/my-mug-01" \
-  -H "Authorization: Bearer $ADMIN_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"name":"My Mug 01 v2","config": {"lighting": {"specular_strength":0.2}}}'
 ```
 
 Delete (soft):
 ```bash
-curl -X DELETE "http://localhost:8040/admin/templates/my-mug-01" -H "Authorization: Bearer $ADMIN_TOKEN"
+curl -X DELETE "http://localhost:8040/admin/templates/my-mug-01"
 ```
 
 ---
 
 ## 5. Implementation checklist (task list)
-- [ ] Add router `app/routers/templates.py` implementing endpoints above (use `verifyAdmin` dependency)
+- [ ] Add router `app/routers/templates.py` implementing endpoints above
 - [ ] Add `TemplateUpdate` schema to `app/schemas.py`
 - [ ] Add DB migrations if needed (depends on ORM setup; current models likely ok)
 - [ ] Add tests in `tests/test_templates_crud.py` (create/update/get/delete)
@@ -146,7 +143,6 @@ docker compose up -d --build api
 3. Call import URL endpoint with the CDN URL you provided:
 ```bash
 curl -X POST "http://localhost:8040/url-analysis/import" \
-  -H "Authorization: Bearer $ADMIN_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"source_url":"<your-url>"}'
 ```
@@ -155,7 +151,7 @@ curl -X POST "http://localhost:8040/url-analysis/import" \
 ---
 
 ## 8. Security & ACL
-- All admin CRUD endpoints must require `verifyAdmin` header.
+- Security: endpoints are currently public in development.
 - Validate/normalize user-supplied `config` with `_merge_adhoc_user_config` to avoid malformed print_area.
 
 ---
