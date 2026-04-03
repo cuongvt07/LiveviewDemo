@@ -100,3 +100,37 @@ def _sort_pts_clockwise(pts):
 def _fallback_center_quad(W, H):
     q = [[W//4, H//4], [W*3//4, H//4], [W*3//4, H*3//4], [W//4, H*3//4]]
     return {"shape_type": "flat", "quad": q, "clip_mask": q, "confidence": 0.1}
+
+
+def bake_normal_map(img_bgr: np.ndarray, fold_map: np.ndarray | None = None) -> np.ndarray:
+    """
+    Sinh normal map xấp xỉ từ ảnh BGR + fold map (tuỳ chọn).
+    Output: uint8 RGB normal map (X,Y,Z mapped to [0..255]).
+    """
+    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY).astype(np.float32) / 255.0
+
+    if fold_map is not None:
+        if fold_map.shape[:2] != gray.shape[:2]:
+            fold_map = cv2.resize(fold_map, (gray.shape[1], gray.shape[0]), interpolation=cv2.INTER_LINEAR)
+        height = gray * 0.65 + fold_map.astype(np.float32) * 0.35
+    else:
+        height = gray
+
+    gx = cv2.Sobel(height, cv2.CV_32F, 1, 0, ksize=3)
+    gy = cv2.Sobel(height, cv2.CV_32F, 0, 1, ksize=3)
+
+    nx = -gx
+    ny = -gy
+    nz = np.ones_like(height, dtype=np.float32)
+
+    norm = np.sqrt(nx * nx + ny * ny + nz * nz) + 1e-6
+    nx /= norm
+    ny /= norm
+    nz /= norm
+
+    normal = np.dstack([
+        ((nx * 0.5 + 0.5) * 255).astype(np.uint8),
+        ((ny * 0.5 + 0.5) * 255).astype(np.uint8),
+        ((nz * 0.5 + 0.5) * 255).astype(np.uint8),
+    ])
+    return normal

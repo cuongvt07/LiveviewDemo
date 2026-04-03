@@ -36,6 +36,8 @@ class Template(Base):
         default='draft',
     )  # 'draft' | 'active' | 'archived'
 
+    product_type = Column(String(20), nullable=False, default='mug')
+
     mockup_path     = Column(String(500), nullable=False)
     shadow_map_path = Column(String(500), nullable=True)
     normal_map_path = Column(String(500), nullable=True)
@@ -85,4 +87,16 @@ class TemplateConfigHistory(Base):
     template = relationship(
         'Template',
         back_populates='config_history',
+    )
+
+class RenderedResult(Base):
+    __tablename__ = 'rendered_results'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    url_slug = Column(String(500), nullable=False, index=True)
+    image_path = Column(String(500), nullable=False)
+    created_at = Column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        index=True
     )

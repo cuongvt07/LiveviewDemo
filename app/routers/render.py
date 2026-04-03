@@ -1,47 +1,776 @@
 # app/routers/render.py
 
-import uuid
 import asyncio
+import copy
+import json
+import logging
+import os
+import time
+import uuid
+from pathlib import Path
 from typing import Optional
-from fastapi import APIRouter, UploadFile, File, Form, HTTPException
-from fastapi.responses import Response
-from sqlalchemy import select
-from pydantic import BaseModel
 
+import cv2
+import numpy as np
+from fastapi import APIRouter, BackgroundTasks, File, Form, HTTPException, Request, UploadFile
+from fastapi.responses import Response
+from pydantic import BaseModel
+from sqlalchemy import select
+
+from app.config import getRenderDevice, isGpuEnabled, setRenderDevice
 from app.db.database import async_session
 from app.db.models import Template
+from app.pipeline.clothes.clothes_pipeline import ClothesAssets
+from app.pipeline.mugs.cylinder_math import summarize_horizontal_squeeze
+from app.pipeline.mugs.mug_pipeline import MugAssets
+from app.pipeline.mugs.specular_gloss import extract_specular_from_mockup
 from app.pipeline.pipeline import run_pipeline
+from app.pipeline.shared.decode import decode_design, decode_design_preview
+from app.pipeline.shared.design_transform import apply_design_transform, estimate_print_area_canvas_size
+from app.pipeline.mugs.cylindrical_warp import cylindrical_warp, compute_and_cache_cylindrical_map
+from app.pipeline.shared.liveview_cache import (
+    get_cylindrical_map_cache,
+    make_cylindrical_map_cache_key,
+    set_cylindrical_map_cache,
+    get_preview_canvas_cache,
+    make_preview_canvas_cache_key,
+    set_preview_canvas_cache,
+)
+from app.pipeline.shared.smooth_mesh_warp import apply_smooth_mesh_warp
 from app.services import template_registry
-from app.pipeline.warp import perspective_from_camera_angle, cylinder_warp, tps_warp
-from app.services.vision import auto_detect_print_area_v2, create_soft_mask
-from app.pipeline.lighting import composite_with_surface_lighting
+from app.services.render_persist import persistRenderResult
+from app.services.url_analysis import resolve_local_asset_path
+from app.services.vision import auto_detect_print_area_v2, bake_normal_map, create_soft_mask
+from app.services.render_queue import enqueue_adhoc_render, get_job
 
-router = APIRouter(tags=['render'])
+router = APIRouter(tags=["render"])
+
+GRID_CELL_PX = 90
+MIN_GRID_DIVS = 4
+MAX_GRID_DIVS = 24
+DEFAULT_MESH_DENSITY_STRENGTH = 2.0
+DEFAULT_CURVE_CORRECTION_ALPHA = 0.7
+DEFAULT_CURVE_SNAP_THRESHOLD_PX = 2.0
+PREVIEW_PNG_COMPRESSION = 1
 
 
-@router.post('/mockup/render')
+def _force_jpeg_output_format(requested_format: str | None) -> str:
+    normalized = str(requested_format or "").strip().lower()
+    if normalized not in {"jpg", "jpeg"}:
+        logging.getLogger("mockup_service").info(
+            "Coerce output_format '%s' -> 'jpg' for lightweight output",
+            requested_format,
+        )
+    return "jpg"
+
+
+def _log_horizontal_squeeze_debug(
+    source: str,
+    theta_max_deg: float,
+    edge_squeeze: float,
+    squeeze_power: float,
+    center_focus_width: float,
+) -> None:
+    logger = logging.getLogger("mockup_service")
+    debug = summarize_horizontal_squeeze(
+        theta_max_deg=theta_max_deg,
+        edge_squeeze=edge_squeeze,
+        squeeze_power=squeeze_power,
+        center_focus_width=center_focus_width,
+    )
+    logger.info(
+        "%s horizontal squeeze debug: edge_squeeze=%s squeeze_power=%s center_focus_width=%s active=%s mode=%s inactive_reason=%s sample_in=%s sample_out=%s sample_delta=%s",
+        source,
+        edge_squeeze,
+        squeeze_power,
+        center_focus_width,
+        debug["active"],
+        debug["mode"],
+        debug["inactive_reason"],
+        debug["sample_in"],
+        debug["sample_out"],
+        debug["sample_delta"],
+    )
+
+
+import gc
+
+
+class WarpPreviewRequest(BaseModel):
+    mockup_width: int
+    mockup_height: int
+    print_area: dict
+    warp_type: str = "cylinder"
+    theta_max_deg: float = 52.0
+    curve: float = 0.0
+    curve_top: Optional[float] = None
+    curve_bottom: Optional[float] = None
+    edge_squeeze: float = 0.0
+    squeeze_power: float = 2.0
+    center_focus_width: float = 0.0
+    mesh_density_strength: float = DEFAULT_MESH_DENSITY_STRENGTH
+    curve_correction_alpha: float = DEFAULT_CURVE_CORRECTION_ALPHA
+    curve_snap_threshold_px: float = DEFAULT_CURVE_SNAP_THRESHOLD_PX
+    design_scale: float = 1.0
+    design_offset_x: float = 0.0
+    design_offset_y: float = 0.0
+    design_fit_mode: str = "cover"
+    mask_points: Optional[list[list[int]]] = None
+    template_id: Optional[str] = None
+
+
+class WarpPrefetchRequest(BaseModel):
+    warp_params: dict
+    img_shape: tuple[int, int]
+    mockup_id: Optional[str] = None
+
+
+_warp_prefetch_inflight: set = set()
+
+
+class RenderDeviceRequest(BaseModel):
+    device: str
+
+
+def _resolve_product_type(raw_product_type: Optional[str], warp_type: str, has_manual_mesh: bool) -> str:
+    if isinstance(raw_product_type, str):
+        lowered = raw_product_type.lower()
+        if lowered.startswith("apparel"):
+            return "clothes"
+        if lowered in {"clothes", "tshirt", "hoodie", "tote"}:
+            return "clothes"
+        if lowered in {"mug", "cylinder_ceramic", "cylinder_glass", "cylinder_travel"}:
+            return "mug"
+    if warp_type == "tps":
+        return "clothes"
+    return "mug"
+
+
+def _build_default_adhoc_config(width: int, height: int) -> dict:
+    mx, my = int(width * 0.22), int(height * 0.14)
+    return {
+        "product_type": "mug",
+        "cylinder": {
+            "theta_max_deg": 52.0,
+            "smile_base": 0.08,
+            "pitch": 0.0,
+            "curve_top": None,
+            "curve_bottom": None,
+            "edge_squeeze": 0.0,
+            "squeeze_power": 2.0,
+            "center_focus_width": 0.0,
+            "mesh_density_strength": DEFAULT_MESH_DENSITY_STRENGTH,
+            "curve_correction_alpha": DEFAULT_CURVE_CORRECTION_ALPHA,
+            "curve_snap_threshold_px": DEFAULT_CURVE_SNAP_THRESHOLD_PX,
+        },
+        "mesh": {
+            "n_points": 80,
+            "displacement_strength": 6.0,
+        },
+        "print_area": {
+            "top_left": [mx, my],
+            "top_right": [width - mx, my],
+            "bottom_right": [width - mx, height - my],
+            "bottom_left": [mx, height - my],
+        },
+        "design_transform": {
+            "scale": 1.0,
+            "offset_x": 0.0,
+            "offset_y": 0.0,
+            "fit_mode": "cover",
+        },
+        "lighting": {
+            # Ad-hoc mug defaults aim for realism instead of a flat raw overlay.
+            "shadow_strength": 0.45,
+            "displacement_strength": 0.0,
+            "specular_strength": 0.30,
+            "specular_threshold": 180,
+            "light_pos_x": 0.62,
+            "light_pos_y": 0.32,
+            "light_height": 55.0,
+            "light_contrast": 50.0,
+            "light_highlight": 60.0,
+            "light_softness": 55.0,
+            "cylinder_shading_strength": 0.28,
+            "edge_darkening_strength": 0.12,
+            "specular_line_strength": 0.65,
+            "specular_line_position": 0.18,
+            "specular_line_sigma": 0.12,
+            "specular_line_blur_kernel": 11,
+            "diffuse_highlight_strength": 0.25,
+            "highlight_detail_strength": 0.35,
+            "lighting_blur_kernel": 21,
+            "highlight_blur_kernel": 9,
+            "highlight_extract_blur_kernel": 41,
+            "highlight_detail_blur_kernel": 9,
+        },
+        "color": {
+            "enable_color_match": False,
+            "match_strength": 0.0,
+        },
+        "edge": {
+            "feather_px": 0,
+        },
+        "render": {
+            "preserve_original_color": False,
+        },
+        "output": {
+            "jpeg_quality": 90,
+        },
+    }
+
+
+def _merge_adhoc_user_config(config: dict, config_json: Optional[str], scale_factor: float = 1.0) -> dict:
+    if not config_json:
+        return config
+
+    import json
+
+    try:
+        user_config = json.loads(config_json)
+    except Exception:
+        return config
+
+    def _normalize_design_fit_mode(value: object) -> str:
+        lowered = str(value or "cover").strip().lower()
+        return lowered if lowered in {"cover", "contain"} else "cover"
+
+    user_pa = user_config.get("print_area", {})
+    if isinstance(user_pa, dict):
+        # Scale specific coordinates
+        if scale_factor != 1.0:
+            for pt_key in ["top_left", "top_right", "bottom_right", "bottom_left"]:
+                if pt_key in user_pa and isinstance(user_pa[pt_key], list) and len(user_pa[pt_key]) >= 2:
+                    user_pa[pt_key] = [user_pa[pt_key][0] * scale_factor, user_pa[pt_key][1] * scale_factor]
+            
+            for list_key in ["mask_points", "mesh_control_src", "mesh_control_dst"]:
+                if list_key in user_pa and isinstance(user_pa[list_key], list):
+                    user_pa[list_key] = [
+                        [pt[0] * scale_factor, pt[1] * scale_factor] if isinstance(pt, list) and len(pt) >= 2 else pt
+                        for pt in user_pa[list_key]
+                    ]
+
+        for key in [
+            "top_left",
+            "top_right",
+            "bottom_right",
+            "bottom_left",
+            "mask_points",
+            "camera_elevation",
+            "mesh_control_src",
+            "mesh_control_dst",
+            "product_type",
+        ]:
+            if key in user_pa:
+                config["print_area"][key] = user_pa[key]
+
+    user_warp = user_config.get("warp", {})
+    if not isinstance(user_warp, dict):
+        user_warp = {}
+
+    mesh_src = config["print_area"].get("mesh_control_src")
+    mesh_dst = config["print_area"].get("mesh_control_dst")
+    has_manual_mesh = (
+        isinstance(mesh_src, list)
+        and isinstance(mesh_dst, list)
+        and len(mesh_src) >= 3
+        and len(mesh_src) == len(mesh_dst)
+    )
+
+    warp_type = str(user_warp.get("warp_type", "")).lower()
+    raw_product_type = (
+        user_warp.get("product_type")
+        or user_config.get("product_type")
+        or config["print_area"].get("product_type")
+    )
+    config["product_type"] = _resolve_product_type(raw_product_type, warp_type, has_manual_mesh)
+
+    config["cylinder"]["theta_max_deg"] = float(
+        user_warp.get("theta_max_deg", config["cylinder"]["theta_max_deg"])
+    )
+    config["cylinder"]["smile_base"] = float(
+        user_warp.get("curve", config["cylinder"]["smile_base"])
+    )
+    if "curve_top" in user_warp and "curve_bottom" in user_warp:
+        try:
+            config["cylinder"]["curve_top"] = float(user_warp.get("curve_top"))
+            config["cylinder"]["curve_bottom"] = float(user_warp.get("curve_bottom"))
+        except (TypeError, ValueError):
+            config["cylinder"]["curve_top"] = None
+            config["cylinder"]["curve_bottom"] = None
+    else:
+        config["cylinder"]["curve_top"] = None
+        config["cylinder"]["curve_bottom"] = None
+
+    config["cylinder"]["pitch"] = float(
+        config["print_area"].get(
+            "camera_elevation", user_warp.get("camera_elevation", config["cylinder"]["pitch"])
+        )
+    )
+    config["cylinder"]["edge_squeeze"] = float(
+        user_warp.get("edge_squeeze", config["cylinder"]["edge_squeeze"])
+    )
+    config["cylinder"]["squeeze_power"] = float(
+        user_warp.get("squeeze_power", config["cylinder"]["squeeze_power"])
+    )
+    config["cylinder"]["center_focus_width"] = float(
+        user_warp.get("center_focus_width", config["cylinder"]["center_focus_width"])
+    )
+    config["cylinder"]["mesh_density_strength"] = float(
+        user_warp.get("mesh_density_strength", config["cylinder"]["mesh_density_strength"])
+    )
+    config["cylinder"]["curve_correction_alpha"] = float(
+        user_warp.get("curve_correction_alpha", config["cylinder"]["curve_correction_alpha"])
+    )
+    config["cylinder"]["curve_snap_threshold_px"] = float(
+        user_warp.get("curve_snap_threshold_px", config["cylinder"]["curve_snap_threshold_px"])
+    )
+
+    if "feather_radius" in user_warp:
+        config["edge"]["feather_px"] = int(user_warp.get("feather_radius", config["edge"]["feather_px"]))
+
+    user_edge = user_config.get("edge", {})
+    if isinstance(user_edge, dict) and "feather_px" in user_edge:
+        config["edge"]["feather_px"] = int(user_edge.get("feather_px", config["edge"]["feather_px"]))
+
+    user_color = user_config.get("color", {})
+    if isinstance(user_color, dict):
+        if "enable_color_match" in user_color:
+            config["color"]["enable_color_match"] = bool(user_color.get("enable_color_match"))
+        if "match_strength" in user_color:
+            config["color"]["match_strength"] = float(user_color.get("match_strength", config["color"]["match_strength"]))
+
+    user_lighting = user_config.get("lighting", {})
+    if isinstance(user_lighting, dict):
+        if "shadow_strength" in user_lighting:
+            config["lighting"]["shadow_strength"] = float(user_lighting.get("shadow_strength", config["lighting"]["shadow_strength"]))
+        if "displacement_strength" in user_lighting:
+            config["lighting"]["displacement_strength"] = float(
+                user_lighting.get("displacement_strength", config["lighting"]["displacement_strength"])
+            )
+        if "specular_strength" in user_lighting:
+            config["lighting"]["specular_strength"] = float(
+                user_lighting.get("specular_strength", config["lighting"]["specular_strength"])
+            )
+        if "specular_threshold" in user_lighting:
+            config["lighting"]["specular_threshold"] = int(
+                user_lighting.get("specular_threshold", config["lighting"]["specular_threshold"])
+            )
+        if "light_pos_x" in user_lighting:
+            config["lighting"]["light_pos_x"] = float(
+                user_lighting.get("light_pos_x", config["lighting"]["light_pos_x"])
+            )
+        if "light_pos_y" in user_lighting:
+            config["lighting"]["light_pos_y"] = float(
+                user_lighting.get("light_pos_y", config["lighting"]["light_pos_y"])
+            )
+        if "light_height" in user_lighting:
+            config["lighting"]["light_height"] = float(
+                user_lighting.get("light_height", config["lighting"]["light_height"])
+            )
+        if "light_contrast" in user_lighting:
+            config["lighting"]["light_contrast"] = float(
+                user_lighting.get("light_contrast", config["lighting"]["light_contrast"])
+            )
+        if "light_highlight" in user_lighting:
+            config["lighting"]["light_highlight"] = float(
+                user_lighting.get("light_highlight", config["lighting"]["light_highlight"])
+            )
+        if "light_softness" in user_lighting:
+            config["lighting"]["light_softness"] = float(
+                user_lighting.get("light_softness", config["lighting"]["light_softness"])
+            )
+        if "cylinder_shading_strength" in user_lighting:
+            config["lighting"]["cylinder_shading_strength"] = float(
+                user_lighting.get("cylinder_shading_strength", config["lighting"]["cylinder_shading_strength"])
+            )
+        if "edge_darkening_strength" in user_lighting:
+            config["lighting"]["edge_darkening_strength"] = float(
+                user_lighting.get("edge_darkening_strength", config["lighting"]["edge_darkening_strength"])
+            )
+        if "specular_line_strength" in user_lighting:
+            config["lighting"]["specular_line_strength"] = float(
+                user_lighting.get("specular_line_strength", config["lighting"]["specular_line_strength"])
+            )
+        if "specular_line_position" in user_lighting:
+            config["lighting"]["specular_line_position"] = float(
+                user_lighting.get("specular_line_position", config["lighting"]["specular_line_position"])
+            )
+        if "specular_line_sigma" in user_lighting:
+            config["lighting"]["specular_line_sigma"] = float(
+                user_lighting.get("specular_line_sigma", config["lighting"]["specular_line_sigma"])
+            )
+        if "specular_line_blur_kernel" in user_lighting:
+            config["lighting"]["specular_line_blur_kernel"] = int(
+                user_lighting.get("specular_line_blur_kernel", config["lighting"]["specular_line_blur_kernel"])
+            )
+        if "diffuse_highlight_strength" in user_lighting:
+            config["lighting"]["diffuse_highlight_strength"] = float(
+                user_lighting.get("diffuse_highlight_strength", config["lighting"]["diffuse_highlight_strength"])
+            )
+        if "highlight_detail_strength" in user_lighting:
+            config["lighting"]["highlight_detail_strength"] = float(
+                user_lighting.get("highlight_detail_strength", config["lighting"]["highlight_detail_strength"])
+            )
+        if "lighting_blur_kernel" in user_lighting:
+            config["lighting"]["lighting_blur_kernel"] = int(
+                user_lighting.get("lighting_blur_kernel", config["lighting"]["lighting_blur_kernel"])
+            )
+        if "highlight_blur_kernel" in user_lighting:
+            config["lighting"]["highlight_blur_kernel"] = int(
+                user_lighting.get("highlight_blur_kernel", config["lighting"]["highlight_blur_kernel"])
+            )
+        if "highlight_extract_blur_kernel" in user_lighting:
+            config["lighting"]["highlight_extract_blur_kernel"] = int(
+                user_lighting.get("highlight_extract_blur_kernel", config["lighting"]["highlight_extract_blur_kernel"])
+            )
+        if "highlight_detail_blur_kernel" in user_lighting:
+            config["lighting"]["highlight_detail_blur_kernel"] = int(
+                user_lighting.get("highlight_detail_blur_kernel", config["lighting"]["highlight_detail_blur_kernel"])
+            )
+
+    user_render = user_config.get("render", {})
+    if isinstance(user_render, dict) and "preserve_original_color" in user_render:
+        config.setdefault("render", {})
+        config["render"]["preserve_original_color"] = bool(user_render.get("preserve_original_color"))
+
+    # Keep ad-hoc mug renders color-faithful by default, but preserve richer
+    # clothes defaults unless caller explicitly overrides color/lighting keys.
+    if config["product_type"] == "clothes":
+        if not isinstance(user_color, dict) or "enable_color_match" not in user_color:
+            config["color"]["enable_color_match"] = True
+        if not isinstance(user_color, dict) or "match_strength" not in user_color:
+            config["color"]["match_strength"] = 0.25
+
+        if not isinstance(user_lighting, dict) or "shadow_strength" not in user_lighting:
+            config["lighting"]["shadow_strength"] = 0.40
+        if not isinstance(user_lighting, dict) or "displacement_strength" not in user_lighting:
+            config["lighting"]["displacement_strength"] = 0.08
+        if not isinstance(user_lighting, dict) or "specular_strength" not in user_lighting:
+            config["lighting"]["specular_strength"] = 0.08
+        if not isinstance(user_edge, dict) or "feather_px" not in user_edge:
+            config["edge"]["feather_px"] = 10
+        if not isinstance(user_render, dict) or "preserve_original_color" not in user_render:
+            config.setdefault("render", {})
+            config["render"]["preserve_original_color"] = False
+
+    config["design_transform"] = {
+        "scale": float(user_warp.get("design_scale", config["design_transform"]["scale"])),
+        "offset_x": float(user_warp.get("design_offset_x", config["design_transform"]["offset_x"])),
+        "offset_y": float(user_warp.get("design_offset_y", config["design_transform"]["offset_y"])),
+        "fit_mode": _normalize_design_fit_mode(
+            user_warp.get("design_fit_mode", config["design_transform"].get("fit_mode", "cover"))
+        ),
+    }
+
+    if has_manual_mesh:
+        config["mesh"]["control_src"] = mesh_src
+        config["mesh"]["control_dst"] = mesh_dst
+
+    return config
+
+
+def _clone_assets_with_config(assets: MugAssets | ClothesAssets, config: dict) -> MugAssets | ClothesAssets:
+    if isinstance(assets, MugAssets):
+        return MugAssets(
+            mockup=assets.mockup,
+            shadow_map=assets.shadow_map,
+            normal_map=assets.normal_map,
+            mask=assets.mask,
+            specular_map=assets.specular_map,
+            config=config,
+        )
+
+    if isinstance(assets, ClothesAssets):
+        return ClothesAssets(
+            mockup=assets.mockup,
+            wrinkle_map=assets.wrinkle_map,
+            shadow_map=assets.shadow_map,
+            mask=assets.mask,
+            config=config,
+            slug=assets.slug,
+        )
+
+    return assets
+
+
+def _compute_adaptive_grid(width: int, height: int, cell_px: int = GRID_CELL_PX) -> tuple[int, int]:
+    safe_w = max(1, int(width))
+    safe_h = max(1, int(height))
+    cols = int(np.clip(np.round(safe_w / max(cell_px, 1)), MIN_GRID_DIVS, MAX_GRID_DIVS))
+    rows = int(np.clip(np.round(safe_h / max(cell_px, 1)), MIN_GRID_DIVS, MAX_GRID_DIVS))
+    return cols, rows
+
+
+def _compute_adaptive_axis_edges(divisions: int, density_strength: float = DEFAULT_MESH_DENSITY_STRENGTH) -> np.ndarray:
+    divs = max(1, int(divisions))
+    samples = np.linspace(0.0, 1.0, divs + 1, dtype=np.float32)
+    power = max(1.0, float(density_strength))
+    if power <= 1.0 + 1e-8:
+        return samples
+
+    edges = np.empty_like(samples)
+    left_mask = samples <= 0.5
+    left_samples = samples[left_mask] / 0.5
+    edges[left_mask] = 0.5 * np.power(left_samples, power)
+
+    right_samples = (1.0 - samples[~left_mask]) / 0.5
+    edges[~left_mask] = 1.0 - 0.5 * np.power(right_samples, power)
+
+    edges = np.clip(edges, 0.0, 1.0)
+    edges[0] = 0.0
+    edges[-1] = 1.0
+    return np.maximum.accumulate(edges)
+
+
+def _build_preview_design_canvas(
+    width: int,
+    height: int,
+    cell_px: int = GRID_CELL_PX,
+    mesh_density_strength: float = DEFAULT_MESH_DENSITY_STRENGTH,
+) -> np.ndarray:
+    safe_w = max(1, int(width))
+    safe_h = max(1, int(height))
+    cache_key = make_preview_canvas_cache_key(
+        width=safe_w,
+        height=safe_h,
+        mesh_density_strength=mesh_density_strength,
+    )
+    cached_canvas = get_preview_canvas_cache(cache_key)
+    if cached_canvas is not None:
+        return cached_canvas
+
+    cols, rows = _compute_adaptive_grid(safe_w, safe_h, cell_px=cell_px)
+    canvas = np.zeros((safe_h, safe_w, 4), dtype=np.uint8)
+
+    x_edges = np.rint(_compute_adaptive_axis_edges(cols, mesh_density_strength) * safe_w).astype(np.int32)
+    y_edges = np.linspace(0, safe_h, rows + 1, dtype=np.int32)
+
+    for r in range(rows):
+        y0, y1 = int(y_edges[r]), int(y_edges[r + 1])
+        for c in range(cols):
+            x0, x1 = int(x_edges[c]), int(x_edges[c + 1])
+            even = (r + c) % 2 == 0
+            color = 240 if even else 160
+            alpha = 100 if even else 55
+            canvas[y0:y1, x0:x1, :3] = [color, color, color]
+            canvas[y0:y1, x0:x1, 3] = alpha
+
+    for x in x_edges:
+        xi = int(np.clip(x, 0, safe_w - 1))
+        cv2.line(canvas, (xi, 0), (xi, safe_h - 1), (255, 255, 255, 170), 1, cv2.LINE_AA)
+    for y in y_edges:
+        yi = int(np.clip(y, 0, safe_h - 1))
+        cv2.line(canvas, (0, yi), (safe_w - 1, yi), (255, 255, 255, 170), 1, cv2.LINE_AA)
+    return set_preview_canvas_cache(cache_key, canvas)
+
+
+def _encode_preview_png(image: np.ndarray) -> bytes:
+    ok, buf = cv2.imencode(
+        ".png",
+        image,
+        [int(cv2.IMWRITE_PNG_COMPRESSION), PREVIEW_PNG_COMPRESSION],
+    )
+    if not ok:
+        raise HTTPException(status_code=500, detail="encode_failed")
+    return bytes(buf)
+
+
+def _render_warp_preview_image(
+    req: WarpPreviewRequest,
+    design_canvas: np.ndarray,
+    reference_mockup: np.ndarray | None = None,
+) -> np.ndarray:
+    from app.pipeline.clothes.tps_warp import tps_warp_design
+    from app.pipeline.mugs.cylindrical_warp import cylindrical_warp
+
+    w, h = req.mockup_width, req.mockup_height
+    pa = {
+        "top_left": req.print_area["top_left"],
+        "top_right": req.print_area["top_right"],
+        "bottom_right": req.print_area["bottom_right"],
+        "bottom_left": req.print_area["bottom_left"],
+    }
+    canvas_w, canvas_h = estimate_print_area_canvas_size(
+        pa,
+        fallback_width=design_canvas.shape[1],
+        fallback_height=design_canvas.shape[0],
+    )
+
+    design_canvas = apply_design_transform(
+        design_canvas,
+        scale=req.design_scale,
+        offset_x=req.design_offset_x,
+        offset_y=req.design_offset_y,
+        fit_mode=req.design_fit_mode,
+        target_width=canvas_w,
+        target_height=canvas_h,
+    )
+
+    if req.warp_type == "cylinder":
+        smile_val = float(req.curve)
+        pitch_val = float(req.print_area.get("camera_elevation", 0))
+        _log_horizontal_squeeze_debug(
+            source="warp-preview",
+            theta_max_deg=req.theta_max_deg,
+            edge_squeeze=req.edge_squeeze,
+            squeeze_power=req.squeeze_power,
+            center_focus_width=req.center_focus_width,
+        )
+        warped = cylindrical_warp(
+            design_canvas,
+            pa,
+            (w, h),
+            reference_mockup=reference_mockup,
+            theta_max_deg=req.theta_max_deg,
+            pitch=pitch_val,
+            smile_base=smile_val,
+            curve_top=req.curve_top,
+            curve_bottom=req.curve_bottom,
+            edge_squeeze=req.edge_squeeze,
+            squeeze_power=req.squeeze_power,
+            center_focus_width=req.center_focus_width,
+            curve_correction_alpha=req.curve_correction_alpha,
+            curve_snap_threshold_px=req.curve_snap_threshold_px,
+            is_preview=True,
+        )
+        mesh_src = req.print_area.get("mesh_control_src", [])
+        mesh_dst = req.print_area.get("mesh_control_dst", [])
+        if (
+            isinstance(mesh_src, list)
+            and isinstance(mesh_dst, list)
+            and len(mesh_src) >= 4
+            and len(mesh_src) == len(mesh_dst)
+        ):
+            warped = apply_smooth_mesh_warp(
+                warped,
+                src_pts=np.float32(mesh_src),
+                dst_pts=np.float32(mesh_dst),
+                output_size=(w, h),
+                is_preview=True,
+            )
+    elif req.warp_type == "tps":
+        src_pts_px = np.float32(req.print_area.get("mesh_control_src", []))
+        dst_pts = np.float32(req.print_area.get("mesh_control_dst", []))
+        dh, dw = design_canvas.shape[:2]
+        if len(src_pts_px) >= 3 and len(src_pts_px) == len(dst_pts):
+            base = cv2.warpPerspective(
+                design_canvas,
+                cv2.getPerspectiveTransform(
+                    np.float32([[0, 0], [dw - 1, 0], [dw - 1, dh - 1], [0, dh - 1]]),
+                    np.float32([pa["top_left"], pa["top_right"], pa["bottom_right"], pa["bottom_left"]]),
+                ),
+                (w, h),
+            )
+            warped = tps_warp_design(base, src_pts_px, dst_pts, (w, h))
+        else:
+            warped = cv2.warpPerspective(
+                design_canvas,
+                cv2.getPerspectiveTransform(
+                    np.float32([[0, 0], [dw - 1, 0], [dw - 1, dh - 1], [0, dh - 1]]),
+                    np.float32([pa["top_left"], pa["top_right"], pa["bottom_right"], pa["bottom_left"]]),
+                ),
+                (w, h),
+            )
+    else:
+        dh, dw = design_canvas.shape[:2]
+        warped = cv2.warpPerspective(
+            design_canvas,
+            cv2.getPerspectiveTransform(
+                np.float32([[0, 0], [dw - 1, 0], [dw - 1, dh - 1], [0, dh - 1]]),
+                np.float32([pa["top_left"], pa["top_right"], pa["bottom_right"], pa["bottom_left"]]),
+            ),
+            (w, h),
+        )
+
+    if req.mask_points and warped.shape[2] == 4:
+        mask_to_use = create_soft_mask(req.mask_points, (h, w), feather_radius=2)
+        warped[:, :, 3] = cv2.bitwise_and(warped[:, :, 3], mask_to_use)
+
+    return warped
+
+
+@router.post("/mockup/warp-prefetch", status_code=202)
+async def warpPrefetch(request: WarpPrefetchRequest, background_tasks: BackgroundTasks):
+    """
+    Fire-and-forget: pre-compute warp map and store in cache.
+    Always returns 202 Accepted immediately.
+    """
+    from app.pipeline.shared.liveview_cache import make_cylindrical_map_cache_key
+    
+    wp = request.warp_params
+    pa = wp.get("print_area")
+    if not pa:
+        return {"status": "skipped", "reason": "missing_print_area"}
+
+    # Use default canvas size estimation if not provided
+    design_w, design_h = 1500, 1500 # standard target
+    
+    cache_key = make_cylindrical_map_cache_key(
+        print_area=pa,
+        output_size=request.img_shape,
+        design_size=(design_w, design_h),
+        theta_max_deg=float(wp.get("theta_max_deg", 52.0)),
+        pitch=float(wp.get("pitch", 0.0)),
+        smile_base=float(wp.get("curve", 0.08)),
+        curve_top=wp.get("curve_top"),
+        curve_bottom=wp.get("curve_bottom"),
+        edge_squeeze=float(wp.get("edge_squeeze", 0.0)),
+        squeeze_power=float(wp.get("squeeze_power", 2.0)),
+        center_focus_width=float(wp.get("center_focus_width", 0.0)),
+    )
+
+    if get_cylindrical_map_cache(cache_key) is not None or cache_key in _warp_prefetch_inflight:
+        return {"status": "skipped", "reason": "cached_or_inflight"}
+
+    background_tasks.add_task(_prefetch_compute_task, cache_key, wp, request.img_shape, (design_w, design_h))
+    return {"status": "accepted"}
+
+
+async def _prefetch_compute_task(cache_key: tuple, wp: dict, output_size: tuple, design_size: tuple):
+    _warp_prefetch_inflight.add(cache_key)
+    logger = logging.getLogger("mockup_service")
+    try:
+        loop = asyncio.get_event_loop()
+        # compute_and_cache_cylindrical_map handles the caching internally
+        await loop.run_in_executor(
+            None,
+            compute_and_cache_cylindrical_map,
+            wp.get("print_area"),
+            output_size,
+            design_size,
+            float(wp.get("theta_max_deg", 52.0)),
+            float(wp.get("pitch", 0.0)),
+            float(wp.get("curve", 0.08)),
+            wp.get("curve_top"),
+            wp.get("curve_bottom"),
+            float(wp.get("edge_squeeze", 0.0)),
+            float(wp.get("squeeze_power", 2.0)),
+            float(wp.get("center_focus_width", 0.0)),
+        )
+        logger.info(f"[PREFETCH] warp map computed and cached for key hash: {hash(cache_key)}")
+    except Exception as e:
+        logger.error(f"[PREFETCH] failed: {str(e)}")
+    finally:
+        _warp_prefetch_inflight.discard(cache_key)
+
+
+@router.post("/mockup/render")
 async def renderMockup(
-    design_image: UploadFile = File(...),
+    design_image: Optional[UploadFile] = File(None),
+    design_url: Optional[str] = Form(None),
     template_id: str = Form(...),
-    output_format: str = Form('jpg'),
+    output_format: str = Form("jpg"),
     jpeg_quality: int = Form(None),
+    config_json: str = Form(None),
 ):
-    '''
-    Render design lên template mockup.
-    Trả về binary image (JPEG/PNG).
-    '''
-    request_id = f'req_{uuid.uuid4().hex[:8]}'
-
-    # Kiểm tra template trong cache
+    request_id = f"req_{uuid.uuid4().hex[:8]}"
+    effective_output_format = _force_jpeg_output_format(output_format)
     assets = template_registry.get(template_id)
 
     if assets is None:
-        # Thử load từ DB
         async with async_session() as session:
-            stmt = select(Template).where(
-                Template.slug == template_id,
-                Template.status == 'active',
-            )
+            stmt = select(Template).where(Template.slug == template_id, Template.status == "active")
             result = await session.execute(stmt)
             template = result.scalar_one_or_none()
 
@@ -49,82 +778,108 @@ async def renderMockup(
             raise HTTPException(
                 status_code=404,
                 detail={
-                    'error': 'template_not_found',
-                    'message': f'Template \'{template_id}\' không tồn tại hoặc chưa active',
-                    'request_id': request_id,
+                    "error": "template_not_found",
+                    "message": f"Template '{template_id}' not found or inactive",
+                    "request_id": request_id,
                 },
             )
 
-        # Load assets vào cache
         record = {
-            'mockup_path': template.mockup_path,
-            'shadow_map_path': template.shadow_map_path,
-            'normal_map_path': template.normal_map_path,
-            'specular_path': template.specular_path,
-            'mask_path': template.mask_path,
-            'config': template.config,
-            'output_width': template.output_width,
-            'output_height': template.output_height,
+            "mockup_path": template.mockup_path,
+            "shadow_map_path": template.shadow_map_path,
+            "normal_map_path": template.normal_map_path,
+            "specular_path": template.specular_path,
+            "mask_path": template.mask_path,
+            "config": template.config,
+            "output_width": template.output_width,
+            "output_height": template.output_height,
         }
         try:
             assets = template_registry.load_template(template_id, record)
-        except Exception as e:
+        except Exception as exc:
             raise HTTPException(
                 status_code=500,
+                detail={"error": "render_failed", "message": str(exc), "request_id": request_id},
+            ) from exc
+
+    if design_image is not None:
+        design_bytes = await design_image.read()
+    elif design_url:
+        p = resolve_local_asset_path(design_url)
+        if not p.exists():
+            raise HTTPException(
+                status_code=400,
                 detail={
-                    'error': 'render_failed',
-                    'message': str(e),
-                    'request_id': request_id,
+                    "error": "design_not_found",
+                    "message": f"Design URL {design_url} not found",
+                    "request_id": request_id,
                 },
             )
+        design_bytes = p.read_bytes()
+    else:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "missing_design",
+                "message": "Missing design_image or design_url",
+                "request_id": request_id,
+            },
+        )
 
-    # Đọc design image
-    design_bytes = await design_image.read()
+    effective_assets = assets
+    if config_json:
+        try:
+            effective_config = _merge_adhoc_user_config(copy.deepcopy(assets.config), config_json)
+        except Exception as exc:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "error": "invalid_config_override",
+                    "message": str(exc),
+                    "request_id": request_id,
+                },
+            ) from exc
+        effective_assets = _clone_assets_with_config(assets, effective_config)
 
-    # Xác định quality
-    quality = jpeg_quality
-    if quality is None:
-        quality = assets.config.get('output', {}).get('jpeg_quality', 90)
+    quality = (
+        jpeg_quality
+        if jpeg_quality is not None
+        else effective_assets.config.get("output", {}).get("jpeg_quality", 90)
+    )
 
-    # Chạy pipeline trong threadpool (CPU-bound)
     try:
         image_bytes, meta = await asyncio.to_thread(
             run_pipeline,
             design_bytes,
-            assets,
-            output_format,
+            effective_assets,
+            effective_output_format,
             quality,
         )
-    except ValueError as e:
-        error_code = str(e)
-        status = 400
-        if error_code == 'image_too_large':
-            msg = 'File > 10MB'
-        elif error_code == 'invalid_image':
-            msg = 'File không đọc được hoặc sai định dạng'
+    except ValueError as exc:
+        error_code = str(exc)
+        if error_code == "image_too_large":
+            msg = "File > 10MB"
+        elif error_code == "invalid_image":
+            msg = "Invalid image data"
         else:
             msg = error_code
         raise HTTPException(
-            status_code=status,
-            detail={
-                'error': error_code,
-                'message': msg,
-                'request_id': request_id,
-            },
-        )
-    except Exception as e:
-        import logging
+            status_code=400,
+            detail={"error": error_code, "message": msg, "request_id": request_id},
+        ) from exc
+    except Exception as exc:
         import traceback
-        logger = logging.getLogger('mockup_service')
-        logger.error(f'Render failed: {traceback.format_exc()}')
+
+        logger = logging.getLogger("mockup_service")
+        logger.error(f"Render failed: {traceback.format_exc()}")
         raise HTTPException(
             status_code=500,
-            detail={
-                'error': 'render_failed',
-                'message': str(e),
-                'request_id': request_id,
-            },
-        )
+            detail={"error": "render_failed", "message": str(exc), "request_id": request_id},
+        ) from exc
+
+    # Persist result in background if the design came from a URL
+    if design_url:
+        asyncio.create_task(persistRenderResult(design_url, image_bytes, effective_output_format))
 
     return Response(
         content=image_bytes,
@@ -137,137 +892,149 @@ async def renderMockup(
     )
 
 
-@router.post('/mockup/render-adhoc')
+@router.post("/mockup/render-adhoc")
 async def renderAdhoc(
-    mockup_image: UploadFile = File(...),
-    design_image: UploadFile = File(...),
-    output_format: str = Form('jpg'),
+    mockup_image: Optional[UploadFile] = File(None),
+    design_image: Optional[UploadFile] = File(None),
+    mockup_url: Optional[str] = Form(None),
+    design_url: Optional[str] = Form(None),
+    output_format: str = Form("jpg"),
+    jpeg_quality: int = Form(None),
     config_json: str = Form(None),
+    is_preview: bool = Form(False),
 ):
-    '''
-    Render nhanh dùng ảnh mockup tùy chỉnh tải lên, không cần tạo Template.
-    Tự động tạo mask và print_area mặc định ở giữa ảnh.
-    '''
-    import cv2
-    import numpy as np
-    from app.pipeline.pipeline import decode_design, TemplateAssets
-    from app.pipeline.specular import extract_specular_from_mockup
-    import time
-
-    request_id = f'req_{uuid.uuid4().hex[:8]}'
+    request_id = f"req_{uuid.uuid4().hex[:8]}"
+    effective_output_format = _force_jpeg_output_format(output_format)
 
     try:
-        mockup_bytes = await mockup_image.read()
-        design_bytes = await design_image.read()
+        # 1. Resolve Mockup
+        if mockup_image:
+            mockup_bytes = await mockup_image.read()
+        elif mockup_url:
+            p = resolve_local_asset_path(mockup_url)
+            if not p.exists():
+                raise HTTPException(status_code=400, detail=f"Mockup URL {mockup_url} not found")
+            mockup_bytes = p.read_bytes()
+        else:
+            raise HTTPException(status_code=400, detail="Missing mockup_image or mockup_url")
 
-        # Decode Mockup (BGR)
+        # 2. Resolve Design
+        if design_image:
+            design_bytes = await design_image.read()
+        elif design_url:
+            p = resolve_local_asset_path(design_url)
+            if not p.exists():
+                raise HTTPException(status_code=400, detail=f"Design URL {design_url} not found")
+            design_bytes = p.read_bytes()
+        else:
+            raise HTTPException(status_code=400, detail="Missing design_image or design_url")
+
         buf = np.frombuffer(mockup_bytes, dtype=np.uint8)
+        t_adhoc_start = time.perf_counter()
+        logger = logging.getLogger('mockup_service')
         mockup = cv2.imdecode(buf, cv2.IMREAD_COLOR)
         if mockup is None:
-            raise ValueError('Ảnh mockup không hợp lệ')
-            
-        H, W = mockup.shape[:2]
-        if max(H, W) > 3000:
-            scale = 3000 / max(H, W)
-            mockup = cv2.resize(mockup, (int(W * scale), int(H * scale)))
-            H, W = mockup.shape[:2]
+            raise ValueError("invalid_mockup")
 
-        # Tạo mask full trắng rỗng (vì adhoc không có mask xịn, ta phó thác cho Alpha channel của warped image)
-        mask = np.full((H, W), 255, dtype=np.uint8)
-        mx, my = int(W * 0.22), int(H * 0.14)
+        h, w = mockup.shape[:2]
+        max_dim = 512 if is_preview else 3000
+        scale = 1.0
+        if max(h, w) > max_dim:
+            scale = max_dim / max(h, w)
+            mockup = cv2.resize(mockup, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_LINEAR)
+            h, w = mockup.shape[:2]
+        logger.info('[PERF] adhoc: mockup decode+resize: %dms (size=%dx%d)', int((time.perf_counter() - t_adhoc_start) * 1000), w, h)
 
-        # --- Tự động sinh Normal Map hình trụ cho cốc (tốt hơn placeholder phẳng) ---
-        # Normal trên bề mặt trụ: Nx = sin(theta), Ny = 0, Nz = cos(theta)
-        # theta biến thiên theo chiều ngang từ -theta_max đến +theta_max
+        mask = np.full((h, w), 255, dtype=np.uint8)
+
         theta_max_rad = np.deg2rad(52.0)
-        cols = np.arange(W, dtype=np.float32)
-        theta = (cols / W - 0.5) * 2.0 * theta_max_rad  # [-theta_max, +theta_max]
+        cols = np.arange(w, dtype=np.float32)
+        theta = (cols / w - 0.5) * 2.0 * theta_max_rad
         cos_t = np.cos(theta)
         sin_t = np.sin(theta)
 
-        Nx = np.broadcast_to(sin_t[None, :], (H, W))
-        Nz = np.broadcast_to(cos_t[None, :], (H, W))
-        Ny = np.zeros((H, W), dtype=np.float32)
+        nx = np.broadcast_to(sin_t[None, :], (h, w))
+        nz = np.broadcast_to(cos_t[None, :], (h, w))
+        ny = np.zeros((h, w), dtype=np.float32)
+        normal_map = np.dstack(
+            [
+                ((nx * 0.5 + 0.5) * 255).astype(np.uint8),
+                ((ny * 0.5 + 0.5) * 255).astype(np.uint8),
+                ((nz * 0.5 + 0.5) * 255).astype(np.uint8),
+            ]
+        )
 
-        normal_map = np.dstack([
-            ((Nx * 0.5 + 0.5) * 255).astype(np.uint8),   # R = X
-            ((Ny * 0.5 + 0.5) * 255).astype(np.uint8),   # G = Y
-            ((Nz * 0.5 + 0.5) * 255).astype(np.uint8),   # B = Z
-        ])
-
-        # --- Tự động sinh Shadow Map hình trụ ---
-        # Viền 2 bên tối hơn (cos falloff), tạo bóng tự nhiên
-        shadow_intensity = np.broadcast_to(cos_t[None, :], (H, W))
-        # Boost giữa lên sáng, viền tối hơn
+        shadow_intensity = np.broadcast_to(cos_t[None, :], (h, w))
         shadow_map = np.clip(shadow_intensity * 0.6 + 0.4, 0, 1)
         shadow_map = (shadow_map * 255).astype(np.uint8)
 
-        # Extract specular map (tự động)
-        specular_map = extract_specular_from_mockup(mockup)
+        t_config = time.perf_counter()
+        config = _build_default_adhoc_config(w, h)
+        config = _merge_adhoc_user_config(config, config_json, scale)
+        config["is_preview"] = is_preview
+        logger.info('[PERF] adhoc: config merge: %dms', int((time.perf_counter() - t_config) * 1000))
+        lighting_cfg = config.get("lighting", {})
+        specular_strength = float(lighting_cfg.get("specular_strength", 0.0))
+        if specular_strength > 0:
+            specular_threshold = int(lighting_cfg.get("specular_threshold", 220))
+            specular_map = extract_specular_from_mockup(mockup, threshold=specular_threshold)
+        else:
+            specular_map = np.zeros((h, w), dtype=np.float32)
+        logging.getLogger("mockup_service").info(
+            "render-adhoc effective warp: theta_max_deg=%s curve_top=%s curve_bottom=%s pitch=%s edge_squeeze=%s squeeze_power=%s center_focus_width=%s",
+            config.get("cylinder", {}).get("theta_max_deg"),
+            config.get("cylinder", {}).get("curve_top"),
+            config.get("cylinder", {}).get("curve_bottom"),
+            config.get("cylinder", {}).get("pitch"),
+            config.get("cylinder", {}).get("edge_squeeze"),
+            config.get("cylinder", {}).get("squeeze_power"),
+            config.get("cylinder", {}).get("center_focus_width"),
+        )
+        _log_horizontal_squeeze_debug(
+            source="render-adhoc",
+            theta_max_deg=float(config.get("cylinder", {}).get("theta_max_deg", 52.0)),
+            edge_squeeze=float(config.get("cylinder", {}).get("edge_squeeze", 0.0)),
+            squeeze_power=float(config.get("cylinder", {}).get("squeeze_power", 2.0)),
+            center_focus_width=float(config.get("cylinder", {}).get("center_focus_width", 0.0)),
+        )
 
-        # Config mặc định — BẬT ĐẦY ĐỦ lighting pipeline
-        config = {
-            'warp': {
-                'warp_type': 'cylinder',
-                'theta_max_deg': 52.0,
-                'curve': 0.15,
-            },
-            'print_area': {
-                'top_left':     [mx, my],
-                'top_right':    [W - mx, my],
-                'bottom_right': [W - mx, H - my],
-                'bottom_left':  [mx, H - my],
-            },
-            'lighting': {
-                'shadow_strength':       0.35,
-                'displacement_strength': 0.08,
-                'specular_strength':     0.30,
-                'specular_threshold':    220,
-            },
-            'color': {
-                'enable_color_match': True,
-                'match_strength':     0.40,
-            },
-            'edge': {
-                'feather_px': 4,
-            },
-            'output': {
-                'jpeg_quality': 90,
-            },
-        }
+        product_type = config.get("product_type", "mug")
+        if product_type == "mug":
+            assets = MugAssets(
+                mockup=mockup,
+                shadow_map=shadow_map,
+                normal_map=normal_map,
+                mask=mask,
+                specular_map=specular_map,
+                config=config,
+            )
+        else:
+            assets = ClothesAssets(
+                mockup=mockup,
+                wrinkle_map=normal_map,
+                shadow_map=shadow_map,
+                mask=mask,
+                config=config,
+            )
 
-        # Thử override config nếu user có truyền lên
-        if config_json:
-            import json
-            try:
-                user_config = json.loads(config_json)
-                # Override các tuỳ chỉnh an toàn trong ad-hoc mode
-                if 'print_area' in user_config:
-                    # Merge print_area fields individually to avoid losing default fields if user only sends some
-                    for key in ['top_left', 'top_right', 'bottom_right', 'bottom_left', 'mask_points', 'camera_elevation']:
-                        if key in user_config['print_area']:
-                            config['print_area'][key] = user_config['print_area'][key]
-                if 'warp' in user_config:
-                    config['warp'].update(user_config['warp'])
-            except Exception as e:
-                pass
-
-        assets = TemplateAssets(
-            mockup=mockup,
-            shadow_map=shadow_map,
-            normal_map=normal_map,
-            mask=mask,
-            specular_map=specular_map,
-            config=config,
+        quality = (
+            max(1, min(100, int(jpeg_quality)))
+            if jpeg_quality is not None
+            else int(config.get("output", {}).get("jpeg_quality", 90))
         )
 
         image_bytes, meta = await asyncio.to_thread(
             run_pipeline,
             design_bytes,
             assets,
-            output_format,
-            90,
+            effective_output_format,
+            quality,
+            False,
         )
+
+        # Persist result in background if the design came from a URL
+        if design_url and not is_preview:
+            asyncio.create_task(persistRenderResult(design_url, image_bytes, effective_output_format))
 
         return Response(
             content=image_bytes,
@@ -278,192 +1045,339 @@ async def renderAdhoc(
                 'X-Request-Id': request_id,
             },
         )
-
-    except Exception as e:
+    except Exception as exc:
         import traceback
-        import logging
+
         logger = logging.getLogger('mockup_service')
         logger.error(f'Render-adhoc failed: {traceback.format_exc()}')
         raise HTTPException(
             status_code=400,
-            detail={
-                'error': 'render_failed',
-                'message': str(e),
-                'request_id': request_id,
-            },
+            detail={'error': 'render_failed', 'message': str(exc), 'request_id': request_id},
+        ) from exc
+
+
+@router.post("/mockup/warp-preview")
+async def renderWarpPreview(req: WarpPreviewRequest):
+    canvas_w, canvas_h = estimate_print_area_canvas_size(
+        req.print_area,
+        fallback_width=req.mockup_width,
+        fallback_height=req.mockup_height,
+    )
+    design_canvas = _build_preview_design_canvas(
+        canvas_w,
+        canvas_h,
+        mesh_density_strength=req.mesh_density_strength,
+    )
+    warped = _render_warp_preview_image(req, design_canvas)
+    return Response(content=_encode_preview_png(warped), media_type="image/png", headers={"Cache-Control": "no-cache"})
+
+
+@router.post('/mockup/render-async-adhoc')
+async def render_adhoc_async(
+    mockup_image: Optional[UploadFile] = File(None),
+    design_image: Optional[UploadFile] = File(None),
+    mockup_url: Optional[str] = Form(None),
+    design_url: Optional[str] = Form(None),
+    config_json: str = Form(None),
+    output_format: str = Form('jpg'),
+    is_preview: bool = Form(False),
+):
+    request_id = f"req_{uuid.uuid4().hex[:8]}"
+    effective_output_format = _force_jpeg_output_format(output_format)
+    try:
+        if mockup_image:
+            mockup_bytes = await mockup_image.read()
+        elif mockup_url:
+            p = resolve_local_asset_path(mockup_url)
+            if not p.exists():
+                raise HTTPException(status_code=400, detail=f"Mockup URL {mockup_url} not found")
+            mockup_bytes = p.read_bytes()
+        else:
+            raise HTTPException(status_code=400, detail="Missing mockup_image or mockup_url")
+
+        if design_image:
+            design_bytes = await design_image.read()
+        elif design_url:
+            p = resolve_local_asset_path(design_url)
+            if not p.exists():
+                raise HTTPException(status_code=400, detail=f"Design URL {design_url} not found")
+            design_bytes = p.read_bytes()
+        else:
+            raise HTTPException(status_code=400, detail="Missing design_image or design_url")
+
+        import json as _json
+        try:
+            cfg = _json.loads(config_json) if config_json else {}
+        except Exception:
+            cfg = {}
+
+        # Keep async adhoc render config identical to synchronous /render-adhoc:
+        # normalize user payload into full pipeline config before enqueue.
+        mockup_buf = np.frombuffer(mockup_bytes, dtype=np.uint8)
+        mockup = cv2.imdecode(mockup_buf, cv2.IMREAD_COLOR)
+        if mockup is None:
+            raise HTTPException(status_code=400, detail="invalid_mockup")
+        mh, mw = mockup.shape[:2]
+        max_dim = 512 if is_preview else 3000
+        scale = 1.0
+        if max(mh, mw) > max_dim:
+            scale = max_dim / max(mh, mw)
+            mockup = cv2.resize(mockup, (int(mw * scale), int(mh * scale)), interpolation=cv2.INTER_LINEAR)
+            mh, mw = mockup.shape[:2]
+            
+        effective_cfg = _build_default_adhoc_config(mw, mh)
+        effective_cfg = _merge_adhoc_user_config(
+            effective_cfg,
+            _json.dumps(cfg) if cfg else None,
+            scale
+        )
+        effective_cfg["is_preview"] = is_preview
+
+        ok, res_buf = cv2.imencode('.png', mockup)
+        job_id = enqueue_adhoc_render(
+            design_bytes,
+            res_buf.tobytes(),
+            effective_cfg,
+            output_format=effective_output_format,
+        )
+        return {"job_id": job_id, "request_id": request_id, "status": "queued"}
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail={'error': 'enqueue_failed', 'message': str(exc), 'request_id': request_id}) from exc
+
+
+@router.get('/mockup/render-status/{job_id}')
+async def render_status(job_id: str):
+    job = get_job(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail={'error': 'not_found'})
+    res = {
+        'id': job['id'],
+        'status': job.get('status'),
+        'phase': job.get('phase'),
+        'created_at': job.get('created_at'),
+        'updated_at': job.get('updated_at'),
+        'error': job.get('error'),
+        'result': {},
+    }
+    if job.get('result'):
+        final = job['result'].get('final_path')
+        preview = job['result'].get('preview_path')
+        if preview:
+            res['result']['preview_url'] = f"/static/renders/{Path(preview).name}"
+        if final:
+            res['result']['final_url'] = f"/static/renders/{Path(final).name}"
+        res['result']['content_type'] = job['result'].get('content_type')
+        res['result']['processing_time_ms'] = job['result'].get('processing_time_ms')
+    return res
+
+
+@router.post("/mockup/warp-preview-file")
+async def renderWarpPreviewFile(
+    config_json: str = Form(...),
+    design_image: UploadFile = File(...),
+):
+    try:
+        payload = json.loads(config_json)
+        req = WarpPreviewRequest(**payload)
+        design_bytes = await design_image.read()
+        design_canvas = decode_design_preview(design_bytes)
+        warped = _render_warp_preview_image(req, design_canvas)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    return Response(content=_encode_preview_png(warped), media_type="image/png", headers={"Cache-Control": "no-cache"})
+
+
+from fastapi import BackgroundTasks
+
+@router.post("/mockup/warp-prefetch")
+async def renderWarpPrefetch(
+    background_tasks: BackgroundTasks,
+    config_json: str = Form(...),
+):
+    try:
+        payload = json.loads(config_json)
+        req = WarpPreviewRequest(**payload)
+
+        canvas_w, canvas_h = estimate_print_area_canvas_size(
+            req.print_area,
+            fallback_width=req.mockup_width,
+            fallback_height=req.mockup_height,
         )
 
+        def run_cache():
+            from app.pipeline.mugs.cylindrical_warp import compute_and_cache_cylindrical_map
+            compute_and_cache_cylindrical_map(
+                print_area={
+                    "top_left": req.print_area["top_left"],
+                    "top_right": req.print_area["top_right"],
+                    "bottom_right": req.print_area["bottom_right"],
+                    "bottom_left": req.print_area["bottom_left"],
+                },
+                output_size=(req.mockup_width, req.mockup_height),
+                design_size=(canvas_w, canvas_h),
+                theta_max_deg=req.theta_max_deg,
+                pitch=float(req.print_area.get("camera_elevation", 0)),
+                smile_base=req.curve,
+                curve_top=req.curve_top,
+                curve_bottom=req.curve_bottom,
+                edge_squeeze=req.edge_squeeze,
+                squeeze_power=req.squeeze_power,
+                center_focus_width=req.center_focus_width,
+                curve_correction_alpha=req.curve_correction_alpha,
+                curve_snap_threshold_px=req.curve_snap_threshold_px,
+            )
 
-class WarpPreviewRequest(BaseModel):
-    mockup_width: int
-    mockup_height: int
-    print_area: dict
-    warp_type: str = 'cylinder'
-    theta_max_deg: float = 52.0
-    curve: float = 0.0
-    design_scale: float = 1.0
-    design_offset_x: float = 0.0
-    design_offset_y: float = 0.0
-    mask_points: Optional[list[list[int]]] = None
-    template_id: Optional[str] = None
-
-@router.post('/mockup/warp-preview')
-async def renderWarpPreview(req: WarpPreviewRequest):
-    '''
-    Endpoint sinh preview đã được composite (Multiply + Highlight).
-    Đảm bảo Editor nhìn thấy chính xác những gì sẽ render ra file thật.
-    '''
-    import numpy as np
-    import cv2
-    from app.pipeline.warp import perspective_warp, cylinder_warp, tps_warp, perspective_from_camera_angle
-    from app.pipeline.lighting import composite_with_surface_lighting
-    from app.services.vision import create_soft_mask
-
-    W, H = req.mockup_width, req.mockup_height
-    
-    # 1. Tạo Design Layer cho Preview
-    # Nếu không có template_id (chỉ xem grid), ta vẫn dùng grid nhưng mờ hơn
-    # Nếu CÓ template_id, ta dùng một lớp bán trong suốt để thấy được vùng in trên Mockup 
-    # mà không bị rối mắt bởi 2 bộ grid.
-    design_canvas = np.zeros((400, 400, 4), dtype=np.uint8)
-    
-    design_canvas[:, :, :3] = [255, 255, 255]
-    design_canvas[:, :, 3] = 10 # Rất mờ, gần như trong suốt
-
-    # 2. Warp Geometry
-    # We use the quad points directly from the frontend (already calibrated)
-    pa = {
-        'top_left': req.print_area['top_left'], 
-        'top_right': req.print_area['top_right'],
-        'bottom_right': req.print_area['bottom_right'], 
-        'bottom_left': req.print_area['bottom_left']
-    }
-
-    if req.warp_type == 'cylinder':
-        # Pass both smile and pitch for differential curve
-        smile_val = req.curve
-        pitch_val = req.print_area.get('camera_elevation', 0)
-        warped = cylinder_warp(design_canvas, pa, (W, H), req.theta_max_deg, smile_val, pitch_val, 
-                               req.design_scale, req.design_offset_x, req.design_offset_y)
-    elif req.warp_type == 'tps':
-        src_pts = req.print_area.get('mesh_src', [[0,0], [400,0], [400,400], [0,400]])
-        dst_pts = req.print_area.get('mesh_dst', [pa['top_left'], pa['top_right'], pa['bottom_right'], pa['bottom_left']])
-        warped = tps_warp(design_canvas, src_pts, dst_pts, (W, H))
-    else:
-        warped = cv2.warpPerspective(design_canvas, cv2.getPerspectiveTransform(
-            np.float32([[0,0], [400,0], [400,400], [0,400]]), 
-            np.float32([pa['top_left'], pa['top_right'], pa['bottom_right'], pa['bottom_left']])), (W, H))
-
-    # 3. Apply Alpha Masking
-    mask_to_use = np.full((H, W), 255, dtype=np.uint8)
-    if req.mask_points:
-        mask_to_use = create_soft_mask(req.mask_points, (H, W), feather_radius=2)
-        if warped.shape[2] == 4:
-            warped[:, :, 3] = cv2.bitwise_and(warped[:, :, 3], mask_to_use)
-
-    # 4. Physical Composite (Tạm thời bỏ qua để ảnh sáng rõ theo yêu cầu User)
-    final_view = warped
-    # if req.template_id:
-    #     ... lighting logic ...
-
-    ok, buf = cv2.imencode('.png', final_view)
-    return Response(content=bytes(buf), media_type='image/png', headers={"Cache-Control": "no-cache"})
+        background_tasks.add_task(run_cache)
+        return Response(status_code=202)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
-@router.post('/mockup/detect-region')
+
+@router.post("/mockup/warp-preview-adhoc")
+async def renderWarpPreviewAdhoc(
+    config_json: str = Form(...),
+    mockup_image: UploadFile = File(...),
+    design_image: UploadFile | None = File(None),
+):
+    try:
+        payload = json.loads(config_json)
+        req = WarpPreviewRequest(**payload)
+
+        mockup_bytes = await mockup_image.read()
+        mockup_buf = np.frombuffer(mockup_bytes, dtype=np.uint8)
+        mockup = cv2.imdecode(mockup_buf, cv2.IMREAD_COLOR)
+        if mockup is None:
+            raise HTTPException(status_code=400, detail="invalid_mockup")
+
+        if design_image is not None:
+            design_bytes = await design_image.read()
+            design_canvas = decode_design_preview(design_bytes)
+        else:
+            canvas_w, canvas_h = estimate_print_area_canvas_size(
+                req.print_area,
+                fallback_width=req.mockup_width,
+                fallback_height=req.mockup_height,
+            )
+            design_canvas = _build_preview_design_canvas(
+                canvas_w,
+                canvas_h,
+                mesh_density_strength=req.mesh_density_strength,
+            )
+
+        warped = _render_warp_preview_image(req, design_canvas, reference_mockup=mockup)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    png_bytes = _encode_preview_png(warped)
+    del warped
+    gc.collect()
+    return Response(content=png_bytes, media_type="image/png", headers={"Cache-Control": "no-cache"})
+
+
+@router.post("/mockup/detect-region")
 async def detectRegion(mockup_image: UploadFile = File(...)):
-    '''
-    Tự động nhận diện vùng in (quad) và phân loại sản phẩm.
-    '''
-    import cv2
-    import numpy as np
-    from app.services.vision import auto_detect_print_area
-
     content = await mockup_image.read()
     buf = np.frombuffer(content, dtype=np.uint8)
     img = cv2.imdecode(buf, cv2.IMREAD_COLOR)
     if img is None:
-        raise HTTPException(status_code=400, detail="Không đọc được ảnh mockup")
+        raise HTTPException(status_code=400, detail="invalid_mockup")
 
-    # Resize nếu ảnh quá lớn để processing nhanh
-    H, W = img.shape[:2]
+    h, w = img.shape[:2]
     max_dim = 1000
-    if max(H, W) > max_dim:
-        scale = max_dim / max(H, W)
-        img_small = cv2.resize(img, (int(W * scale), int(H * scale)))
+    if max(h, w) > max_dim:
+        scale = max_dim / max(h, w)
+        img_small = cv2.resize(img, (int(w * scale), int(h * scale)))
         result = auto_detect_print_area_v2(img_small)
-        # Scale lại tọa độ
-        for key in ['quad', 'clip_mask']:
+        for key in ["quad", "clip_mask"]:
             if result.get(key):
-                result[key] = [[int(p[0]/scale), int(p[1]/scale)] for p in result[key]]
-    else:
-        result = auto_detect_print_area_v2(img)
+                result[key] = [[int(p[0] / scale), int(p[1] / scale)] for p in result[key]]
+        return result
+    return auto_detect_print_area_v2(img)
 
 
-def apply_gamma_correction(img, target_gamma=2.2):
-    """ Áp dụng gamma correction để màu chuẩn POD. """
-    lut = np.array([((i / 255.0) ** (1.0 / target_gamma)) * 255 for i in range(256)], dtype=np.uint8)
-    if len(img.shape) == 3:
-        res = img.copy()
-        res[:, :, :3] = cv2.LUT(img[:, :, :3], lut)
-        return res
-    return cv2.LUT(img, lut)
-
-
-def unsharp_mask(img, amount=0.3, radius=1.0):
-    """ Sharpen nhẹ để bù softness từ interpolation. """
-    blurred = cv2.GaussianBlur(img, (0, 0), radius)
-    sharpened = cv2.addWeighted(img, 1.0 + amount, blurred, -amount, 0)
-    return np.clip(sharpened, 0, 255).astype(np.uint8)
-
-
-@router.post('/mockup/bake-normal')
+@router.post("/mockup/bake-normal")
 async def bakeNormal(
     mockup_image: UploadFile = File(...),
     fold_map: UploadFile = File(None),
 ):
-    '''
-    Bake normal map từ ảnh mockup và fold map.
-    '''
-    import cv2
-    import numpy as np
-    from app.services.vision import bake_normal_map
-
     content = await mockup_image.read()
     buf = np.frombuffer(content, dtype=np.uint8)
     img = cv2.imdecode(buf, cv2.IMREAD_COLOR)
+    if img is None:
+        raise HTTPException(status_code=400, detail="invalid_mockup")
 
     f_map = None
     if fold_map:
         f_content = await fold_map.read()
         f_buf = np.frombuffer(f_content, dtype=np.uint8)
-        f_map = cv2.imdecode(f_buf, cv2.IMREAD_GRAYSCALE)
-        # Normalize fold_map về [-1, 1] if needed? 
-        # Typically brush is 0-255. 128 = neutral.
-        f_map = (f_map.astype(np.float32) - 128.0) / 128.0
+        raw = cv2.imdecode(f_buf, cv2.IMREAD_GRAYSCALE)
+        if raw is not None:
+            f_map = (raw.astype(np.float32) - 128.0) / 128.0
 
     normal_map = bake_normal_map(img, f_map)
-    ok, buf = cv2.imencode('.png', normal_map)
-    
-    return Response(content=bytes(buf), media_type='image/png')
+    ok, buf = cv2.imencode(".png", normal_map)
+    if not ok:
+        raise HTTPException(status_code=500, detail="encode_failed")
+    return Response(content=bytes(buf), media_type="image/png")
 
 
-@router.get('/templates')
-async def listTemplates():
-    '''Liệt kê tất cả template đang active.'''
+@router.get("/templates")
+async def listTemplates(request: Request):
+    asset_base_dir = Path(os.getenv("ASSET_BASE_DIR", "./templates"))
+
     async with async_session() as session:
-        stmt = select(Template).where(Template.status == 'active')
+        stmt = select(Template).where(Template.status == "active")
         result = await session.execute(stmt)
         templates = result.scalars().all()
 
+    def _preview_url(slug: str) -> str:
+        template_dir = asset_base_dir / slug
+        if (template_dir / "preview.jpg").exists():
+            return f"/static/templates/{slug}/preview.jpg"
+        if (template_dir / "preview.png").exists():
+            return f"/static/templates/{slug}/preview.png"
+        return f"/static/templates/{slug}/mockup.jpg"
+
     return {
-        'templates': [
+        "templates": [
             {
-                'id': t.slug,
-                'name': t.name,
-                'preview_url': f'/static/templates/{t.slug}/mockup.jpg',
-                'output_size': [t.output_width, t.output_height],
+                "id": t.slug,
+                "name": t.name,
+                "preview_url": _preview_url(t.slug),
+                "preview_url_full": f"{str(request.base_url).rstrip('/')}{_preview_url(t.slug)}",
+                "output_size": [t.output_width, t.output_height],
             }
             for t in templates
         ]
+    }
+
+
+@router.get("/render/device")
+async def getRenderDeviceState():
+    return {
+        "device": getRenderDevice(),
+        "gpu_active": isGpuEnabled(),
+        "opencl_available": bool(cv2.ocl.haveOpenCL()),
+    }
+
+
+@router.post("/render/device")
+async def setRenderDeviceState(req: RenderDeviceRequest):
+    try:
+        gpu_active = setRenderDevice(req.device)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc
+
+    return {
+        "device": getRenderDevice(),
+        "gpu_active": gpu_active,
+        "opencl_available": bool(cv2.ocl.haveOpenCL()),
     }

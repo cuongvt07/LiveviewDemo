@@ -4,9 +4,10 @@
   "version": "0.0.0",
   "type": "module",
   "scripts": {
-    "dev": "vite",
+    "dev": "vite --configLoader native",
     "build": "tsc -b && vite build",
     "lint": "eslint .",
+    "check:encoding": "node scripts/check-encoding.js",
     "preview": "vite preview"
   },
   "dependencies": {
