@@ -144,6 +144,11 @@ async def lifespan(app: FastAPI):
     yield
 
     logger.info('Shutting down...')
+    try:
+        from app.services.url_analysis import close_async_http_client
+        await close_async_http_client()
+    except Exception:
+        logger.warning('Failed to close URL analysis HTTP client', exc_info=True)
 
 
 from fastapi.middleware.cors import CORSMiddleware

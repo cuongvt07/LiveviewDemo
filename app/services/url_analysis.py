@@ -1,20 +1,29 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
+import logging
 import mimetypes
 import os
 import re
+from contextlib import suppress
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Optional
-from urllib.parse import urlparse
+from urllib.parse import urlparse, unquote
 from urllib.request import Request, urlopen
+
+try:
+    import httpx
+except Exception:  # pragma: no cover - optional fallback
+    httpx = None  # type: ignore
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 INPUTS_DIR = REPO_ROOT / "inputs"
 PUBLIC_DIR = REPO_ROOT / "public"
+logger = logging.getLogger("mockup_service")
 
 STATIC_ASSET_PREFIXES: tuple[tuple[str, Path], ...] = (
     ("/static/bases/", INPUTS_DIR / "bases"),
@@ -31,6 +40,9 @@ DEFAULT_SECTION_URL_TEMPLATES: dict[str, str] = {
     "print": "https://asset.prtvstatic.com/{folder_path}/{name}.png",
     "cus": "https://asset.prtvstatic.com/{folder_path}/{name}.png",
 }
+
+_HTTPX_CLIENT: Optional["httpx.AsyncClient"] = None
+_HTTPX_CLIENT_LOCK = asyncio.Lock()
 
 MUG_MOCKUP_POLICIES: dict[tuple[str, str], dict] = {
     ("11oz", "white"): {
@@ -340,7 +352,7 @@ def resolve_public_mockup_variant(parsed: ParsedLiveviewUrl, preferred_view: Opt
         color_variant = _infer_color_variant(parsed.color_slug, parsed.color_hex)
         mug_size = _infer_mug_size(parsed.template)
         raise FileNotFoundError(
-            f"Không tìm thấy mockup local cho template={parsed.template}, color={color_variant}, size={mug_size}"
+            f"KhÃ´ng tÃ¬m tháº¥y mockup local cho template={parsed.template}, color={color_variant}, size={mug_size}"
         )
 
     normalized_preferred = str(preferred_view or "").strip().lower()
@@ -355,19 +367,19 @@ def resolve_public_mockup_variant(parsed: ParsedLiveviewUrl, preferred_view: Opt
 def parse_printerval_liveview_url(source_url: str) -> ParsedLiveviewUrl:
     parsed = urlparse(source_url.strip())
     if parsed.scheme not in {"http", "https"}:
-        raise ValueError("URL phải bắt đầu bằng http:// hoặc https://")
+        raise ValueError("URL pháº£i báº¯t Ä‘áº§u báº±ng http:// hoáº·c https://")
 
     path_parts = [part for part in parsed.path.split("/") if part]
     if len(path_parts) < 2 or path_parts[0] != "image":
-        raise ValueError("URL không đúng format /image/[resolution]/[slug].[ext]")
+        raise ValueError("URL khÃ´ng Ä‘Ãºng format /image/[resolution]/[slug].[ext]")
 
     resolution = None
-    file_part = path_parts[-1]
+    file_part = unquote(path_parts[-1])
     if len(path_parts) >= 3 and RESOLUTION_RE.fullmatch(path_parts[-2]):
         resolution = path_parts[-2]
 
     if "." not in file_part:
-        raise ValueError("URL không có phần mở rộng ảnh hợp lệ")
+        raise ValueError("URL khÃ´ng cÃ³ pháº§n má»Ÿ rá»™ng áº£nh há»£p lá»‡")
 
     slug, extension = file_part.rsplit(".", 1)
     slug_parts = [part.strip() for part in slug.split(",") if part.strip()]
@@ -377,7 +389,7 @@ def parse_printerval_liveview_url(source_url: str) -> ParsedLiveviewUrl:
         template_slug, design_slug, color_hex = slug_parts
         color_slug = None
     else:
-        raise ValueError("Slug URL phải có dạng 3 hoặc 4 phần ngăn bởi dấu phẩy")
+        raise ValueError("Slug URL pháº£i cÃ³ dáº¡ng 3 hoáº·c 4 pháº§n ngÄƒn bá»Ÿi dáº¥u pháº©y")
 
     section = design_slug.split("-", 1)[0].lower()
     return ParsedLiveviewUrl(
@@ -586,12 +598,43 @@ def _guess_extension(remote_url: str, content_type: str) -> str:
     return guessed or ".png"
 
 
+async def _get_async_http_client() -> Optional["httpx.AsyncClient"]:
+    global _HTTPX_CLIENT
+    if httpx is None:
+        return None
+    if _HTTPX_CLIENT is not None:
+        return _HTTPX_CLIENT
+
+    async with _HTTPX_CLIENT_LOCK:
+        if _HTTPX_CLIENT is not None:
+            return _HTTPX_CLIENT
+        _HTTPX_CLIENT = httpx.AsyncClient(
+            http2=True,
+            limits=httpx.Limits(max_connections=100, max_keepalive_connections=20),
+            timeout=httpx.Timeout(30.0),
+            follow_redirects=True,
+        )
+        return _HTTPX_CLIENT
+
+
+async def close_async_http_client() -> None:
+    global _HTTPX_CLIENT
+    if _HTTPX_CLIENT is None:
+        return
+    try:
+        await _HTTPX_CLIENT.aclose()
+    except Exception:
+        logger.warning("Failed to close async HTTP client", exc_info=True)
+    finally:
+        _HTTPX_CLIENT = None
+
+
 def download_remote_asset(remote_url: str, target_dir: Path, preferred_name: str) -> Path:
     target_dir.mkdir(parents=True, exist_ok=True)
     request = Request(
         remote_url,
         headers={
-            "User-Agent": "mug-mockup-service/1.2 (+url-analysis)",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
             "Accept": "image/*,*/*;q=0.8",
         },
     )
@@ -600,7 +643,7 @@ def download_remote_asset(remote_url: str, target_dir: Path, preferred_name: str
         content_type = response.headers.get("Content-Type", "")
 
     if not content:
-        raise ValueError(f"URL không trả về dữ liệu ảnh: {remote_url}")
+        raise ValueError(f"URL khÃ´ng tráº£ vá» dá»¯ liá»‡u áº£nh: {remote_url}")
 
     suffix = _guess_extension(remote_url, content_type)
     url_hash = hashlib.sha1(remote_url.encode("utf-8")).hexdigest()[:12]
@@ -610,7 +653,62 @@ def download_remote_asset(remote_url: str, target_dir: Path, preferred_name: str
     return destination
 
 
-def analyze_and_ingest_url(source_url: str, preferred_view: Optional[str] = None) -> dict:
+async def download_remote_asset_async(remote_url: str, target_dir: Path, preferred_name: str) -> Path:
+    target_dir.mkdir(parents=True, exist_ok=True)
+    client = await _get_async_http_client()
+
+    if client is None:
+        return await asyncio.to_thread(download_remote_asset, remote_url, target_dir, preferred_name)
+
+    response = await client.get(
+        remote_url,
+        headers={
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept": "image/*,*/*;q=0.8",
+        },
+    )
+    response.raise_for_status()
+    content = response.content
+    content_type = response.headers.get("Content-Type", "")
+
+    if not content:
+        raise ValueError(f"URL khÃ´ng tráº£ vá» dá»¯ liá»‡u áº£nh: {remote_url}")
+
+    suffix = _guess_extension(remote_url, content_type)
+    url_hash = hashlib.sha1(remote_url.encode("utf-8")).hexdigest()[:12]
+    file_name = f"{_sanitize_filename(preferred_name)}-{url_hash}{suffix}"
+    destination = target_dir / file_name
+    destination.write_bytes(content)
+    return destination
+
+
+def _find_cached_downloaded_asset(remote_url: str, target_dir: Path, preferred_name: str) -> Optional[Path]:
+    if not remote_url:
+        return None
+    target_dir.mkdir(parents=True, exist_ok=True)
+    url_hash = hashlib.sha1(remote_url.encode("utf-8")).hexdigest()[:12]
+    file_prefix = f"{_sanitize_filename(preferred_name)}-{url_hash}"
+    for candidate in sorted(target_dir.glob(f"{file_prefix}.*")):
+        if candidate.is_file() and candidate.stat().st_size > 0:
+            return candidate
+    return None
+
+
+def check_local_asset_exists(raw_path: Optional[str]) -> bool:
+    if not isinstance(raw_path, str) or not raw_path.strip():
+        return False
+    try:
+        path = resolve_local_asset_path(raw_path.strip())
+    except Exception:
+        return False
+    return path.exists() and path.is_file() and path.stat().st_size > 0
+
+
+def analyze_and_ingest_url(
+    source_url: str,
+    preferred_view: Optional[str] = None,
+    reuse_local_artwork: bool = True,
+) -> dict:
     context = build_url_lookup_context(source_url)
     parsed = context["parsed"]
     color_variant = context["color_variant"]
@@ -638,29 +736,159 @@ def analyze_and_ingest_url(source_url: str, preferred_view: Optional[str] = None
         design_source_url = source_url
         design_source_mode = "original_url_fallback"
         warning = (
-            "Chưa cấu hình PRINTERVAL_SECTION_URL_TEMPLATES nên hệ thống đang tải chính URL CDN gốc về local làm artwork fallback."
+            "ChÆ°a cáº¥u hÃ¬nh PRINTERVAL_SECTION_URL_TEMPLATES nÃªn há»‡ thá»‘ng Ä‘ang táº£i chÃ­nh URL CDN gá»‘c vá» local lÃ m artwork fallback."
         )
 
-    try:
-        downloaded = download_remote_asset(
+    preferred_name = f"{parsed.template}-{parsed.design_slug}"
+    artwork_dir = INPUTS_DIR / "artworks"
+    downloaded: Optional[Path] = None
+
+    if reuse_local_artwork:
+        downloaded = _find_cached_downloaded_asset(
             design_source_url,
-            INPUTS_DIR / "artworks",
-            preferred_name=f"{parsed.template}-{parsed.design_slug}",
+            artwork_dir,
+            preferred_name=preferred_name,
         )
-    except Exception:
-        if design_source_mode == "configured_template":
-            design_source_mode = "original_url_fallback"
-            warning = (
-                "Không tải được design source URL đã cấu hình, hệ thống fallback sang chính URL CDN gốc."
-            )
+        if downloaded is not None:
+            design_source_mode = f"{design_source_mode}_local_cache"
+
+    if downloaded is None:
+        try:
             downloaded = download_remote_asset(
-                parsed.source_url,
-                INPUTS_DIR / "artworks",
-                preferred_name=f"{parsed.template}-{parsed.design_slug}",
+                design_source_url,
+                artwork_dir,
+                preferred_name=preferred_name,
             )
-            design_source_url = parsed.source_url
-        else:
-            raise
+        except Exception:
+            if design_source_mode == "configured_template":
+                design_source_mode = "original_url_fallback"
+                warning = (
+                    "KhÃ´ng táº£i Ä‘Æ°á»£c design source URL Ä‘Ã£ cáº¥u hÃ¬nh, há»‡ thá»‘ng fallback sang chÃ­nh URL CDN gá»‘c."
+                )
+                if reuse_local_artwork:
+                    downloaded = _find_cached_downloaded_asset(
+                        parsed.source_url,
+                        artwork_dir,
+                        preferred_name=preferred_name,
+                    )
+                    if downloaded is not None:
+                        design_source_mode = "original_url_fallback_local_cache"
+                if downloaded is None:
+                    downloaded = download_remote_asset(
+                        parsed.source_url,
+                        artwork_dir,
+                        preferred_name=preferred_name,
+                    )
+                design_source_url = parsed.source_url
+            else:
+                raise
+
+    return {
+        "source_url": parsed.source_url,
+        "parsed": parsed.to_dict(),
+        "product_type": product_type,
+        "mockup_url": mockup_url,
+        "mockup_policy_key": f"{mug_size}:{color_variant}",
+        "mockup_family_key": context["mockup_family_key"],
+        "design_lookup_key": context["design_lookup_key"],
+        "mockup_view": selected_view,
+        "available_views": [item["view"] for item in list_available_mockup_views(parsed)],
+        "design_url": f"/static/artworks/{downloaded.name}",
+        "design_source_url": design_source_url,
+        "design_source_mode": design_source_mode,
+        "print_area_preset": print_area_preset,
+        "print_area_preset_confidence": print_area_confidence,
+        "print_area_preset_source": print_area_source,
+        "warp_config_preset": warp_preset,
+        "warning": warning,
+    }
+
+
+async def analyze_and_ingest_url_async(
+    source_url: str,
+    preferred_view: Optional[str] = None,
+    reuse_local_artwork: bool = True,
+) -> dict:
+    context = build_url_lookup_context(source_url)
+    parsed = context["parsed"]
+    color_variant = context["color_variant"]
+    mug_size = context["mug_size"]
+    product_type = context["product_type"]
+    policy = MUG_MOCKUP_POLICIES.get((mug_size, color_variant), {})
+    mockup_variant = resolve_public_mockup_variant(parsed, preferred_view=preferred_view)
+    mockup_url = str(mockup_variant["mockup_url"])
+    selected_view = str(mockup_variant["view"])
+
+    # Run print-area detection in parallel with network download.
+    detect_task = asyncio.create_task(
+        asyncio.to_thread(_detect_print_area_preset, mockup_url, product_type)
+    )
+    warp_preset = _build_warp_preset(parsed, color_variant)
+
+    design_source_url, design_source_mode = _build_design_source_url(parsed)
+    warning: Optional[str] = None
+    if not design_source_url:
+        design_source_url = source_url
+        design_source_mode = "original_url_fallback"
+        warning = (
+            "ChÆ°a cáº¥u hÃ¬nh PRINTERVAL_SECTION_URL_TEMPLATES nÃªn há»‡ thá»‘ng Ä‘ang táº£i chÃ­nh URL CDN gá»‘c vá» local lÃ m artwork fallback."
+        )
+
+    preferred_name = f"{parsed.template}-{parsed.design_slug}"
+    artwork_dir = INPUTS_DIR / "artworks"
+    downloaded: Optional[Path] = None
+
+    if reuse_local_artwork:
+        downloaded = _find_cached_downloaded_asset(
+            design_source_url,
+            artwork_dir,
+            preferred_name=preferred_name,
+        )
+        if downloaded is not None:
+            design_source_mode = f"{design_source_mode}_local_cache"
+
+    if downloaded is None:
+        try:
+            downloaded = await download_remote_asset_async(
+                design_source_url,
+                artwork_dir,
+                preferred_name=preferred_name,
+            )
+        except Exception:
+            if design_source_mode == "configured_template":
+                design_source_mode = "original_url_fallback"
+                warning = (
+                    "KhÃ´ng táº£i Ä‘Æ°á»£c design source URL Ä‘Ã£ cáº¥u hÃ¬nh, há»‡ thá»‘ng fallback sang chÃ­nh URL CDN gá»‘c."
+                )
+                if reuse_local_artwork:
+                    downloaded = _find_cached_downloaded_asset(
+                        parsed.source_url,
+                        artwork_dir,
+                        preferred_name=preferred_name,
+                    )
+                    if downloaded is not None:
+                        design_source_mode = "original_url_fallback_local_cache"
+                if downloaded is None:
+                    downloaded = await download_remote_asset_async(
+                        parsed.source_url,
+                        artwork_dir,
+                        preferred_name=preferred_name,
+                    )
+                design_source_url = parsed.source_url
+            else:
+                if not detect_task.done():
+                    detect_task.cancel()
+                with suppress(Exception):
+                    await detect_task
+                raise
+
+    print_area_preset, print_area_confidence, print_area_source = await detect_task
+    if print_area_source == "default":
+        policy_print_area = _build_policy_print_area(policy, product_type, preferred_view=selected_view)
+        if policy_print_area:
+            print_area_preset = policy_print_area
+            print_area_confidence = 0.98
+            print_area_source = "policy"
 
     return {
         "source_url": parsed.source_url,

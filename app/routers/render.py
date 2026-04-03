@@ -1,16 +1,18 @@
 # app/routers/render.py
 
 import asyncio
+import copy
 import json
 import logging
 import os
+import time
 import uuid
 from pathlib import Path
 from typing import Optional
 
 import cv2
 import numpy as np
-from fastapi import APIRouter, File, Form, HTTPException, UploadFile
+from fastapi import APIRouter, BackgroundTasks, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import Response
 from pydantic import BaseModel
 from sqlalchemy import select
@@ -25,7 +27,11 @@ from app.pipeline.mugs.specular_gloss import extract_specular_from_mockup
 from app.pipeline.pipeline import run_pipeline
 from app.pipeline.shared.decode import decode_design, decode_design_preview
 from app.pipeline.shared.design_transform import apply_design_transform, estimate_print_area_canvas_size
+from app.pipeline.mugs.cylindrical_warp import cylindrical_warp, compute_and_cache_cylindrical_map
 from app.pipeline.shared.liveview_cache import (
+    get_cylindrical_map_cache,
+    make_cylindrical_map_cache_key,
+    set_cylindrical_map_cache,
     get_preview_canvas_cache,
     make_preview_canvas_cache_key,
     set_preview_canvas_cache,
@@ -46,6 +52,16 @@ DEFAULT_MESH_DENSITY_STRENGTH = 2.0
 DEFAULT_CURVE_CORRECTION_ALPHA = 0.7
 DEFAULT_CURVE_SNAP_THRESHOLD_PX = 2.0
 PREVIEW_PNG_COMPRESSION = 1
+
+
+def _force_jpeg_output_format(requested_format: str | None) -> str:
+    normalized = str(requested_format or "").strip().lower()
+    if normalized not in {"jpg", "jpeg"}:
+        logging.getLogger("mockup_service").info(
+            "Coerce output_format '%s' -> 'jpg' for lightweight output",
+            requested_format,
+        )
+    return "jpg"
 
 
 def _log_horizontal_squeeze_debug(
@@ -101,6 +117,15 @@ class WarpPreviewRequest(BaseModel):
     design_fit_mode: str = "cover"
     mask_points: Optional[list[list[int]]] = None
     template_id: Optional[str] = None
+
+
+class WarpPrefetchRequest(BaseModel):
+    warp_params: dict
+    img_shape: tuple[int, int]
+    mockup_id: Optional[str] = None
+
+
+_warp_prefetch_inflight: set = set()
 
 
 class RenderDeviceRequest(BaseModel):
@@ -195,7 +220,7 @@ def _build_default_adhoc_config(width: int, height: int) -> dict:
     }
 
 
-def _merge_adhoc_user_config(config: dict, config_json: Optional[str]) -> dict:
+def _merge_adhoc_user_config(config: dict, config_json: Optional[str], scale_factor: float = 1.0) -> dict:
     if not config_json:
         return config
 
@@ -212,6 +237,19 @@ def _merge_adhoc_user_config(config: dict, config_json: Optional[str]) -> dict:
 
     user_pa = user_config.get("print_area", {})
     if isinstance(user_pa, dict):
+        # Scale specific coordinates
+        if scale_factor != 1.0:
+            for pt_key in ["top_left", "top_right", "bottom_right", "bottom_left"]:
+                if pt_key in user_pa and isinstance(user_pa[pt_key], list) and len(user_pa[pt_key]) >= 2:
+                    user_pa[pt_key] = [user_pa[pt_key][0] * scale_factor, user_pa[pt_key][1] * scale_factor]
+            
+            for list_key in ["mask_points", "mesh_control_src", "mesh_control_dst"]:
+                if list_key in user_pa and isinstance(user_pa[list_key], list):
+                    user_pa[list_key] = [
+                        [pt[0] * scale_factor, pt[1] * scale_factor] if isinstance(pt, list) and len(pt) >= 2 else pt
+                        for pt in user_pa[list_key]
+                    ]
+
         for key in [
             "top_left",
             "top_right",
@@ -432,6 +470,30 @@ def _merge_adhoc_user_config(config: dict, config_json: Optional[str]) -> dict:
     return config
 
 
+def _clone_assets_with_config(assets: MugAssets | ClothesAssets, config: dict) -> MugAssets | ClothesAssets:
+    if isinstance(assets, MugAssets):
+        return MugAssets(
+            mockup=assets.mockup,
+            shadow_map=assets.shadow_map,
+            normal_map=assets.normal_map,
+            mask=assets.mask,
+            specular_map=assets.specular_map,
+            config=config,
+        )
+
+    if isinstance(assets, ClothesAssets):
+        return ClothesAssets(
+            mockup=assets.mockup,
+            wrinkle_map=assets.wrinkle_map,
+            shadow_map=assets.shadow_map,
+            mask=assets.mask,
+            config=config,
+            slug=assets.slug,
+        )
+
+    return assets
+
+
 def _compute_adaptive_grid(width: int, height: int, cell_px: int = GRID_CELL_PX) -> tuple[int, int]:
     safe_w = max(1, int(width))
     safe_h = max(1, int(height))
@@ -570,6 +632,7 @@ def _render_warp_preview_image(
             center_focus_width=req.center_focus_width,
             curve_correction_alpha=req.curve_correction_alpha,
             curve_snap_threshold_px=req.curve_snap_threshold_px,
+            is_preview=True,
         )
         mesh_src = req.print_area.get("mesh_control_src", [])
         mesh_dst = req.print_area.get("mesh_control_dst", [])
@@ -584,6 +647,7 @@ def _render_warp_preview_image(
                 src_pts=np.float32(mesh_src),
                 dst_pts=np.float32(mesh_dst),
                 output_size=(w, h),
+                is_preview=True,
             )
     elif req.warp_type == "tps":
         src_pts_px = np.float32(req.print_area.get("mesh_control_src", []))
@@ -626,6 +690,71 @@ def _render_warp_preview_image(
     return warped
 
 
+@router.post("/mockup/warp-prefetch", status_code=202)
+async def warpPrefetch(request: WarpPrefetchRequest, background_tasks: BackgroundTasks):
+    """
+    Fire-and-forget: pre-compute warp map and store in cache.
+    Always returns 202 Accepted immediately.
+    """
+    from app.pipeline.shared.liveview_cache import make_cylindrical_map_cache_key
+    
+    wp = request.warp_params
+    pa = wp.get("print_area")
+    if not pa:
+        return {"status": "skipped", "reason": "missing_print_area"}
+
+    # Use default canvas size estimation if not provided
+    design_w, design_h = 1500, 1500 # standard target
+    
+    cache_key = make_cylindrical_map_cache_key(
+        print_area=pa,
+        output_size=request.img_shape,
+        design_size=(design_w, design_h),
+        theta_max_deg=float(wp.get("theta_max_deg", 52.0)),
+        pitch=float(wp.get("pitch", 0.0)),
+        smile_base=float(wp.get("curve", 0.08)),
+        curve_top=wp.get("curve_top"),
+        curve_bottom=wp.get("curve_bottom"),
+        edge_squeeze=float(wp.get("edge_squeeze", 0.0)),
+        squeeze_power=float(wp.get("squeeze_power", 2.0)),
+        center_focus_width=float(wp.get("center_focus_width", 0.0)),
+    )
+
+    if get_cylindrical_map_cache(cache_key) is not None or cache_key in _warp_prefetch_inflight:
+        return {"status": "skipped", "reason": "cached_or_inflight"}
+
+    background_tasks.add_task(_prefetch_compute_task, cache_key, wp, request.img_shape, (design_w, design_h))
+    return {"status": "accepted"}
+
+
+async def _prefetch_compute_task(cache_key: tuple, wp: dict, output_size: tuple, design_size: tuple):
+    _warp_prefetch_inflight.add(cache_key)
+    logger = logging.getLogger("mockup_service")
+    try:
+        loop = asyncio.get_event_loop()
+        # compute_and_cache_cylindrical_map handles the caching internally
+        await loop.run_in_executor(
+            None,
+            compute_and_cache_cylindrical_map,
+            wp.get("print_area"),
+            output_size,
+            design_size,
+            float(wp.get("theta_max_deg", 52.0)),
+            float(wp.get("pitch", 0.0)),
+            float(wp.get("curve", 0.08)),
+            wp.get("curve_top"),
+            wp.get("curve_bottom"),
+            float(wp.get("edge_squeeze", 0.0)),
+            float(wp.get("squeeze_power", 2.0)),
+            float(wp.get("center_focus_width", 0.0)),
+        )
+        logger.info(f"[PREFETCH] warp map computed and cached for key hash: {hash(cache_key)}")
+    except Exception as e:
+        logger.error(f"[PREFETCH] failed: {str(e)}")
+    finally:
+        _warp_prefetch_inflight.discard(cache_key)
+
+
 @router.post("/mockup/render")
 async def renderMockup(
     design_image: Optional[UploadFile] = File(None),
@@ -633,8 +762,10 @@ async def renderMockup(
     template_id: str = Form(...),
     output_format: str = Form("jpg"),
     jpeg_quality: int = Form(None),
+    config_json: str = Form(None),
 ):
     request_id = f"req_{uuid.uuid4().hex[:8]}"
+    effective_output_format = _force_jpeg_output_format(output_format)
     assets = template_registry.get(template_id)
 
     if assets is None:
@@ -695,10 +826,35 @@ async def renderMockup(
             },
         )
 
-    quality = jpeg_quality if jpeg_quality is not None else assets.config.get("output", {}).get("jpeg_quality", 90)
+    effective_assets = assets
+    if config_json:
+        try:
+            effective_config = _merge_adhoc_user_config(copy.deepcopy(assets.config), config_json)
+        except Exception as exc:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "error": "invalid_config_override",
+                    "message": str(exc),
+                    "request_id": request_id,
+                },
+            ) from exc
+        effective_assets = _clone_assets_with_config(assets, effective_config)
+
+    quality = (
+        jpeg_quality
+        if jpeg_quality is not None
+        else effective_assets.config.get("output", {}).get("jpeg_quality", 90)
+    )
 
     try:
-        image_bytes, meta = await asyncio.to_thread(run_pipeline, design_bytes, assets, output_format, quality)
+        image_bytes, meta = await asyncio.to_thread(
+            run_pipeline,
+            design_bytes,
+            effective_assets,
+            effective_output_format,
+            quality,
+        )
     except ValueError as exc:
         error_code = str(exc)
         if error_code == "image_too_large":
@@ -723,7 +879,7 @@ async def renderMockup(
 
     # Persist result in background if the design came from a URL
     if design_url:
-        asyncio.create_task(persistRenderResult(design_url, image_bytes, output_format))
+        asyncio.create_task(persistRenderResult(design_url, image_bytes, effective_output_format))
 
     return Response(
         content=image_bytes,
@@ -743,9 +899,12 @@ async def renderAdhoc(
     mockup_url: Optional[str] = Form(None),
     design_url: Optional[str] = Form(None),
     output_format: str = Form("jpg"),
+    jpeg_quality: int = Form(None),
     config_json: str = Form(None),
+    is_preview: bool = Form(False),
 ):
     request_id = f"req_{uuid.uuid4().hex[:8]}"
+    effective_output_format = _force_jpeg_output_format(output_format)
 
     try:
         # 1. Resolve Mockup
@@ -771,15 +930,20 @@ async def renderAdhoc(
             raise HTTPException(status_code=400, detail="Missing design_image or design_url")
 
         buf = np.frombuffer(mockup_bytes, dtype=np.uint8)
+        t_adhoc_start = time.perf_counter()
+        logger = logging.getLogger('mockup_service')
         mockup = cv2.imdecode(buf, cv2.IMREAD_COLOR)
         if mockup is None:
             raise ValueError("invalid_mockup")
 
         h, w = mockup.shape[:2]
-        if max(h, w) > 3000:
-            scale = 3000 / max(h, w)
-            mockup = cv2.resize(mockup, (int(w * scale), int(h * scale)))
+        max_dim = 512 if is_preview else 3000
+        scale = 1.0
+        if max(h, w) > max_dim:
+            scale = max_dim / max(h, w)
+            mockup = cv2.resize(mockup, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_LINEAR)
             h, w = mockup.shape[:2]
+        logger.info('[PERF] adhoc: mockup decode+resize: %dms (size=%dx%d)', int((time.perf_counter() - t_adhoc_start) * 1000), w, h)
 
         mask = np.full((h, w), 255, dtype=np.uint8)
 
@@ -804,8 +968,11 @@ async def renderAdhoc(
         shadow_map = np.clip(shadow_intensity * 0.6 + 0.4, 0, 1)
         shadow_map = (shadow_map * 255).astype(np.uint8)
 
+        t_config = time.perf_counter()
         config = _build_default_adhoc_config(w, h)
-        config = _merge_adhoc_user_config(config, config_json)
+        config = _merge_adhoc_user_config(config, config_json, scale)
+        config["is_preview"] = is_preview
+        logger.info('[PERF] adhoc: config merge: %dms', int((time.perf_counter() - t_config) * 1000))
         lighting_cfg = config.get("lighting", {})
         specular_strength = float(lighting_cfg.get("specular_strength", 0.0))
         if specular_strength > 0:
@@ -850,11 +1017,24 @@ async def renderAdhoc(
                 config=config,
             )
 
-        image_bytes, meta = await asyncio.to_thread(run_pipeline, design_bytes, assets, output_format, 90, False)
+        quality = (
+            max(1, min(100, int(jpeg_quality)))
+            if jpeg_quality is not None
+            else int(config.get("output", {}).get("jpeg_quality", 90))
+        )
+
+        image_bytes, meta = await asyncio.to_thread(
+            run_pipeline,
+            design_bytes,
+            assets,
+            effective_output_format,
+            quality,
+            False,
+        )
 
         # Persist result in background if the design came from a URL
-        if design_url:
-            asyncio.create_task(persistRenderResult(design_url, image_bytes, output_format))
+        if design_url and not is_preview:
+            asyncio.create_task(persistRenderResult(design_url, image_bytes, effective_output_format))
 
         return Response(
             content=image_bytes,
@@ -899,9 +1079,11 @@ async def render_adhoc_async(
     mockup_url: Optional[str] = Form(None),
     design_url: Optional[str] = Form(None),
     config_json: str = Form(None),
-    output_format: str = Form('png'),
+    output_format: str = Form('jpg'),
+    is_preview: bool = Form(False),
 ):
     request_id = f"req_{uuid.uuid4().hex[:8]}"
+    effective_output_format = _force_jpeg_output_format(output_format)
     try:
         if mockup_image:
             mockup_bytes = await mockup_image.read()
@@ -936,13 +1118,28 @@ async def render_adhoc_async(
         if mockup is None:
             raise HTTPException(status_code=400, detail="invalid_mockup")
         mh, mw = mockup.shape[:2]
+        max_dim = 512 if is_preview else 3000
+        scale = 1.0
+        if max(mh, mw) > max_dim:
+            scale = max_dim / max(mh, mw)
+            mockup = cv2.resize(mockup, (int(mw * scale), int(mh * scale)), interpolation=cv2.INTER_LINEAR)
+            mh, mw = mockup.shape[:2]
+            
         effective_cfg = _build_default_adhoc_config(mw, mh)
         effective_cfg = _merge_adhoc_user_config(
             effective_cfg,
             _json.dumps(cfg) if cfg else None,
+            scale
         )
+        effective_cfg["is_preview"] = is_preview
 
-        job_id = enqueue_adhoc_render(design_bytes, mockup_bytes, effective_cfg, output_format=output_format)
+        ok, res_buf = cv2.imencode('.png', mockup)
+        job_id = enqueue_adhoc_render(
+            design_bytes,
+            res_buf.tobytes(),
+            effective_cfg,
+            output_format=effective_output_format,
+        )
         return {"job_id": job_id, "request_id": request_id, "status": "queued"}
     except HTTPException:
         raise
@@ -993,6 +1190,53 @@ async def renderWarpPreviewFile(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     return Response(content=_encode_preview_png(warped), media_type="image/png", headers={"Cache-Control": "no-cache"})
+
+
+from fastapi import BackgroundTasks
+
+@router.post("/mockup/warp-prefetch")
+async def renderWarpPrefetch(
+    background_tasks: BackgroundTasks,
+    config_json: str = Form(...),
+):
+    try:
+        payload = json.loads(config_json)
+        req = WarpPreviewRequest(**payload)
+
+        canvas_w, canvas_h = estimate_print_area_canvas_size(
+            req.print_area,
+            fallback_width=req.mockup_width,
+            fallback_height=req.mockup_height,
+        )
+
+        def run_cache():
+            from app.pipeline.mugs.cylindrical_warp import compute_and_cache_cylindrical_map
+            compute_and_cache_cylindrical_map(
+                print_area={
+                    "top_left": req.print_area["top_left"],
+                    "top_right": req.print_area["top_right"],
+                    "bottom_right": req.print_area["bottom_right"],
+                    "bottom_left": req.print_area["bottom_left"],
+                },
+                output_size=(req.mockup_width, req.mockup_height),
+                design_size=(canvas_w, canvas_h),
+                theta_max_deg=req.theta_max_deg,
+                pitch=float(req.print_area.get("camera_elevation", 0)),
+                smile_base=req.curve,
+                curve_top=req.curve_top,
+                curve_bottom=req.curve_bottom,
+                edge_squeeze=req.edge_squeeze,
+                squeeze_power=req.squeeze_power,
+                center_focus_width=req.center_focus_width,
+                curve_correction_alpha=req.curve_correction_alpha,
+                curve_snap_threshold_px=req.curve_snap_threshold_px,
+            )
+
+        background_tasks.add_task(run_cache)
+        return Response(status_code=202)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
 
 
 @router.post("/mockup/warp-preview-adhoc")
@@ -1086,7 +1330,7 @@ async def bakeNormal(
 
 
 @router.get("/templates")
-async def listTemplates():
+async def listTemplates(request: Request):
     asset_base_dir = Path(os.getenv("ASSET_BASE_DIR", "./templates"))
 
     async with async_session() as session:
@@ -1094,16 +1338,21 @@ async def listTemplates():
         result = await session.execute(stmt)
         templates = result.scalars().all()
 
+    def _preview_url(slug: str) -> str:
+        template_dir = asset_base_dir / slug
+        if (template_dir / "preview.jpg").exists():
+            return f"/static/templates/{slug}/preview.jpg"
+        if (template_dir / "preview.png").exists():
+            return f"/static/templates/{slug}/preview.png"
+        return f"/static/templates/{slug}/mockup.jpg"
+
     return {
         "templates": [
             {
                 "id": t.slug,
                 "name": t.name,
-                "preview_url": (
-                    f"/static/templates/{t.slug}/preview.png"
-                    if (asset_base_dir / t.slug / "preview.png").exists()
-                    else f"/static/templates/{t.slug}/mockup.jpg"
-                ),
+                "preview_url": _preview_url(t.slug),
+                "preview_url_full": f"{str(request.base_url).rstrip('/')}{_preview_url(t.slug)}",
                 "output_size": [t.output_width, t.output_height],
             }
             for t in templates

@@ -79,6 +79,7 @@ class TemplateListItem(BaseModel):
     name: str
     status: str
     preview_url: Optional[str] = None
+    preview_url_full: Optional[str] = None
     output_size: list[int]
 
 

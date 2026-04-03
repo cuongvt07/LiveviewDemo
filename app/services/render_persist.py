@@ -30,6 +30,12 @@ def extractSlug(source_url: str) -> str:
     The slug is the comma-separated identifier portion of the URL path,
     e.g. 'mugs-11oz,White,print-123_456,ffffff' — used as the DB lookup key.
     """
+    if not source_url:
+        return "adhoc_no_url"
+        
+    if not source_url.startswith(('http://', 'https://')):
+        return "adhoc_" + hashlib.md5(source_url.encode('utf-8')).hexdigest()[:12]
+        
     parsed = parse_printerval_liveview_url(source_url)
     return parsed.slug
 

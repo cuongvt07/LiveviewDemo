@@ -2,6 +2,7 @@
 
 import cv2
 import time
+import logging
 import numpy as np
 from .mugs.mug_pipeline        import run_mug_pipeline,     MugAssets
 from .clothes.clothes_pipeline import run_clothes_pipeline,  ClothesAssets
@@ -17,18 +18,22 @@ def run_pipeline(
     """
     Entry point chung — dispatch theo product_type trong config.
     """
+    logger = logging.getLogger('mockup_service')
     t0 = time.perf_counter()
     product_type = assets.config.get("product_type", "mug")
 
     # Dispatch
+    t_pipeline = time.perf_counter()
     if product_type == "mug":
         result_bgr = run_mug_pipeline(design_bytes, assets)
     elif product_type in ("tshirt", "hoodie", "tote", "clothes"):
         result_bgr = run_clothes_pipeline(design_bytes, assets)
     else:
         raise ValueError(f"Unknown product_type: {product_type}")
+    logger.info('[PERF] pipeline dispatch (%s): %dms', product_type, int((time.perf_counter() - t_pipeline) * 1000))
 
     # Encode
+    t_encode = time.perf_counter()
     if output_format == "png":
         ok, buf = cv2.imencode(".png", result_bgr)
         content_type = "image/png"
@@ -39,11 +44,13 @@ def run_pipeline(
              cv2.IMWRITE_JPEG_OPTIMIZE, 1 if optimize_jpeg else 0]
         )
         content_type = "image/jpeg"
+    logger.info('[PERF] encode (%s): %dms', output_format, int((time.perf_counter() - t_encode) * 1000))
 
     if not ok:
         raise RuntimeError("encode_failed")
 
     elapsed_ms = int((time.perf_counter() - t0) * 1000)
+    logger.info('[PERF] ===== TOTAL run_pipeline: %dms =====', elapsed_ms)
     return bytes(buf), {
         "processing_time_ms": elapsed_ms,
         "content_type": content_type,

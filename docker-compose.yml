@@ -4,7 +4,7 @@ services:
       context: .
       dockerfile: Dockerfile.api
     ports:
-      - '8005:8000'
+      - '8040:8000'
     environment:
       - DATABASE_URL=postgresql+asyncpg://postgres:postgres@postgres:5432/mockup_service
       - ASSET_BASE_DIR=/app/templates

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import threading
 from collections import OrderedDict
 from typing import Any
@@ -17,13 +18,27 @@ def _normalize_scalar(value: Any, digits: int = 4) -> Any:
     return value
 
 
-def _normalize_points(points: list | tuple | None) -> tuple:
+def _quantize_scalar(value: Any, step: float) -> Any:
+    """Làm tròn tham số theo bước (step) để gom các request gần giống nhau về chung cache key."""
+    if value is None:
+        return None
+    from numbers import Number
+    if isinstance(value, (np.floating, float)) or (isinstance(value, Number) and not isinstance(value, bool)):
+        return float(round(round(float(value) / step) * step, 6))
+    return value
+
+
+def _normalize_points(points: list | tuple | None, quantize_step: float | None = None) -> tuple:
     if not isinstance(points, (list, tuple)):
         return ()
     normalized = []
     for point in points:
         if isinstance(point, (list, tuple)) and len(point) >= 2:
-            normalized.append((int(round(float(point[0]))), int(round(float(point[1])))))
+            x, y = float(point[0]), float(point[1])
+            if quantize_step is not None and quantize_step > 0:
+                x = round(x / quantize_step) * quantize_step
+                y = round(y / quantize_step) * quantize_step
+            normalized.append((int(round(x)), int(round(y))))
     return tuple(normalized)
 
 
@@ -74,6 +89,7 @@ class _ByteBoundLruCache:
 
 _preview_canvas_cache = _ByteBoundLruCache(max_bytes=32 * 1024 * 1024)
 _cylindrical_map_cache = _ByteBoundLruCache(max_bytes=160 * 1024 * 1024)
+_tps_map_cache = _ByteBoundLruCache(max_bytes=400 * 1024 * 1024)
 
 
 def make_preview_canvas_cache_key(width: int, height: int, mesh_density_strength: float) -> tuple:
@@ -104,29 +120,34 @@ def make_cylindrical_map_cache_key(
     edge_squeeze: float,
     squeeze_power: float,
     center_focus_width: float,
+    is_preview: bool = False,
 ) -> tuple:
+    quantize_step = 4.0 if is_preview else None
     return (
         int(output_size[0]),
         int(output_size[1]),
         int(design_size[0]),
         int(design_size[1]),
+        is_preview,
         _normalize_points(
             [
                 print_area.get("top_left"),
                 print_area.get("top_right"),
                 print_area.get("bottom_right"),
                 print_area.get("bottom_left"),
-            ]
+            ],
+            quantize_step=quantize_step
         ),
-        _normalize_scalar(theta_max_deg),
-        _normalize_scalar(pitch),
-        _normalize_scalar(smile_base),
-        _normalize_scalar(curve_top),
-        _normalize_scalar(curve_bottom),
-        _normalize_scalar(edge_squeeze),
-        _normalize_scalar(squeeze_power),
-        _normalize_scalar(center_focus_width),
+        _quantize_scalar(theta_max_deg, 2.0),
+        _quantize_scalar(pitch, 5.0),
+        _quantize_scalar(smile_base, 0.02),
+        _quantize_scalar(curve_top, 5.0),
+        _quantize_scalar(curve_bottom, 5.0),
+        _quantize_scalar(edge_squeeze, 0.05),
+        _quantize_scalar(squeeze_power, 0.1),
+        _quantize_scalar(center_focus_width, 0.05),
     )
+
 
 
 def get_cylindrical_map_cache(key: tuple) -> dict | None:
@@ -135,3 +156,37 @@ def get_cylindrical_map_cache(key: tuple) -> dict | None:
 
 def set_cylindrical_map_cache(key: tuple, bundle: dict) -> dict:
     return _cylindrical_map_cache.set(key, bundle)
+
+
+def make_tps_map_cache_key(
+    src_pts: np.ndarray | list | tuple,
+    dst_pts: np.ndarray | list | tuple,
+    input_size: tuple[int, int],
+    output_size: tuple[int, int],
+    is_preview: bool = False,
+) -> tuple:
+    def _hash_pts(pts):
+        pts_arr = np.asarray(pts, dtype=np.float32)
+        if is_preview:
+            # Quantize by 4px to increase cache hits during dragging
+            quant_step = 4.0
+            pts_arr = np.round(pts_arr / quant_step) * quant_step
+        return hashlib.md5(pts_arr.tobytes()).hexdigest()
+        
+    return (
+        _hash_pts(src_pts),
+        _hash_pts(dst_pts),
+        int(input_size[0]),
+        int(input_size[1]),
+        int(output_size[0]),
+        int(output_size[1]),
+        is_preview,
+    )
+
+
+def get_tps_map_cache(key: tuple) -> tuple[np.ndarray, np.ndarray] | None:
+    return _tps_map_cache.get(key)
+
+
+def set_tps_map_cache(key: tuple, tps_maps: tuple[np.ndarray, np.ndarray]) -> tuple[np.ndarray, np.ndarray]:
+    return _tps_map_cache.set(key, tps_maps)

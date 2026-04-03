@@ -60,26 +60,26 @@ export default function TemplateManager() {
       </div>
 
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(300px, 1fr))', gap: '1.5rem' }}>
-        {templates.map(t => (
-          <div key={t.id} className="glass-panel" style={{ padding: '1rem' }}>
+        {templates.map(templateItem => (
+          <div key={templateItem.id} className="glass-panel" style={{ padding: '1rem' }}>
             <div style={{ 
               width: '100%', 
               aspectRatio: '1', 
               background: 'rgba(0,0,0,0.5)', 
               borderRadius: '8px', 
               marginBottom: '1rem',
-              backgroundImage: `url(${t.preview_url})`,
+              backgroundImage: `url(${templateItem.preview_url})`,
               backgroundSize: 'cover',
               backgroundPosition: 'center'
             }}></div>
-            <h3 style={{ margin: '0 0 0.5rem', fontSize: '1.125rem' }}>{t.name}</h3>
+            <h3 style={{ margin: '0 0 0.5rem', fontSize: '1.125rem' }}>{templateItem.name}</h3>
             <div style={{ fontSize: '0.875rem', color: 'var(--text-secondary)', marginBottom: '1rem' }}>
-              {t('template_manager.slug')} {t.id} <br />
-              {t('template_manager.size')} {t.output_size[0]}x{t.output_size[1]}
+              {t('template_manager.slug')} {templateItem.id} <br />
+              {t('template_manager.size')} {templateItem.output_size ? `${templateItem.output_size[0]}x${templateItem.output_size[1]}` : '1500x1500'}
             </div>
             <div style={{ display: 'flex', gap: '0.5rem' }}>
                <button className="btn btn-outline" style={{ flex: 1, padding: '0.5rem' }}>{t('template_manager.config')}</button>
-               <button className="btn btn-outline" style={{ flex: 1, padding: '0.5rem' }} onClick={() => showHistory(t.id)}>{t('template_manager.history')}</button>
+               <button className="btn btn-outline" style={{ flex: 1, padding: '0.5rem' }} onClick={() => showHistory(templateItem.id)}>{t('template_manager.history')}</button>
             </div>
           </div>
         ))}

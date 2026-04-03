@@ -19,6 +19,16 @@ function blobToDataUrl(blob: Blob): Promise<string> {
   })
 }
 
+function debounce<T extends (...args: any[]) => void>(fn: T, delay: number): T & { cancel: () => void } {
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  const debounced = (...args: Parameters<T>) => {
+    if (timer) clearTimeout(timer);
+    timer = setTimeout(() => fn(...args), delay);
+  };
+  debounced.cancel = () => { if (timer) clearTimeout(timer); };
+  return debounced as T & { cancel: () => void };
+}
+
 export default function LivePreview() {
   const [mode, setMode] = useState<'template' | 'adhoc'>('template')
   const [templates, setTemplates] = useState<any[]>([])
@@ -61,6 +71,7 @@ export default function LivePreview() {
   const [templateLookupResult, setTemplateLookupResult] = useState<any | null>(null)
   const [templateMatches, setTemplateMatches] = useState<any[]>([])
   const [resolvedTemplatePreviewUrl, setResolvedTemplatePreviewUrl] = useState<string | null>(null)
+  const [isUploadingAsset, setIsUploadingAsset] = useState(false)
   
   // Results
   const [previewUrl, setPreviewUrl] = useState<string | null>(null)
@@ -118,6 +129,86 @@ export default function LivePreview() {
     setRenderTime(null)
   }, [designFile, libraryDesignUrl, mockupFile, libraryMockupUrl, mode, selectedTemplate])
 
+  // Auto-upload local files to library to optimize slider performance
+  useEffect(() => {
+    if (mockupFile && !libraryMockupUrl) {
+      const uploadMockup = async () => {
+        setIsUploadingAsset(true);
+        const fd = new FormData();
+        fd.append('file', mockupFile);
+        try {
+          const res = await fetch('/admin/library/bases/upload', { method: 'POST', body: fd });
+          if (res.ok) {
+            const data = await res.json();
+            setLibraryMockupUrl(data.url);
+            // We keep mockupFile to show it's "local" but use URL for rendering
+          }
+        } catch (e) {
+          console.error('Failed to auto-upload mockup:', e);
+        } finally {
+          setIsUploadingAsset(false);
+        }
+      };
+      void uploadMockup();
+    }
+  }, [mockupFile, libraryMockupUrl]);
+
+  // Task 0.2B: Background pre-compute warp maps while sliders are moving
+  const triggerWarpPrefetch = useMemo(() => {
+    return debounce((warp: any, h: number, w: number) => {
+      // Fire-and-forget prefetch to background compute the map
+      void fetch('/v1/mockup/warp-prefetch', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          warp_params: warp,
+          img_shape: [h, w],
+        }),
+      }).catch(() => {
+        // Silent failure for prefetch
+      });
+    }, 150);
+  }, []);
+
+  useEffect(() => {
+    if (mode === 'adhoc' && (mockupFile || libraryMockupUrl) && effectivePrintArea) {
+      const img = document.querySelector('.live-preview-image') as HTMLImageElement;
+      const h = img?.naturalHeight || 1500;
+      const w = img?.naturalWidth || 1500;
+      
+      triggerWarpPrefetch({
+        ...effectiveWarp,
+        print_area: effectivePrintArea,
+      }, h, w);
+    }
+  }, [effectiveWarp, effectivePrintArea, mode, mockupFile, libraryMockupUrl, triggerWarpPrefetch]);
+
+  useEffect(() => {
+    return () => triggerWarpPrefetch.cancel();
+  }, [triggerWarpPrefetch]);
+
+  useEffect(() => {
+    if (designFile && !libraryDesignUrl) {
+      const uploadDesign = async () => {
+        setIsUploadingAsset(true);
+        const fd = new FormData();
+        fd.append('file', designFile);
+        try {
+          const res = await fetch('/admin/library/artworks/upload', { method: 'POST', body: fd });
+          if (res.ok) {
+            const data = await res.json();
+            setLibraryDesignUrl(data.url);
+          }
+        } catch (e) {
+          console.error('Failed to auto-upload design:', e);
+        } finally {
+          setIsUploadingAsset(false);
+        }
+      };
+      void uploadDesign();
+    }
+  }, [designFile, libraryDesignUrl]);
+
   useEffect(() => {
     setResolvedTemplatePreviewUrl(null)
   }, [designFile, libraryDesignUrl, mockupFile, libraryMockupUrl, sourceProductUrl])
@@ -157,8 +248,8 @@ export default function LivePreview() {
 
     const buildFormData = () => {
       const fd = new FormData()
-      if (designFile) fd.append('design_image', designFile)
-      else if (libraryDesignUrl) fd.append('design_url', libraryDesignUrl)
+      if (libraryDesignUrl) fd.append('design_url', libraryDesignUrl)
+      else if (designFile) fd.append('design_image', designFile)
       return fd
     }
 
@@ -169,12 +260,12 @@ export default function LivePreview() {
         fd.append('template_id', selectedTemplate)
         url = '/v1/mockup/render'
       } else {
-        if (mockupFile) {
-          fd.append('mockup_image', mockupFile)
-        } else if (libraryMockupUrl) {
+        if (libraryMockupUrl) {
           fd.append('mockup_url', libraryMockupUrl)
+        } else if (mockupFile) {
+          fd.append('mockup_image', mockupFile)
         }
-        fd.append('output_format', 'png')
+        fd.append('output_format', 'jpg')
         if (effectivePrintArea) {
           const isCylinderProduct = String(effectiveWarp?.product_type || productType).startsWith('cylinder')
           const configJson = {
@@ -203,6 +294,7 @@ export default function LivePreview() {
 
         // Keep queue-based async render for normal page mode.
         // In editor modal, use sync render to avoid queue lag while dragging mesh.
+        fd.append('is_preview', 'true')
         const useAsyncAdhoc = !showEditor
         url = useAsyncAdhoc ? '/v1/mockup/render-async-adhoc' : '/v1/mockup/render-adhoc'
       }
@@ -329,9 +421,7 @@ export default function LivePreview() {
 
     setLoading(true);
     try {
-      const previewDataUrl = previewUrl
-        ? await fetch(previewUrl).then(async response => blobToDataUrl(await response.blob()))
-        : null
+      let previewDataUrl: string | null = null
 
       const urlAnalysisMeta = urlImportSummary ? {
         source_url: urlImportSummary.source_url,
@@ -375,73 +465,103 @@ export default function LivePreview() {
         throw new Error(t('live_preview.upload.no_mockup'));
       }
 
+      const OUT_W = 1500
+      const OUT_H = 1500
+      const cfg: any = { print_area: effectivePrintArea, warp: effectiveWarp }
+      const ptsDst = effectivePrintArea?.mesh_control_dst
+      const ptsSrc = effectivePrintArea?.mesh_control_src
+      if (Array.isArray(ptsDst) && ptsDst.length > 0) {
+        const n = ptsDst.length
+        let side = Math.round(Math.sqrt(n))
+        let cols = Math.max(1, side - 1)
+        let rows = Math.max(1, side - 1)
+        if (side * side !== n) {
+          cols = Math.max(1, Math.round(Math.sqrt(n)))
+          rows = Math.max(1, Math.ceil(n / cols) - 1)
+        }
+        const points = ptsDst.map((p: number[]) => [Number(p[0]) / OUT_W, Number(p[1]) / OUT_H, false])
+        cfg.mesh = {
+          enabled: true,
+          cols: cols,
+          rows: rows,
+          spacing: 'cosine',
+          tension: 0.35,
+          corner_blend_radius: 0.08,
+          symmetry_lock: true,
+          max_displacement: 0.15,
+          points,
+        }
+      } else if (Array.isArray(ptsSrc) && ptsSrc.length > 0) {
+        const n = ptsSrc.length
+        let side = Math.round(Math.sqrt(n))
+        let cols = Math.max(1, side - 1)
+        let rows = Math.max(1, side - 1)
+        if (side * side !== n) {
+          cols = Math.max(1, Math.round(Math.sqrt(n)))
+          rows = Math.max(1, Math.ceil(n / cols) - 1)
+        }
+        const points = ptsSrc.map((p: number[]) => [Number(p[0]) / OUT_W, Number(p[1]) / OUT_H, false])
+        cfg.mesh = {
+          enabled: true,
+          cols: cols,
+          rows: rows,
+          spacing: 'cosine',
+          tension: 0.35,
+          corner_blend_radius: 0.08,
+          symmetry_lock: true,
+          max_displacement: 0.15,
+          points,
+        }
+      }
+
+      // Save-template must use full-quality preview (not low-res live preview).
+      if (effectivePrintArea && (libraryDesignUrl || designFile)) {
+        try {
+          const previewRenderFd = new FormData()
+          previewRenderFd.append('mockup_url', resolvedMockupUrl)
+          if (libraryDesignUrl) previewRenderFd.append('design_url', libraryDesignUrl)
+          else if (designFile) previewRenderFd.append('design_image', designFile)
+          previewRenderFd.append('output_format', 'jpg')
+          previewRenderFd.append('jpeg_quality', '95')
+          previewRenderFd.append('is_preview', 'false')
+          previewRenderFd.append('config_json', JSON.stringify(cfg))
+
+          const previewRenderRes = await fetch('/v1/mockup/render-adhoc', {
+            method: 'POST',
+            body: previewRenderFd,
+          })
+          if (previewRenderRes.ok) {
+            const contentType = previewRenderRes.headers.get('content-type') || ''
+            if (contentType.startsWith('image/')) {
+              previewDataUrl = await blobToDataUrl(await previewRenderRes.blob())
+            }
+          } else {
+            console.warn('High-quality preview render failed before save-template:', previewRenderRes.status)
+          }
+        } catch (e) {
+          console.warn('High-quality preview render error before save-template:', e)
+        }
+      }
+
+      if (!previewDataUrl && previewUrl) {
+        previewDataUrl = await fetch(previewUrl).then(async response => blobToDataUrl(await response.blob()))
+      }
+
       const res = await fetch('/admin/templates/save-adhoc', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
         },
-        // If printArea contains mesh_control_dst/src, include mesh payload normalized to template output size
-        body: (() => {
-          const cfg: any = { print_area: effectivePrintArea, warp: effectiveWarp };
-          const ptsDst = effectivePrintArea?.mesh_control_dst;
-          const ptsSrc = effectivePrintArea?.mesh_control_src;
-          const OUT_W = 1500, OUT_H = 1500;
-          if (Array.isArray(ptsDst) && ptsDst.length > 0) {
-            const n = ptsDst.length;
-            let side = Math.round(Math.sqrt(n));
-            let cols = Math.max(1, side - 1);
-            let rows = Math.max(1, side - 1);
-            if (side * side !== n) {
-              // fallback: estimate cols by scanning unique x counts per row if possible
-              cols = Math.max(1, Math.round(Math.sqrt(n)));
-              rows = Math.max(1, Math.ceil(n / cols) - 1);
-            }
-            const points = ptsDst.map((p: number[]) => [Number(p[0]) / OUT_W, Number(p[1]) / OUT_H, false]);
-            cfg.mesh = {
-              enabled: true,
-              cols: cols,
-              rows: rows,
-              spacing: 'cosine',
-              tension: 0.35,
-              corner_blend_radius: 0.08,
-              symmetry_lock: true,
-              max_displacement: 0.15,
-              points,
-            };
-          } else if (Array.isArray(ptsSrc) && ptsSrc.length > 0) {
-            const n = ptsSrc.length;
-            let side = Math.round(Math.sqrt(n));
-            let cols = Math.max(1, side - 1);
-            let rows = Math.max(1, side - 1);
-            if (side * side !== n) {
-              cols = Math.max(1, Math.round(Math.sqrt(n)));
-              rows = Math.max(1, Math.ceil(n / cols) - 1);
-            }
-            const points = ptsSrc.map((p: number[]) => [Number(p[0]) / OUT_W, Number(p[1]) / OUT_H, false]);
-            cfg.mesh = {
-              enabled: true,
-              cols: cols,
-              rows: rows,
-              spacing: 'cosine',
-              tension: 0.35,
-              corner_blend_radius: 0.08,
-              symmetry_lock: true,
-              max_displacement: 0.15,
-              points,
-            };
-          }
-
-          return JSON.stringify({
-            slug,
-            name,
-            product_type: productType || 'mug',
-            config: Object.assign(cfg, (urlAnalysisMeta ? { url_analysis: urlAnalysisMeta } : {})),
-            mockup_url: resolvedMockupUrl,
-            output_width: OUT_W,
-            output_height: OUT_H,
-            preview_data_url: previewDataUrl,
-          });
-        })(),
+        body: JSON.stringify({
+          slug,
+          name,
+          product_type: productType || 'mug',
+          config: Object.assign(cfg, (urlAnalysisMeta ? { url_analysis: urlAnalysisMeta } : {})),
+          mockup_url: resolvedMockupUrl,
+          output_width: OUT_W,
+          output_height: OUT_H,
+          preview_data_url: previewDataUrl,
+        }),
       });
 
         if (!res.ok) {
@@ -949,9 +1069,26 @@ export default function LivePreview() {
                 />
               </div>
               <aside style={{ width: '400px', borderLeft: '1px solid var(--border-color)', padding: '1rem', display: 'flex', flexDirection: 'column' }}>
-                <h4>{t('live_preview.modal.quick_preview_title')}</h4>
-                <div style={{ flex: 1, background: '#000', borderRadius: '8px', overflow: 'hidden', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1rem' }}>
+                  <h4 style={{ margin: 0 }}>{t('live_preview.modal.quick_preview_title')}</h4>
+                  {renderTime !== null && (
+                    <div style={{ fontSize: '0.75rem', color: 'var(--accent-color)', fontWeight: 'bold', background: 'rgba(59, 130, 246, 0.1)', padding: '2px 8px', borderRadius: '12px' }}>
+                      {renderTime} ms
+                    </div>
+                  )}
+                </div>
+                <div style={{ flex: 1, background: '#000', borderRadius: '8px', overflow: 'hidden', display: 'flex', alignItems: 'center', justifyContent: 'center', position: 'relative' }}>
                   {(previewUrl || resolvedTemplatePreviewUrl) ? <img src={previewUrl || resolvedTemplatePreviewUrl || ''} style={{ width: '100%', height: '100%', objectFit: 'contain' }} /> : <small>{t('live_preview.modal.quick_preview_hint')}</small>}
+                  {loading && (
+                    <div style={{ position: 'absolute', inset: 0, background: 'rgba(0,0,0,0.4)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 10 }}>
+                      <div className="spinner-mini"></div>
+                    </div>
+                  )}
+                  {isUploadingAsset && (
+                    <div style={{ position: 'absolute', bottom: '1rem', left: '1rem', right: '1rem', background: 'rgba(0,0,0,0.7)', color: 'white', padding: '0.5rem', borderRadius: '4px', fontSize: '0.7rem', textAlign: 'center' }}>
+                      Optimizing assets...
+                    </div>
+                  )}
                 </div>
               </aside>
             </div>

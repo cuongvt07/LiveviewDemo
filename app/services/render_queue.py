@@ -15,6 +15,7 @@ _worker_started = False
 
 OUT_DIR = Path('output') / 'renders'
 OUT_DIR.mkdir(parents=True, exist_ok=True)
+PREVIEW_MAX_DIM = 512
 
 
 def _start_worker():
@@ -26,7 +27,7 @@ def _start_worker():
     _worker_started = True
 
 
-def enqueue_adhoc_render(design_bytes: bytes, mockup_bytes: bytes, config: dict, output_format: str = 'png') -> str:
+def enqueue_adhoc_render(design_bytes: bytes, mockup_bytes: bytes, config: dict, output_format: str = 'jpg') -> str:
     job_id = f'job_{uuid.uuid4().hex[:12]}'
     job = {
         'id': job_id,
@@ -76,7 +77,11 @@ def _worker_loop():
             design_bytes = payload['design_bytes']
             mockup_bytes = payload['mockup_bytes']
             config = payload['config']
-            output_format = payload.get('output_format', 'png')
+            requested_output_format = str(payload.get('output_format', 'jpg')).strip().lower()
+            output_format = 'jpg'
+            if requested_output_format not in {'jpg', 'jpeg'}:
+                # Queue worker enforces JPEG output for lighter payloads.
+                pass
 
             # Build minimal assets similar to render-adhoc
             import cv2
@@ -111,16 +116,17 @@ def _worker_loop():
 
             job['phase'] = 'rendering_lowres'
             job['updated_at'] = time.time()
-            # Produce a low-res quick preview (512px) to show fast
-            preview_w, preview_h = (512, int(512 * h / max(w, 1)))
+            # Produce a quick preview with max dimension pinned to 512px.
+            max_side = max(int(w), int(h), 1)
+            scale = min(1.0, float(PREVIEW_MAX_DIM) / float(max_side))
+            preview_w = max(1, int(round(w * scale)))
+            preview_h = max(1, int(round(h * scale)))
             try:
-                # Try to generate a preview by resizing design and calling run_pipeline
-                small_design = design_bytes
-                # run_pipeline expects full design bytes; we'll pass original but set output size via assets.mockup size? Keep simple: render full and resize result
+                # Keep render output logic simple: render once, then downscale for preview.
                 result_bytes, meta = run_pipeline(design_bytes, assets, output_format, 90, False)
                 # write preview and final
-                preview_path = OUT_DIR / f"{job_id}_preview.png"
-                final_path = OUT_DIR / f"{job_id}.png"
+                preview_path = OUT_DIR / f"{job_id}_preview.jpg"
+                final_path = OUT_DIR / f"{job_id}.jpg"
                 with open(final_path, 'wb') as f:
                     f.write(result_bytes)
                 # create small preview by resizing final
@@ -128,7 +134,15 @@ def _worker_loop():
                     img = cv2.imdecode(np.frombuffer(result_bytes, np.uint8), cv2.IMREAD_UNCHANGED)
                     if img is not None:
                         small = cv2.resize(img, (preview_w, preview_h), interpolation=cv2.INTER_LINEAR)
-                        cv2.imencode('.png', small)[1].tofile(str(preview_path))
+                        ok_preview, preview_buf = cv2.imencode(
+                            '.jpg',
+                            small,
+                            [int(cv2.IMWRITE_JPEG_QUALITY), 85],
+                        )
+                        if ok_preview:
+                            preview_buf.tofile(str(preview_path))
+                        else:
+                            raise RuntimeError('preview_encode_failed')
                 except Exception:
                     # fallback: copy final to preview
                     from shutil import copyfile
@@ -137,7 +151,7 @@ def _worker_loop():
                 job['result'] = {
                     'final_path': str(final_path),
                     'preview_path': str(preview_path),
-                    'content_type': meta.get('content_type', 'image/png'),
+                    'content_type': meta.get('content_type', 'image/jpeg'),
                     'processing_time_ms': meta.get('processing_time_ms', 0),
                 }
                 job['phase'] = 'done'

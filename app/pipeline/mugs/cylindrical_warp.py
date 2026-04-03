@@ -1,3 +1,6 @@
+import logging
+import time
+
 import cv2
 import numpy as np
 
@@ -356,7 +359,7 @@ def _build_curved_clip_mask(
     return mask
 
 
-def _compute_and_cache_cylindrical_map(
+def compute_and_cache_cylindrical_map(
     print_area: dict,
     output_size: tuple[int, int],
     design_size: tuple[int, int],
@@ -371,6 +374,7 @@ def _compute_and_cache_cylindrical_map(
     reference_mockup: np.ndarray | None = None,
     curve_correction_alpha: float = 0.0,
     curve_snap_threshold_px: float = 2.0,
+    is_preview: bool = False,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray | None]:
     """Compute map_x/map_y (heavy math) and write to liveview cache.
 
@@ -392,6 +396,7 @@ def _compute_and_cache_cylindrical_map(
         edge_squeeze=edge_squeeze,
         squeeze_power=squeeze_power,
         center_focus_width=center_focus_width,
+        is_preview=is_preview,
     )
 
     # If another thread already filled the cache, return it
@@ -417,27 +422,65 @@ def _compute_and_cache_cylindrical_map(
 
     H_mat, _ = cv2.findHomography(dst_corners, src_canonical)
 
-    ys, xs = np.mgrid[0:H, 0:W].astype(np.float32)
-    pts = np.stack([xs.ravel(), ys.ravel(), np.ones(H * W)], axis=0)
-    proj = H_mat @ pts
-    proj /= proj[2:3, :]
-    X_proj = proj[0].reshape(H, W)
-    Y_proj = proj[1].reshape(H, W)
+    PREVIEW_GRID_SIZE = 512
+    if is_preview and (W > PREVIEW_GRID_SIZE or H > PREVIEW_GRID_SIZE):
+        sw = PREVIEW_GRID_SIZE if W >= H else int(W * PREVIEW_GRID_SIZE / H)
+        sh = PREVIEW_GRID_SIZE if H >= W else int(H * PREVIEW_GRID_SIZE / W)
+        
+        ys_small, xs_small = np.mgrid[0:sh, 0:sw].astype(np.float32)
+        # Map grid [0, sw-1] to [0, W-1]
+        xs_full = (xs_small / max(sw - 1, 1)) * (W - 1)
+        ys_full = (ys_small / max(sh - 1, 1)) * (H - 1)
+        
+        pts_small = np.stack([xs_full.ravel(), ys_full.ravel(), np.ones(sh * sw)], axis=0)
+        proj_small = H_mat @ pts_small
+        proj_small /= proj_small[2:3, :]
+        X_proj_small = proj_small[0].reshape(sh, sw)
+        Y_proj_small = proj_small[1].reshape(sh, sw)
+        
+        U_small, V_small = compute_uv_cylindrical(
+            X_proj_small,
+            Y_proj_small,
+            theta_max_deg=theta_max_deg,
+            pitch=pitch,
+            hr_ratio=max(1e-6, float(abs(print_area.get("bottom_left", [0, 0])[1] - print_area.get("top_left", [0, 0])[1]) / (abs(print_area.get("top_right", [0, 0])[0] - print_area.get("top_left", [0, 0])[0]) + 1e-6))),
+            smile_base=smile_base,
+            curve_top=curve_top,
+            curve_bottom=curve_bottom,
+            edge_squeeze=edge_squeeze,
+            squeeze_power=squeeze_power,
+            center_focus_width=center_focus_width,
+            clamp_v=False,
+        )
+        
+        # Upscale U, V back to (W, H)
+        U = cv2.resize(U_small, (W, H), interpolation=cv2.INTER_LINEAR)
+        V = cv2.resize(V_small, (W, H), interpolation=cv2.INTER_LINEAR)
+        
+        # We also need X_proj, Y_proj for the "outside" check later
+        X_proj = cv2.resize(X_proj_small, (W, H), interpolation=cv2.INTER_LINEAR)
+    else:
+        ys, xs = np.mgrid[0:H, 0:W].astype(np.float32)
+        pts = np.stack([xs.ravel(), ys.ravel(), np.ones(H * W)], axis=0)
+        proj = H_mat @ pts
+        proj /= proj[2:3, :]
+        X_proj = proj[0].reshape(H, W)
+        Y_proj = proj[1].reshape(H, W)
 
-    U, V = compute_uv_cylindrical(
-        X_proj,
-        Y_proj,
-        theta_max_deg=theta_max_deg,
-        pitch=pitch,
-        hr_ratio=max(1e-6, float(abs(print_area.get("bottom_left", [0, 0])[1] - print_area.get("top_left", [0, 0])[1]) / (abs(print_area.get("top_right", [0, 0])[0] - print_area.get("top_left", [0, 0])[0]) + 1e-6))),
-        smile_base=smile_base,
-        curve_top=curve_top,
-        curve_bottom=curve_bottom,
-        edge_squeeze=edge_squeeze,
-        squeeze_power=squeeze_power,
-        center_focus_width=center_focus_width,
-        clamp_v=False,
-    )
+        U, V = compute_uv_cylindrical(
+            X_proj,
+            Y_proj,
+            theta_max_deg=theta_max_deg,
+            pitch=pitch,
+            hr_ratio=max(1e-6, float(abs(print_area.get("bottom_left", [0, 0])[1] - print_area.get("top_left", [0, 0])[1]) / (abs(print_area.get("top_right", [0, 0])[0] - print_area.get("top_left", [0, 0])[0]) + 1e-6))),
+            smile_base=smile_base,
+            curve_top=curve_top,
+            curve_bottom=curve_bottom,
+            edge_squeeze=edge_squeeze,
+            squeeze_power=squeeze_power,
+            center_focus_width=center_focus_width,
+            clamp_v=False,
+        )
 
     map_x = (np.clip(U, 0.0, 1.0) * (dw - 1)).astype(np.float32)
     map_y = (np.clip(V, 0.0, 1.0) * (dh - 1)).astype(np.float32)
@@ -505,6 +548,7 @@ def cylindrical_warp(
     center_focus_width: float = 0.0,
     curve_correction_alpha: float = DEFAULT_CURVE_CORRECTION_ALPHA,
     curve_snap_threshold_px: float = DEFAULT_CURVE_SNAP_THRESHOLD_PX,
+    is_preview: bool = False,
 ) -> np.ndarray:
     """
     Warp a flat design to mug cylindrical space.
@@ -536,7 +580,10 @@ def cylindrical_warp(
         edge_squeeze=edge_squeeze,
         squeeze_power=squeeze_power,
         center_focus_width=center_focus_width,
+        is_preview=is_preview,
     )
+    _cyl_logger = logging.getLogger('mockup_service')
+    t_cyl = time.perf_counter()
     cached_bundle = get_cylindrical_map_cache(cache_key)
     map_x: np.ndarray
     map_y: np.ndarray
@@ -545,8 +592,9 @@ def cylindrical_warp(
     if cached_bundle is not None:
         map_x = cached_bundle["map_x"]
         map_y = cached_bundle["map_y"]
+        _cyl_logger.info('[PERF]     warp map: CACHE HIT (%dms)', int((time.perf_counter() - t_cyl) * 1000))
     else:
-        map_x, map_y, H_mat = _compute_and_cache_cylindrical_map(
+        map_x, map_y, H_mat = compute_and_cache_cylindrical_map(
             print_area=pa,
             output_size=(W, H),
             design_size=(dw, dh),
@@ -561,22 +609,29 @@ def cylindrical_warp(
             reference_mockup=reference_mockup,
             curve_correction_alpha=curve_correction_alpha,
             curve_snap_threshold_px=curve_snap_threshold_px,
+            is_preview=is_preview,
         )
+        _cyl_logger.info('[PERF]     warp map: CACHE MISS - computed (%dms)', int((time.perf_counter() - t_cyl) * 1000))
         # refresh cached bundle reference for curved_mask lookup
         cached_bundle = get_cylindrical_map_cache(cache_key)
 
-    interpolation = cv2.INTER_LANCZOS4
-    if W <= 1000:
+    if is_preview:
         interpolation = cv2.INTER_LINEAR
-    elif W <= 2000:
-        interpolation = cv2.INTER_CUBIC
+    else:
+        interpolation = cv2.INTER_LANCZOS4
+        if W <= 1000:
+            interpolation = cv2.INTER_LINEAR
+        elif W <= 2000:
+            interpolation = cv2.INTER_CUBIC
 
+    t_remap = time.perf_counter()
     warped = gpuRemap(
         design,
         map_x,
         map_y,
         interpolation=interpolation,
     )
+    _cyl_logger.info('[PERF]     gpuRemap: %dms (interp=%s)', int((time.perf_counter() - t_remap) * 1000), 'LANCZOS4' if interpolation == cv2.INTER_LANCZOS4 else ('CUBIC' if interpolation == cv2.INTER_CUBIC else 'LINEAR'))
 
     # Final clip by curved boundary so rendered print matches locked editor grid shape.
     if warped.ndim == 3 and warped.shape[2] == 4:
