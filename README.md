@@ -143,6 +143,7 @@ Base URL examples:
 ### 8.2 Render APIs (`/v1`)
 
 - `POST /v1/mockup/render`: render from an existing saved template (`template_id`) and a design.
+- `POST /v1/mockup/render-preview`: fast template preview render (auto preview mode, JPEG).
 - `POST /v1/mockup/render-adhoc`: render without saved template; upload/provide mockup + design directly.
 - `POST /v1/mockup/render-async-adhoc`: queue async ad-hoc render job.
 - `GET /v1/mockup/render-status/{job_id}`: get async render progress/result URL.
@@ -159,6 +160,7 @@ Base URL examples:
 Notes:
 - Render output is forced to JPEG for lightweight responses.
 - `config_json` overrides are supported on render endpoints where defined.
+- `POST /v1/mockup/render` supports `is_preview=true` (and optional `preview_max_dim`, default `512`) to speed up template mode by downscaling render assets first.
 
 ### 8.3 Resolve APIs (`/v1`)
 
@@ -217,6 +219,24 @@ curl -X POST "http://localhost:8040/v1/mockup/render" \
   -F "design_url=/static/artworks/sample.png"
 ```
 
+Render from template in fast preview mode:
+
+```bash
+curl -X POST "http://localhost:8040/v1/mockup/render" \
+  -F "template_id=mug01" \
+  -F "design_url=/static/artworks/sample.png" \
+  -F "is_preview=true" \
+  -F "preview_max_dim=512"
+```
+
+Render from template via dedicated preview API:
+
+```bash
+curl -X POST "http://localhost:8040/v1/mockup/render-preview" \
+  -F "template_id=mug01" \
+  -F "design_url=/static/artworks/sample.png"
+```
+
 Import from source URL:
 
 ```bash
@@ -258,6 +278,7 @@ curl "http://localhost:8040/v1/mockup/resolve?url=https://cdn.printerval.com/ima
 1) Create/publish template via admin APIs.
 2) Render with:
    - `POST /v1/mockup/render` using `template_id` + `design_image` or `design_url`.
+   - For quick UI preview: add `is_preview=true` or call `POST /v1/mockup/render-preview`.
 
 ### 9.2 URL analysis import
 

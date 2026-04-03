@@ -494,6 +494,93 @@ def _clone_assets_with_config(assets: MugAssets | ClothesAssets, config: dict) -
     return assets
 
 
+def _scale_point_pair(value: object, scale: float) -> object:
+    if not isinstance(value, (list, tuple)) or len(value) < 2:
+        return value
+    if not all(isinstance(v, (int, float)) for v in value[:2]):
+        return value
+    scaled = [float(value[0]) * scale, float(value[1]) * scale]
+    if len(value) > 2:
+        scaled.extend(value[2:])
+    return scaled
+
+
+def _scale_point_list(values: object, scale: float) -> object:
+    if not isinstance(values, list):
+        return values
+    scaled_points = []
+    for item in values:
+        scaled_points.append(_scale_point_pair(item, scale))
+    return scaled_points
+
+
+def _scale_print_area_config(print_area: dict, scale: float) -> dict:
+    scaled_print_area = copy.deepcopy(print_area)
+    for key in ("top_left", "top_right", "bottom_right", "bottom_left"):
+        if key in scaled_print_area:
+            scaled_print_area[key] = _scale_point_pair(scaled_print_area[key], scale)
+    for key in ("mask_points", "mesh_control_src", "mesh_control_dst"):
+        if key in scaled_print_area:
+            scaled_print_area[key] = _scale_point_list(scaled_print_area[key], scale)
+    return scaled_print_area
+
+
+def _build_preview_assets(
+    assets: MugAssets | ClothesAssets,
+    max_dim: int = 512,
+) -> MugAssets | ClothesAssets:
+    safe_max_dim = max(128, min(2048, int(max_dim)))
+    src_h, src_w = assets.mockup.shape[:2]
+    src_max_dim = max(src_w, src_h)
+
+    preview_config = copy.deepcopy(assets.config)
+    preview_config["is_preview"] = True
+    preview_config["preview_design_max_dim"] = max(512, safe_max_dim * 2)
+
+    if src_max_dim <= safe_max_dim:
+        return _clone_assets_with_config(assets, preview_config)
+
+    scale = safe_max_dim / float(src_max_dim)
+    dst_w = max(1, int(round(src_w * scale)))
+    dst_h = max(1, int(round(src_h * scale)))
+
+    if isinstance(preview_config.get("print_area"), dict):
+        preview_config["print_area"] = _scale_print_area_config(preview_config["print_area"], scale)
+    if isinstance(preview_config.get("mesh"), dict):
+        mesh_cfg = preview_config["mesh"]
+        if "control_src" in mesh_cfg:
+            mesh_cfg["control_src"] = _scale_point_list(mesh_cfg.get("control_src"), scale)
+        if "control_dst" in mesh_cfg:
+            mesh_cfg["control_dst"] = _scale_point_list(mesh_cfg.get("control_dst"), scale)
+
+    def _resize(arr: np.ndarray | None, interpolation: int) -> np.ndarray | None:
+        if arr is None:
+            return None
+        return cv2.resize(arr, (dst_w, dst_h), interpolation=interpolation)
+
+    if isinstance(assets, MugAssets):
+        return MugAssets(
+            mockup=_resize(assets.mockup, cv2.INTER_AREA),
+            shadow_map=_resize(assets.shadow_map, cv2.INTER_AREA),
+            normal_map=_resize(assets.normal_map, cv2.INTER_LINEAR),
+            mask=_resize(assets.mask, cv2.INTER_NEAREST),
+            specular_map=_resize(assets.specular_map, cv2.INTER_LINEAR),
+            config=preview_config,
+        )
+
+    if isinstance(assets, ClothesAssets):
+        return ClothesAssets(
+            mockup=_resize(assets.mockup, cv2.INTER_AREA),
+            wrinkle_map=_resize(assets.wrinkle_map, cv2.INTER_AREA),
+            shadow_map=_resize(assets.shadow_map, cv2.INTER_AREA),
+            mask=_resize(assets.mask, cv2.INTER_NEAREST),
+            config=preview_config,
+            slug=assets.slug,
+        )
+
+    return _clone_assets_with_config(assets, preview_config)
+
+
 def _compute_adaptive_grid(width: int, height: int, cell_px: int = GRID_CELL_PX) -> tuple[int, int]:
     safe_w = max(1, int(width))
     safe_h = max(1, int(height))
@@ -763,6 +850,8 @@ async def renderMockup(
     output_format: str = Form("jpg"),
     jpeg_quality: int = Form(None),
     config_json: str = Form(None),
+    is_preview: bool = Form(False),
+    preview_max_dim: int = Form(512),
 ):
     request_id = f"req_{uuid.uuid4().hex[:8]}"
     effective_output_format = _force_jpeg_output_format(output_format)
@@ -840,6 +929,8 @@ async def renderMockup(
                 },
             ) from exc
         effective_assets = _clone_assets_with_config(assets, effective_config)
+    if is_preview:
+        effective_assets = _build_preview_assets(effective_assets, max_dim=preview_max_dim)
 
     quality = (
         jpeg_quality
@@ -878,7 +969,7 @@ async def renderMockup(
         ) from exc
 
     # Persist result in background if the design came from a URL
-    if design_url:
+    if design_url and not is_preview:
         asyncio.create_task(persistRenderResult(design_url, image_bytes, effective_output_format))
 
     return Response(
@@ -888,7 +979,29 @@ async def renderMockup(
             'X-Processing-Time-Ms': str(meta['processing_time_ms']),
             'X-Template-Id': template_id,
             'X-Request-Id': request_id,
+            'X-Preview-Mode': '1' if is_preview else '0',
         },
+    )
+
+
+@router.post("/mockup/render-preview")
+async def renderMockupPreview(
+    design_image: Optional[UploadFile] = File(None),
+    design_url: Optional[str] = Form(None),
+    template_id: str = Form(...),
+    jpeg_quality: int = Form(None),
+    config_json: str = Form(None),
+    preview_max_dim: int = Form(512),
+):
+    return await renderMockup(
+        design_image=design_image,
+        design_url=design_url,
+        template_id=template_id,
+        output_format="jpg",
+        jpeg_quality=jpeg_quality,
+        config_json=config_json,
+        is_preview=True,
+        preview_max_dim=preview_max_dim,
     )
 
 

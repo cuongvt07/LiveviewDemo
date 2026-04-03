@@ -10,7 +10,7 @@ import cv2
 
 from ..shared.color_match import apply_color_match
 from ..shared.composite import composite
-from ..shared.decode import decode_design
+from ..shared.decode import decode_design, decode_design_preview
 from ..shared.design_transform import apply_design_transform, estimate_print_area_canvas_size
 from ..shared.smooth_mesh_warp import apply_smooth_mesh_warp
 from .cylindrical_warp import cylindrical_warp
@@ -77,8 +77,14 @@ def run_mug_pipeline(
     render_cfg = cfg.get("render", {})
     preserve_original_color = bool(render_cfg.get("preserve_original_color", False))
     out_w, out_h = assets.mockup.shape[1], assets.mockup.shape[0]
+    is_preview = bool(cfg.get("is_preview", False))
+    preview_design_max_dim = max(256, int(cfg.get("preview_design_max_dim", 960)))
 
-    design = decode_design(design_bytes)
+    design = (
+        decode_design_preview(design_bytes, max_dim=preview_design_max_dim)
+        if is_preview
+        else decode_design(design_bytes)
+    )
     logger.info('[PERF]   decode_design: %dms', int((time.perf_counter() - t_total) * 1000))
     design_transform = cfg.get("design_transform", {})
     canvas_w, canvas_h = estimate_print_area_canvas_size(

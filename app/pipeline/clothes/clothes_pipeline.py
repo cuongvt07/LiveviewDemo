@@ -5,7 +5,7 @@ import numpy as np
 
 from ..shared.color_match import apply_color_match
 from ..shared.composite import composite
-from ..shared.decode import decode_design
+from ..shared.decode import decode_design, decode_design_preview
 from ..shared.design_transform import apply_design_transform, estimate_print_area_canvas_size
 from .tps_warp import tps_warp_design
 from .wrinkle_lighting import apply_fabric_multiply
@@ -36,8 +36,14 @@ def run_clothes_pipeline(
     l = cfg.get("lighting", {})
     color_cfg = cfg.get("color", {})
     W, H = assets.mockup.shape[1], assets.mockup.shape[0]
+    is_preview = bool(cfg.get("is_preview", False))
+    preview_design_max_dim = max(256, int(cfg.get("preview_design_max_dim", 960)))
 
-    design = decode_design(design_bytes)
+    design = (
+        decode_design_preview(design_bytes, max_dim=preview_design_max_dim)
+        if is_preview
+        else decode_design(design_bytes)
+    )
     dt = cfg.get("design_transform", {})
     canvas_w, canvas_h = estimate_print_area_canvas_size(
         cfg.get("print_area"),
