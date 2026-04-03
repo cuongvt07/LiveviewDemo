@@ -6,10 +6,20 @@ Default reads from `RENDER_DEVICE`, but can switch CPU/GPU while service is runn
 import os
 
 import cv2
-
+import numpy as np
 
 _DEFAULT_DEVICE = os.getenv("RENDER_DEVICE", "cpu").lower()
 RENDER_DEVICE = _DEFAULT_DEVICE if _DEFAULT_DEVICE in ("cpu", "gpu") else "cpu"
+
+def _verify_gpu_context() -> bool:
+    """Test GPU thực sự hoạt động — không chỉ check flag."""
+    try:
+        test = cv2.UMat(np.zeros((10, 10, 3), dtype=np.uint8))
+        cv2.GaussianBlur(test, (3, 3), 0).get()
+        return True
+    except Exception as e:
+        print(f"[GPU] Context verification failed: {e}")
+        return False
 
 
 def getRenderDevice() -> str:
@@ -29,12 +39,12 @@ def setRenderDevice(device: str) -> bool:
     if target == "gpu":
         if cv2.ocl.haveOpenCL():
             cv2.ocl.setUseOpenCL(True)
-            if cv2.ocl.useOpenCL():
+            if cv2.ocl.useOpenCL() and _verify_gpu_context():
                 RENDER_DEVICE = "gpu"
-                print(f"[GPU] OpenCL enabled - device: {cv2.ocl.Device.getDefault().name()}")
+                print(f"[GPU] OpenCL verified and active - device: {cv2.ocl.Device.getDefault().name()}")
                 return True
             cv2.ocl.setUseOpenCL(False)
-        print("[GPU] OpenCL not active - fallback to CPU")
+        print("[GPU] Verification failed - fallback to CPU")
         RENDER_DEVICE = "cpu"
         return False
 

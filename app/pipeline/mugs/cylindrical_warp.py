@@ -630,6 +630,7 @@ def cylindrical_warp(
         map_x,
         map_y,
         interpolation=interpolation,
+        map_cache_key=str(cache_key),
     )
     _cyl_logger.info('[PERF]     gpuRemap: %dms (interp=%s)', int((time.perf_counter() - t_remap) * 1000), 'LANCZOS4' if interpolation == cv2.INTER_LANCZOS4 else ('CUBIC' if interpolation == cv2.INTER_CUBIC else 'LINEAR'))
 
