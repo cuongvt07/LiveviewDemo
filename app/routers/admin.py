@@ -8,6 +8,7 @@ import copy
 import shutil
 import logging
 import asyncio
+from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlencode
@@ -62,6 +63,8 @@ URL_ANALYSIS_PREVIEW_HEIGHT = max(1, _read_int_env('URL_ANALYSIS_PREVIEW_HEIGHT'
 URL_ANALYSIS_PREVIEW_QUALITY = max(1, min(100, _read_int_env('URL_ANALYSIS_PREVIEW_QUALITY', 90)))
 URL_ANALYSIS_PREVIEW_FIT = str(os.getenv('URL_ANALYSIS_PREVIEW_FIT', 'contain') or 'contain').strip().lower()
 URL_ANALYSIS_RENDER_QUALITY = max(1, min(100, _read_int_env('URL_ANALYSIS_RENDER_QUALITY', 100)))
+_MOCKUP_LINK_RENDER_LOCKS: dict[str, asyncio.Lock] = {}
+_MOCKUP_LINK_RENDER_LOCKS_GUARD = asyncio.Lock()
 
 
 # NOTE: admin auth removed per request — endpoints are now public in this development instance.
@@ -219,7 +222,12 @@ async def _query_active_templates_by_url_analysis_meta(meta_key: str, meta_value
             )
             result = await session.execute(stmt)
             return result.scalars().all()
-        except Exception:
+        except Exception as exc:
+            logger.warning(
+                "JSONB lookup fallback for meta_key=%s due to: %s",
+                meta_key,
+                exc,
+            )
             # Fallback for non-PostgreSQL dev environments.
             result = await session.execute(select(Template).where(Template.status == 'active'))
             active_templates = result.scalars().all()
@@ -396,6 +404,23 @@ async def _persist_rendered_result_and_get_path(source_url: str, image_bytes: by
         session.add(RenderedResult(url_slug=slug, image_path=image_path))
         await session.commit()
     return image_path
+
+
+@asynccontextmanager
+async def _mockup_link_render_lock(source_url: str):
+    from app.services.render_persist import extractSlug
+
+    lock_key = extractSlug(source_url)
+    async with _MOCKUP_LINK_RENDER_LOCKS_GUARD:
+        lock = _MOCKUP_LINK_RENDER_LOCKS.get(lock_key)
+        if lock is None:
+            lock = asyncio.Lock()
+            _MOCKUP_LINK_RENDER_LOCKS[lock_key] = lock
+    await lock.acquire()
+    try:
+        yield
+    finally:
+        lock.release()
 
 
 def _write_preview_data_url(
@@ -1109,24 +1134,16 @@ async def getTemplatePreviewLinkFromUrl(
     from fastapi.responses import PlainTextResponse
     try:
         context = build_url_lookup_context(url)
-        async with async_session() as session:
-            result = await session.execute(
-                select(Template).where(Template.status == 'active')
+        exact_templates = _sort_templates_by_lookup_meta(
+            await _query_active_templates_by_url_analysis_meta(
+                'design_lookup_key',
+                context['design_lookup_key'],
             )
-            active_templates = result.scalars().all()
-
-        exact_templates: list[Template] = []
-        family_templates: list[Template] = []
-        for template in active_templates:
-            meta = _extract_template_url_analysis_meta(template)
-            if meta.get('design_lookup_key') == context['design_lookup_key']:
-                exact_templates.append(template)
-            if meta.get('mockup_family_key') == context['mockup_family_key']:
-                family_templates.append(template)
+        )
 
         # Exact same template+artwork was already imported => return template image immediately.
         if exact_templates:
-            selected_template = _sort_templates_by_lookup_meta(exact_templates)[0]
+            selected_template = exact_templates[0]
             preview_url = _template_preview_url(selected_template.slug)
             return PlainTextResponse(content=_to_full_url(preview_url, request))
 
@@ -1136,14 +1153,24 @@ async def getTemplatePreviewLinkFromUrl(
             return PlainTextResponse(content=_to_full_url(cached_render_path, request))
 
         # No exact match: pick corresponding family template and render new mockup using extracted artwork.
+        family_templates = _sort_templates_by_lookup_meta(
+            await _query_active_templates_by_url_analysis_meta(
+                'mockup_family_key',
+                context['mockup_family_key'],
+            )
+        )
         if not family_templates:
             return PlainTextResponse(content="", status_code=404)
 
-        selected_template = _sort_templates_by_lookup_meta(family_templates)[0]
+        selected_template = family_templates[0]
         selected_meta = _extract_template_url_analysis_meta(selected_template)
         preferred_view = str(selected_meta.get('mockup_view') or '').strip().lower() or None
 
-        analyzed = await analyze_and_ingest_url_async(url, preferred_view=preferred_view)
+        analyzed = await analyze_and_ingest_url_async(
+            url,
+            preferred_view=preferred_view,
+            include_presets=False,
+        )
         design_url = str(analyzed.get('design_url') or '')
         if not design_url:
             return PlainTextResponse(content="", status_code=404)
@@ -1153,18 +1180,24 @@ async def getTemplatePreviewLinkFromUrl(
             return PlainTextResponse(content="", status_code=404)
         design_bytes = design_path.read_bytes()
 
-        assets = await _load_active_template_assets(selected_template.slug)
-        from app.pipeline.pipeline import run_pipeline
+        async with _mockup_link_render_lock(url):
+            # Re-check cache after waiting for lock to avoid duplicated renders.
+            cached_after_lock = await _find_cached_rendered_result_path(url)
+            if cached_after_lock:
+                return PlainTextResponse(content=_to_full_url(cached_after_lock, request))
 
-        image_bytes, _ = await asyncio.to_thread(
-            run_pipeline,
-            design_bytes,
-            assets,
-            'jpg',
-            URL_ANALYSIS_RENDER_QUALITY,
-        )
-        rendered_path = await _persist_rendered_result_and_get_path(url, image_bytes, 'jpg')
-        return PlainTextResponse(content=_to_full_url(rendered_path, request))
+            assets = await _load_active_template_assets(selected_template.slug)
+            from app.pipeline.pipeline import run_pipeline
+
+            image_bytes, _ = await asyncio.to_thread(
+                run_pipeline,
+                design_bytes,
+                assets,
+                'jpg',
+                URL_ANALYSIS_RENDER_QUALITY,
+            )
+            rendered_path = await _persist_rendered_result_and_get_path(url, image_bytes, 'jpg')
+            return PlainTextResponse(content=_to_full_url(rendered_path, request))
     except Exception as exc:
         logger.error(f'Failed to get template preview link for url={url}: {exc}', exc_info=True)
         return PlainTextResponse(content="", status_code=404)

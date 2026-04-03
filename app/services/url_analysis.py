@@ -352,7 +352,7 @@ def resolve_public_mockup_variant(parsed: ParsedLiveviewUrl, preferred_view: Opt
         color_variant = _infer_color_variant(parsed.color_slug, parsed.color_hex)
         mug_size = _infer_mug_size(parsed.template)
         raise FileNotFoundError(
-            f"KhÃ´ng tÃ¬m tháº¥y mockup local cho template={parsed.template}, color={color_variant}, size={mug_size}"
+            f"KhÃƒÂ´ng tÃƒÂ¬m thÃ¡ÂºÂ¥y mockup local cho template={parsed.template}, color={color_variant}, size={mug_size}"
         )
 
     normalized_preferred = str(preferred_view or "").strip().lower()
@@ -367,11 +367,11 @@ def resolve_public_mockup_variant(parsed: ParsedLiveviewUrl, preferred_view: Opt
 def parse_printerval_liveview_url(source_url: str) -> ParsedLiveviewUrl:
     parsed = urlparse(source_url.strip())
     if parsed.scheme not in {"http", "https"}:
-        raise ValueError("URL pháº£i báº¯t Ä‘áº§u báº±ng http:// hoáº·c https://")
+        raise ValueError("URL phÃ¡ÂºÂ£i bÃ¡ÂºÂ¯t Ã„â€˜Ã¡ÂºÂ§u bÃ¡ÂºÂ±ng http:// hoÃ¡ÂºÂ·c https://")
 
     path_parts = [part for part in parsed.path.split("/") if part]
     if len(path_parts) < 2 or path_parts[0] != "image":
-        raise ValueError("URL khÃ´ng Ä‘Ãºng format /image/[resolution]/[slug].[ext]")
+        raise ValueError("URL khÃƒÂ´ng Ã„â€˜ÃƒÂºng format /image/[resolution]/[slug].[ext]")
 
     resolution = None
     file_part = unquote(path_parts[-1])
@@ -379,7 +379,7 @@ def parse_printerval_liveview_url(source_url: str) -> ParsedLiveviewUrl:
         resolution = path_parts[-2]
 
     if "." not in file_part:
-        raise ValueError("URL khÃ´ng cÃ³ pháº§n má»Ÿ rá»™ng áº£nh há»£p lá»‡")
+        raise ValueError("URL khÃƒÂ´ng cÃƒÂ³ phÃ¡ÂºÂ§n mÃ¡Â»Å¸ rÃ¡Â»â„¢ng Ã¡ÂºÂ£nh hÃ¡Â»Â£p lÃ¡Â»â€¡")
 
     slug, extension = file_part.rsplit(".", 1)
     slug_parts = [part.strip() for part in slug.split(",") if part.strip()]
@@ -389,7 +389,7 @@ def parse_printerval_liveview_url(source_url: str) -> ParsedLiveviewUrl:
         template_slug, design_slug, color_hex = slug_parts
         color_slug = None
     else:
-        raise ValueError("Slug URL pháº£i cÃ³ dáº¡ng 3 hoáº·c 4 pháº§n ngÄƒn bá»Ÿi dáº¥u pháº©y")
+        raise ValueError("Slug URL phÃ¡ÂºÂ£i cÃƒÂ³ dÃ¡ÂºÂ¡ng 3 hoÃ¡ÂºÂ·c 4 phÃ¡ÂºÂ§n ngÃ„Æ’n bÃ¡Â»Å¸i dÃ¡ÂºÂ¥u phÃ¡ÂºÂ©y")
 
     section = design_slug.split("-", 1)[0].lower()
     return ParsedLiveviewUrl(
@@ -643,7 +643,7 @@ def download_remote_asset(remote_url: str, target_dir: Path, preferred_name: str
         content_type = response.headers.get("Content-Type", "")
 
     if not content:
-        raise ValueError(f"URL khÃ´ng tráº£ vá» dá»¯ liá»‡u áº£nh: {remote_url}")
+        raise ValueError(f"URL khÃƒÂ´ng trÃ¡ÂºÂ£ vÃ¡Â»Â dÃ¡Â»Â¯ liÃ¡Â»â€¡u Ã¡ÂºÂ£nh: {remote_url}")
 
     suffix = _guess_extension(remote_url, content_type)
     url_hash = hashlib.sha1(remote_url.encode("utf-8")).hexdigest()[:12]
@@ -672,7 +672,7 @@ async def download_remote_asset_async(remote_url: str, target_dir: Path, preferr
     content_type = response.headers.get("Content-Type", "")
 
     if not content:
-        raise ValueError(f"URL khÃ´ng tráº£ vá» dá»¯ liá»‡u áº£nh: {remote_url}")
+        raise ValueError(f"URL khÃƒÂ´ng trÃ¡ÂºÂ£ vÃ¡Â»Â dÃ¡Â»Â¯ liÃ¡Â»â€¡u Ã¡ÂºÂ£nh: {remote_url}")
 
     suffix = _guess_extension(remote_url, content_type)
     url_hash = hashlib.sha1(remote_url.encode("utf-8")).hexdigest()[:12]
@@ -736,7 +736,7 @@ def analyze_and_ingest_url(
         design_source_url = source_url
         design_source_mode = "original_url_fallback"
         warning = (
-            "ChÆ°a cáº¥u hÃ¬nh PRINTERVAL_SECTION_URL_TEMPLATES nÃªn há»‡ thá»‘ng Ä‘ang táº£i chÃ­nh URL CDN gá»‘c vá» local lÃ m artwork fallback."
+            "ChÃ†Â°a cÃ¡ÂºÂ¥u hÃƒÂ¬nh PRINTERVAL_SECTION_URL_TEMPLATES nÃƒÂªn hÃ¡Â»â€¡ thÃ¡Â»â€˜ng Ã„â€˜ang tÃ¡ÂºÂ£i chÃƒÂ­nh URL CDN gÃ¡Â»â€˜c vÃ¡Â»Â local lÃƒÂ m artwork fallback."
         )
 
     preferred_name = f"{parsed.template}-{parsed.design_slug}"
@@ -763,7 +763,7 @@ def analyze_and_ingest_url(
             if design_source_mode == "configured_template":
                 design_source_mode = "original_url_fallback"
                 warning = (
-                    "KhÃ´ng táº£i Ä‘Æ°á»£c design source URL Ä‘Ã£ cáº¥u hÃ¬nh, há»‡ thá»‘ng fallback sang chÃ­nh URL CDN gá»‘c."
+                    "KhÃƒÂ´ng tÃ¡ÂºÂ£i Ã„â€˜Ã†Â°Ã¡Â»Â£c design source URL Ã„â€˜ÃƒÂ£ cÃ¡ÂºÂ¥u hÃƒÂ¬nh, hÃ¡Â»â€¡ thÃ¡Â»â€˜ng fallback sang chÃƒÂ­nh URL CDN gÃ¡Â»â€˜c."
                 )
                 if reuse_local_artwork:
                     downloaded = _find_cached_downloaded_asset(
@@ -808,6 +808,7 @@ async def analyze_and_ingest_url_async(
     source_url: str,
     preferred_view: Optional[str] = None,
     reuse_local_artwork: bool = True,
+    include_presets: bool = True,
 ) -> dict:
     context = build_url_lookup_context(source_url)
     parsed = context["parsed"]
@@ -819,11 +820,14 @@ async def analyze_and_ingest_url_async(
     mockup_url = str(mockup_variant["mockup_url"])
     selected_view = str(mockup_variant["view"])
 
-    # Run print-area detection in parallel with network download.
-    detect_task = asyncio.create_task(
-        asyncio.to_thread(_detect_print_area_preset, mockup_url, product_type)
-    )
-    warp_preset = _build_warp_preset(parsed, color_variant)
+    detect_task = None
+    warp_preset: Optional[dict] = None
+    if include_presets:
+        # Run print-area detection in parallel with network download.
+        detect_task = asyncio.create_task(
+            asyncio.to_thread(_detect_print_area_preset, mockup_url, product_type)
+        )
+        warp_preset = _build_warp_preset(parsed, color_variant)
 
     design_source_url, design_source_mode = _build_design_source_url(parsed)
     warning: Optional[str] = None
@@ -831,7 +835,7 @@ async def analyze_and_ingest_url_async(
         design_source_url = source_url
         design_source_mode = "original_url_fallback"
         warning = (
-            "ChÆ°a cáº¥u hÃ¬nh PRINTERVAL_SECTION_URL_TEMPLATES nÃªn há»‡ thá»‘ng Ä‘ang táº£i chÃ­nh URL CDN gá»‘c vá» local lÃ m artwork fallback."
+            "PRINTERVAL_SECTION_URL_TEMPLATES is not configured; fallback to downloading from original source URL."
         )
 
     preferred_name = f"{parsed.template}-{parsed.design_slug}"
@@ -847,48 +851,53 @@ async def analyze_and_ingest_url_async(
         if downloaded is not None:
             design_source_mode = f"{design_source_mode}_local_cache"
 
-    if downloaded is None:
-        try:
-            downloaded = await download_remote_asset_async(
-                design_source_url,
-                artwork_dir,
-                preferred_name=preferred_name,
-            )
-        except Exception:
-            if design_source_mode == "configured_template":
-                design_source_mode = "original_url_fallback"
-                warning = (
-                    "KhÃ´ng táº£i Ä‘Æ°á»£c design source URL Ä‘Ã£ cáº¥u hÃ¬nh, há»‡ thá»‘ng fallback sang chÃ­nh URL CDN gá»‘c."
+    try:
+        if downloaded is None:
+            try:
+                downloaded = await download_remote_asset_async(
+                    design_source_url,
+                    artwork_dir,
+                    preferred_name=preferred_name,
                 )
-                if reuse_local_artwork:
-                    downloaded = _find_cached_downloaded_asset(
-                        parsed.source_url,
-                        artwork_dir,
-                        preferred_name=preferred_name,
-                    )
-                    if downloaded is not None:
-                        design_source_mode = "original_url_fallback_local_cache"
-                if downloaded is None:
-                    downloaded = await download_remote_asset_async(
-                        parsed.source_url,
-                        artwork_dir,
-                        preferred_name=preferred_name,
-                    )
-                design_source_url = parsed.source_url
-            else:
-                if not detect_task.done():
-                    detect_task.cancel()
-                with suppress(Exception):
-                    await detect_task
-                raise
+            except Exception:
+                if design_source_mode == "configured_template":
+                    design_source_mode = "original_url_fallback"
+                    warning = "Configured design source failed; fallback to original URL."
+                    if reuse_local_artwork:
+                        downloaded = _find_cached_downloaded_asset(
+                            parsed.source_url,
+                            artwork_dir,
+                            preferred_name=preferred_name,
+                        )
+                        if downloaded is not None:
+                            design_source_mode = "original_url_fallback_local_cache"
+                    if downloaded is None:
+                        downloaded = await download_remote_asset_async(
+                            parsed.source_url,
+                            artwork_dir,
+                            preferred_name=preferred_name,
+                        )
+                    design_source_url = parsed.source_url
+                else:
+                    raise
+    except Exception:
+        if detect_task is not None and not detect_task.done():
+            detect_task.cancel()
+            with suppress(Exception):
+                await detect_task
+        raise
 
-    print_area_preset, print_area_confidence, print_area_source = await detect_task
-    if print_area_source == "default":
-        policy_print_area = _build_policy_print_area(policy, product_type, preferred_view=selected_view)
-        if policy_print_area:
-            print_area_preset = policy_print_area
-            print_area_confidence = 0.98
-            print_area_source = "policy"
+    print_area_preset: Optional[dict] = None
+    print_area_confidence: Optional[float] = None
+    print_area_preset_source: Optional[str] = None
+    if include_presets and detect_task is not None:
+        print_area_preset, print_area_confidence, print_area_preset_source = await detect_task
+        if print_area_preset_source == "default":
+            policy_print_area = _build_policy_print_area(policy, product_type, preferred_view=selected_view)
+            if policy_print_area:
+                print_area_preset = policy_print_area
+                print_area_confidence = 0.98
+                print_area_preset_source = "policy"
 
     return {
         "source_url": parsed.source_url,
@@ -905,7 +914,7 @@ async def analyze_and_ingest_url_async(
         "design_source_mode": design_source_mode,
         "print_area_preset": print_area_preset,
         "print_area_preset_confidence": print_area_confidence,
-        "print_area_preset_source": print_area_source,
+        "print_area_preset_source": print_area_preset_source,
         "warp_config_preset": warp_preset,
         "warning": warning,
     }
