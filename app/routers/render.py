@@ -9,9 +9,11 @@ import time
 import uuid
 from pathlib import Path
 from typing import Optional
+from datetime import datetime, timedelta
 
 import cv2
 import numpy as np
+import base64
 from fastapi import APIRouter, BackgroundTasks, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import Response
 from pydantic import BaseModel
@@ -39,7 +41,7 @@ from app.pipeline.shared.liveview_cache import (
 from app.pipeline.shared.smooth_mesh_warp import apply_smooth_mesh_warp
 from app.services import template_registry
 from app.services.render_persist import persistRenderResult
-from app.services.url_analysis import resolve_local_asset_path
+from app.services.url_analysis import INPUTS_DIR, resolve_or_download_remote_asset
 from app.services.vision import auto_detect_print_area_v2, bake_normal_map, create_soft_mask
 from app.services.render_queue import enqueue_adhoc_render, get_job
 
@@ -62,6 +64,72 @@ def _force_jpeg_output_format(requested_format: str | None) -> str:
             requested_format,
         )
     return "jpg"
+
+
+def _target_dir_for_remote_asset(asset_kind: str) -> Path:
+    normalized_kind = str(asset_kind or "").strip().lower()
+    if normalized_kind == "mockup":
+        return (INPUTS_DIR / "bases").resolve()
+    return (INPUTS_DIR / "artworks").resolve()
+
+
+async def _read_asset_bytes_from_url(
+    raw_url: str,
+    *,
+    asset_kind: str,
+    request_id: str,
+) -> tuple[bytes, Path]:
+    normalized_url = str(raw_url or "").strip()
+    if not normalized_url:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": f"missing_{asset_kind}",
+                "message": f"Missing {asset_kind} URL",
+                "request_id": request_id,
+            },
+        )
+
+    target_dir = _target_dir_for_remote_asset(asset_kind)
+    try:
+        local_path = await resolve_or_download_remote_asset(
+            normalized_url,
+            target_dir=target_dir,
+            reuse_local=True,
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": f"{asset_kind}_resolve_failed",
+                "message": f"Cannot resolve {asset_kind} URL {normalized_url}: {exc}",
+                "request_id": request_id,
+            },
+        ) from exc
+
+    if not local_path.exists():
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": f"{asset_kind}_not_found",
+                "message": f"{asset_kind.capitalize()} URL {normalized_url} not found",
+                "request_id": request_id,
+            },
+        )
+
+    try:
+        return local_path.read_bytes(), local_path
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "error": f"{asset_kind}_read_failed",
+                "message": f"Failed to read local {asset_kind} file {local_path}: {exc}",
+                "request_id": request_id,
+            },
+        ) from exc
 
 
 def _log_horizontal_squeeze_debug(
@@ -117,6 +185,9 @@ class WarpPreviewRequest(BaseModel):
     design_fit_mode: str = "cover"
     mask_points: Optional[list[list[int]]] = None
     template_id: Optional[str] = None
+    # New inputs: either a URL to a design image, or a base64-encoded design image
+    design_url: Optional[str] = None
+    design_base64: Optional[str] = None
 
 
 class WarpPrefetchRequest(BaseModel):
@@ -855,6 +926,7 @@ async def renderMockup(
 ):
     request_id = f"req_{uuid.uuid4().hex[:8]}"
     effective_output_format = _force_jpeg_output_format(output_format)
+    persist_source_url: Optional[str] = design_url.strip() if isinstance(design_url, str) else None
     assets = template_registry.get(template_id)
 
     if assets is None:
@@ -894,17 +966,11 @@ async def renderMockup(
     if design_image is not None:
         design_bytes = await design_image.read()
     elif design_url:
-        p = resolve_local_asset_path(design_url)
-        if not p.exists():
-            raise HTTPException(
-                status_code=400,
-                detail={
-                    "error": "design_not_found",
-                    "message": f"Design URL {design_url} not found",
-                    "request_id": request_id,
-                },
-            )
-        design_bytes = p.read_bytes()
+        design_bytes, _ = await _read_asset_bytes_from_url(
+            design_url,
+            asset_kind="design",
+            request_id=request_id,
+        )
     else:
         raise HTTPException(
             status_code=400,
@@ -969,8 +1035,10 @@ async def renderMockup(
         ) from exc
 
     # Persist result in background if the design came from a URL
-    if design_url and not is_preview:
-        asyncio.create_task(persistRenderResult(design_url, image_bytes, effective_output_format))
+    if persist_source_url and not is_preview:
+        asyncio.create_task(
+            persistRenderResult(persist_source_url, image_bytes, effective_output_format)
+        )
 
     return Response(
         content=image_bytes,
@@ -1018,16 +1086,18 @@ async def renderAdhoc(
 ):
     request_id = f"req_{uuid.uuid4().hex[:8]}"
     effective_output_format = _force_jpeg_output_format(output_format)
+    persist_source_url: Optional[str] = design_url.strip() if isinstance(design_url, str) else None
 
     try:
         # 1. Resolve Mockup
         if mockup_image:
             mockup_bytes = await mockup_image.read()
         elif mockup_url:
-            p = resolve_local_asset_path(mockup_url)
-            if not p.exists():
-                raise HTTPException(status_code=400, detail=f"Mockup URL {mockup_url} not found")
-            mockup_bytes = p.read_bytes()
+            mockup_bytes, _ = await _read_asset_bytes_from_url(
+                mockup_url,
+                asset_kind="mockup",
+                request_id=request_id,
+            )
         else:
             raise HTTPException(status_code=400, detail="Missing mockup_image or mockup_url")
 
@@ -1035,10 +1105,11 @@ async def renderAdhoc(
         if design_image:
             design_bytes = await design_image.read()
         elif design_url:
-            p = resolve_local_asset_path(design_url)
-            if not p.exists():
-                raise HTTPException(status_code=400, detail=f"Design URL {design_url} not found")
-            design_bytes = p.read_bytes()
+            design_bytes, _ = await _read_asset_bytes_from_url(
+                design_url,
+                asset_kind="design",
+                request_id=request_id,
+            )
         else:
             raise HTTPException(status_code=400, detail="Missing design_image or design_url")
 
@@ -1146,8 +1217,10 @@ async def renderAdhoc(
         )
 
         # Persist result in background if the design came from a URL
-        if design_url and not is_preview:
-            asyncio.create_task(persistRenderResult(design_url, image_bytes, effective_output_format))
+        if persist_source_url and not is_preview:
+            asyncio.create_task(
+                persistRenderResult(persist_source_url, image_bytes, effective_output_format)
+            )
 
         return Response(
             content=image_bytes,
@@ -1158,6 +1231,8 @@ async def renderAdhoc(
                 'X-Request-Id': request_id,
             },
         )
+    except HTTPException:
+        raise
     except Exception as exc:
         import traceback
 
@@ -1170,19 +1245,78 @@ async def renderAdhoc(
 
 
 @router.post("/mockup/warp-preview")
-async def renderWarpPreview(req: WarpPreviewRequest):
-    canvas_w, canvas_h = estimate_print_area_canvas_size(
-        req.print_area,
-        fallback_width=req.mockup_width,
-        fallback_height=req.mockup_height,
-    )
-    design_canvas = _build_preview_design_canvas(
-        canvas_w,
-        canvas_h,
-        mesh_density_strength=req.mesh_density_strength,
-    )
-    warped = _render_warp_preview_image(req, design_canvas)
-    return Response(content=_encode_preview_png(warped), media_type="image/png", headers={"Cache-Control": "no-cache"})
+async def renderWarpPreview(req: WarpPreviewRequest, background_tasks: BackgroundTasks):
+    """Extended warp-preview: accepts `design_url` or `design_base64` in JSON payload.
+
+    Renders preview, saves PNG under `static/renders/` and returns JSON with `preview_url` and `expires_at`.
+    """
+    request_id = f"req_{uuid.uuid4().hex[:8]}"
+    # determine design canvas
+    design_canvas = None
+    if req.design_base64:
+        b64 = req.design_base64
+        if b64.startswith('data:'):
+            parts = b64.split(',', 1)
+            if len(parts) == 2:
+                b64 = parts[1]
+        try:
+            import base64 as _base64
+
+            design_bytes = _base64.b64decode(b64)
+            design_canvas = decode_design_preview(design_bytes)
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail={"error": "invalid_base64", "message": str(exc), "request_id": request_id})
+    elif req.design_url:
+        design_bytes, _ = await _read_asset_bytes_from_url(req.design_url, asset_kind="design", request_id=request_id)
+        try:
+            design_canvas = decode_design_preview(design_bytes)
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail={"error": "invalid_design", "message": str(exc), "request_id": request_id})
+
+    if design_canvas is None:
+        canvas_w, canvas_h = estimate_print_area_canvas_size(
+            req.print_area,
+            fallback_width=req.mockup_width,
+            fallback_height=req.mockup_height,
+        )
+        design_canvas = _build_preview_design_canvas(
+            canvas_w,
+            canvas_h,
+            mesh_density_strength=req.mesh_density_strength,
+        )
+
+    try:
+        warped = _render_warp_preview_image(req, design_canvas)
+        png_bytes = _encode_preview_png(warped)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail={"error": "render_failed", "message": str(exc), "request_id": request_id})
+
+    # Save PNG to static/renders with TTL
+    renders_dir = Path('static') / 'renders'
+    renders_dir.mkdir(parents=True, exist_ok=True)
+    fname = f"preview-{uuid.uuid4().hex}.png"
+    out_path = renders_dir / fname
+    out_path.write_bytes(png_bytes)
+
+    PREVIEW_TTL_SECONDS = 300
+
+    def _delete_later(p: str, delay: int):
+        import time, os
+
+        time.sleep(delay)
+        try:
+            if os.path.exists(p):
+                os.remove(p)
+        except Exception:
+            pass
+
+    background_tasks.add_task(_delete_later, str(out_path), PREVIEW_TTL_SECONDS)
+    expires_at = (datetime.utcnow() + timedelta(seconds=PREVIEW_TTL_SECONDS)).isoformat() + 'Z'
+    preview_url = f"/static/renders/{fname}"
+
+    return {"preview_url": preview_url, "expires_at": expires_at}
 
 
 @router.post('/mockup/render-async-adhoc')
@@ -1201,20 +1335,22 @@ async def render_adhoc_async(
         if mockup_image:
             mockup_bytes = await mockup_image.read()
         elif mockup_url:
-            p = resolve_local_asset_path(mockup_url)
-            if not p.exists():
-                raise HTTPException(status_code=400, detail=f"Mockup URL {mockup_url} not found")
-            mockup_bytes = p.read_bytes()
+            mockup_bytes, _ = await _read_asset_bytes_from_url(
+                mockup_url,
+                asset_kind="mockup",
+                request_id=request_id,
+            )
         else:
             raise HTTPException(status_code=400, detail="Missing mockup_image or mockup_url")
 
         if design_image:
             design_bytes = await design_image.read()
         elif design_url:
-            p = resolve_local_asset_path(design_url)
-            if not p.exists():
-                raise HTTPException(status_code=400, detail=f"Design URL {design_url} not found")
-            design_bytes = p.read_bytes()
+            design_bytes, _ = await _read_asset_bytes_from_url(
+                design_url,
+                asset_kind="design",
+                request_id=request_id,
+            )
         else:
             raise HTTPException(status_code=400, detail="Missing design_image or design_url")
 
@@ -1295,6 +1431,41 @@ async def renderWarpPreviewFile(
         payload = json.loads(config_json)
         req = WarpPreviewRequest(**payload)
         design_bytes = await design_image.read()
+        design_canvas = decode_design_preview(design_bytes)
+        warped = _render_warp_preview_image(req, design_canvas)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    return Response(content=_encode_preview_png(warped), media_type="image/png", headers={"Cache-Control": "no-cache"})
+
+
+@router.post('/mockup/warp-preview-base64')
+async def renderWarpPreviewBase64(
+    config_json: str = Form(...),
+    design_base64: str = Form(...),
+):
+    """Render warp preview from a base64-encoded design image provided in the form.
+
+    Allows client to send design blob inline (data URL or raw base64) so preview
+    can run in parallel with async upload.
+    """
+    try:
+        payload = json.loads(config_json)
+        req = WarpPreviewRequest(**payload)
+
+        b64 = design_base64
+        if b64.startswith('data:'):
+            parts = b64.split(',', 1)
+            if len(parts) == 2:
+                b64 = parts[1]
+
+        try:
+            design_bytes = base64.b64decode(b64)
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=f'invalid_base64: {exc}')
+
         design_canvas = decode_design_preview(design_bytes)
         warped = _render_warp_preview_image(req, design_canvas)
     except HTTPException:

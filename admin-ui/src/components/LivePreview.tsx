@@ -193,17 +193,63 @@ export default function LivePreview() {
         setIsUploadingAsset(true);
         const fd = new FormData();
         fd.append('file', designFile);
+        // start upload in background
+        const uploadPromise = fetch('/admin/library/artworks/upload', { method: 'POST', body: fd })
+          .then(res => res.ok ? res.json().catch(() => null) : null)
+          .then(data => { if (data?.url) setLibraryDesignUrl(data.url); })
+          .catch(e => console.error('Failed to auto-upload design:', e))
+          .finally(() => setIsUploadingAsset(false));
+
+        // Meanwhile, create base64 via web worker and call warp-preview in parallel
         try {
-          const res = await fetch('/admin/library/artworks/upload', { method: 'POST', body: fd });
-          if (res.ok) {
-            const data = await res.json();
-            setLibraryDesignUrl(data.url);
+          const arrayBuffer = await designFile.arrayBuffer();
+          // create worker
+          const worker = new Worker(new URL('../workers/encodeWorker.ts', import.meta.url), { type: 'module' });
+          const base64Promise = new Promise<string>((resolve, reject) => {
+            const onMsg = (ev: MessageEvent) => {
+              const d = ev.data as any;
+              worker.removeEventListener('message', onMsg);
+              worker.terminate();
+              if (d?.error) reject(new Error(d.error));
+              else resolve(d.base64);
+            };
+            worker.addEventListener('message', onMsg);
+            worker.postMessage({ buffer: arrayBuffer }, [arrayBuffer]);
+          });
+
+          const base64 = await base64Promise;
+
+          // Build warp preview payload
+          const payload: any = {
+            mockup_width: 1500,
+            mockup_height: 1500,
+            print_area: effectivePrintArea || {},
+            warp_type: effectiveWarp?.warp_type || 'cylinder',
+            theta_max_deg: effectiveWarp?.theta_max_deg || 52.0,
+            mesh_density_strength: effectiveWarp?.mesh_density_strength || 2,
+            design_base64: base64,
+          };
+
+          // call preview endpoint
+          try {
+            const res = await fetch('/v1/mockup/warp-preview', {
+              method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload)
+            });
+            if (res.ok) {
+              const body = await res.json();
+              if (body?.preview_url) {
+                setPreviewUrl(prev => { if (prev && isObjectUrl(prev)) URL.revokeObjectURL(prev); return body.preview_url; });
+              }
+            }
+          } catch (err) {
+            console.error('warp-preview failed:', err);
           }
-        } catch (e) {
-          console.error('Failed to auto-upload design:', e);
-        } finally {
-          setIsUploadingAsset(false);
+        } catch (err) {
+          console.error('Failed to base64-encode design in worker:', err);
         }
+
+        // ensure upload finishes
+        void uploadPromise;
       };
       void uploadDesign();
     }

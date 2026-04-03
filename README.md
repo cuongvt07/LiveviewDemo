@@ -161,6 +161,8 @@ Notes:
 - Render output is forced to JPEG for lightweight responses.
 - `config_json` overrides are supported on render endpoints where defined.
 - `POST /v1/mockup/render` supports `is_preview=true` (and optional `preview_max_dim`, default `512`) to speed up template mode by downscaling render assets first.
+- `design_url` and `mockup_url` can be either local static path (for example `/static/artworks/...`) or remote HTTP/HTTPS URL.
+- Remote URL inputs are auto-downloaded and cached on disk (`inputs/artworks` for design, `inputs/bases` for mockup), so repeated calls are much faster.
 
 ### 8.3 Resolve APIs (`/v1`)
 
@@ -217,6 +219,14 @@ Render from template:
 curl -X POST "http://localhost:8040/v1/mockup/render" \
   -F "template_id=mug01" \
   -F "design_url=/static/artworks/sample.png"
+```
+
+Render directly from remote design URL (single call, auto-cache on backend):
+
+```bash
+curl -X POST "http://localhost:8040/v1/mockup/render" \
+  -F "template_id=mug01" \
+  -F "design_url=https://cdn.printerval.com/image/mugs-11oz,black,print-seller-2025-09-13_funny-baby-huey-cartoon-classic-t-shirt-1-054bcb6a0659c9e13a5f0fd3bfc7c525,2d2d2d.jpeg"
 ```
 
 Render from template in fast preview mode:
@@ -314,6 +324,22 @@ Common checks:
 - Verify required folders exist: `templates`, `inputs`, `public/mockups`, `output/renders`.
 - If Admin UI cannot call API, confirm Vite proxy target is correct.
 - If URL import is slow on first call, that is expected on cache miss; repeated calls should be much faster.
+
+If remote render/download reports missing `h2` (HTTP/2):
+
+```bash
+pip install "httpx[http2]"
+```
+
+After install, restart API to apply:
+
+```bash
+# local
+uvicorn app.main:app --host 0.0.0.0 --port 8040 --reload
+
+# docker
+docker compose restart api
+```
 
 ## 12. Version and Docs
 

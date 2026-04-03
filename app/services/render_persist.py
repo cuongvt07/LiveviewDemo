@@ -7,7 +7,6 @@ Designed for fire-and-forget background usage so it never blocks the render resp
 
 import hashlib
 import logging
-import os
 import time
 from pathlib import Path
 
@@ -65,20 +64,25 @@ async def persistRenderResult(
     This function is designed to be called via asyncio.create_task() so it
     runs in the background without blocking the HTTP response.
     """
+    destination: Path | None = None
     try:
         slug = extractSlug(source_url)
         filename = buildRenderFilename(slug, output_format)
-        saveRenderedImage(image_bytes, filename)
+        destination = saveRenderedImage(image_bytes, filename)
 
         image_path = f'/static/renders/{filename}'
 
         async with async_session() as session:
-            record = RenderedResult(
-                url_slug=slug,
-                image_path=image_path,
-            )
-            session.add(record)
-            await session.commit()
+            try:
+                record = RenderedResult(
+                    url_slug=slug,
+                    image_path=image_path,
+                )
+                session.add(record)
+                await session.commit()
+            except Exception:
+                await session.rollback()
+                raise
 
         logger.info(
             'Persisted render result: slug=%s path=%s',
@@ -86,6 +90,19 @@ async def persistRenderResult(
             image_path,
         )
     except Exception:
+        if destination is not None and destination.exists():
+            try:
+                destination.unlink()
+                logger.info(
+                    'Cleaned up orphan render file after persist failure: %s',
+                    destination,
+                )
+            except Exception:
+                logger.warning(
+                    'Failed to cleanup orphan render file: %s',
+                    destination,
+                    exc_info=True,
+                )
         logger.warning(
             'Failed to persist render result for URL: %s',
             source_url,

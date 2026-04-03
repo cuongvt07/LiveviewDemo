@@ -9,6 +9,7 @@ import os
 import re
 from contextlib import suppress
 from dataclasses import asdict, dataclass
+from importlib.util import find_spec
 from pathlib import Path
 from typing import Optional
 from urllib.parse import urlparse, unquote
@@ -43,6 +44,8 @@ DEFAULT_SECTION_URL_TEMPLATES: dict[str, str] = {
 
 _HTTPX_CLIENT: Optional["httpx.AsyncClient"] = None
 _HTTPX_CLIENT_LOCK = asyncio.Lock()
+_HTTP2_AVAILABLE = find_spec("h2") is not None
+_COMMON_IMAGE_SUFFIXES: tuple[str, ...] = (".jpg", ".jpeg", ".png", ".webp", ".avif")
 
 MUG_MOCKUP_POLICIES: dict[tuple[str, str], dict] = {
     ("11oz", "white"): {
@@ -477,6 +480,62 @@ def resolve_local_asset_path(raw_path: str) -> Path:
     return path.resolve()
 
 
+def is_remote_http_url(raw_path: Optional[str]) -> bool:
+    if not isinstance(raw_path, str):
+        return False
+    normalized = raw_path.strip()
+    if not normalized:
+        return False
+    parsed = urlparse(normalized)
+    return parsed.scheme.lower() in {"http", "https"} and bool(parsed.netloc)
+
+
+def _infer_remote_preferred_name(remote_url: str, fallback: str = "asset") -> str:
+    parsed = urlparse(remote_url)
+    stem = Path(unquote(parsed.path)).stem.strip()
+    if not stem:
+        stem = fallback
+    sanitized = _sanitize_filename(stem)
+    if len(sanitized) > 120:
+        sanitized = sanitized[:120].rstrip("-._")
+    return sanitized or fallback
+
+
+async def resolve_or_download_remote_asset(
+    raw_path: str,
+    *,
+    target_dir: Path,
+    preferred_name: Optional[str] = None,
+    reuse_local: bool = True,
+) -> Path:
+    normalized = str(raw_path or "").strip()
+    if not normalized:
+        raise ValueError("asset_url_empty")
+
+    if not is_remote_http_url(normalized):
+        return resolve_local_asset_path(normalized)
+
+    target_dir = target_dir.resolve()
+    resolved_preferred_name = _sanitize_filename(
+        preferred_name or _infer_remote_preferred_name(normalized)
+    )
+
+    if reuse_local:
+        cached = _find_cached_downloaded_asset(
+            normalized,
+            target_dir,
+            preferred_name=resolved_preferred_name,
+        )
+        if cached is not None:
+            return cached
+
+    return await download_remote_asset_async(
+        normalized,
+        target_dir,
+        preferred_name=resolved_preferred_name,
+    )
+
+
 def _build_default_print_area(width: int, height: int, product_type: str) -> dict:
     if str(product_type).startswith("cylinder"):
         top_left = [int(width * 0.22), int(height * 0.14)]
@@ -598,6 +657,13 @@ def _guess_extension(remote_url: str, content_type: str) -> str:
     return guessed or ".png"
 
 
+def _build_cached_filename(preferred_name: str, remote_url: str, suffix: str) -> str:
+    safe_suffix = suffix if str(suffix).startswith(".") else f".{suffix}"
+    safe_preferred_name = _sanitize_filename(preferred_name)
+    url_hash = hashlib.sha1(remote_url.encode("utf-8")).hexdigest()[:12]
+    return f"{safe_preferred_name}-{url_hash}{safe_suffix.lower()}"
+
+
 async def _get_async_http_client() -> Optional["httpx.AsyncClient"]:
     global _HTTPX_CLIENT
     if httpx is None:
@@ -608,15 +674,25 @@ async def _get_async_http_client() -> Optional["httpx.AsyncClient"]:
     async with _HTTPX_CLIENT_LOCK:
         if _HTTPX_CLIENT is not None:
             return _HTTPX_CLIENT
+            
+        # Optimization: use pre-configured singleton for high-volume concurrent downloads
         _HTTPX_CLIENT = httpx.AsyncClient(
-            http2=True,
-            limits=httpx.Limits(max_connections=100, max_keepalive_connections=20),
-            timeout=httpx.Timeout(30.0),
+            http2=_HTTP2_AVAILABLE,
+            limits=httpx.Limits(
+                max_connections=100, 
+                max_keepalive_connections=20,
+                keepalive_expiry=30.0
+            ),
+            timeout=httpx.Timeout(connect=5.0, read=60.0, pool=5.0),
             follow_redirects=True,
+            headers={
+                "Accept-Encoding": "gzip, br",
+                "Connection": "keep-alive"
+            }
         )
+        if not _HTTP2_AVAILABLE:
+            logger.warning("HTTP/2 disabled for URL downloads because package 'h2' is not installed.")
         return _HTTPX_CLIENT
-
-
 async def close_async_http_client() -> None:
     global _HTTPX_CLIENT
     if _HTTPX_CLIENT is None:
@@ -646,8 +722,7 @@ def download_remote_asset(remote_url: str, target_dir: Path, preferred_name: str
         raise ValueError(f"URL khÃƒÂ´ng trÃ¡ÂºÂ£ vÃ¡Â»Â dÃ¡Â»Â¯ liÃ¡Â»â€¡u Ã¡ÂºÂ£nh: {remote_url}")
 
     suffix = _guess_extension(remote_url, content_type)
-    url_hash = hashlib.sha1(remote_url.encode("utf-8")).hexdigest()[:12]
-    file_name = f"{_sanitize_filename(preferred_name)}-{url_hash}{suffix}"
+    file_name = _build_cached_filename(preferred_name, remote_url, suffix)
     destination = target_dir / file_name
     destination.write_bytes(content)
     return destination
@@ -660,13 +735,19 @@ async def download_remote_asset_async(remote_url: str, target_dir: Path, preferr
     if client is None:
         return await asyncio.to_thread(download_remote_asset, remote_url, target_dir, preferred_name)
 
-    response = await client.get(
-        remote_url,
-        headers={
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            "Accept": "image/*,*/*;q=0.8",
-        },
-    )
+    try:
+        response = await client.get(
+            remote_url,
+            headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                "Accept": "image/*,*/*;q=0.8",
+            },
+        )
+    except Exception as exc:
+        if "h2" in str(exc).lower() and "http2" in str(exc).lower():
+            logger.warning("HTTP/2 transport unavailable, fallback to urllib downloader for %s", remote_url)
+            return await asyncio.to_thread(download_remote_asset, remote_url, target_dir, preferred_name)
+        raise
     response.raise_for_status()
     content = response.content
     content_type = response.headers.get("Content-Type", "")
@@ -675,10 +756,9 @@ async def download_remote_asset_async(remote_url: str, target_dir: Path, preferr
         raise ValueError(f"URL khÃƒÂ´ng trÃ¡ÂºÂ£ vÃ¡Â»Â dÃ¡Â»Â¯ liÃ¡Â»â€¡u Ã¡ÂºÂ£nh: {remote_url}")
 
     suffix = _guess_extension(remote_url, content_type)
-    url_hash = hashlib.sha1(remote_url.encode("utf-8")).hexdigest()[:12]
-    file_name = f"{_sanitize_filename(preferred_name)}-{url_hash}{suffix}"
+    file_name = _build_cached_filename(preferred_name, remote_url, suffix)
     destination = target_dir / file_name
-    destination.write_bytes(content)
+    await asyncio.to_thread(destination.write_bytes, content)
     return destination
 
 
@@ -686,9 +766,18 @@ def _find_cached_downloaded_asset(remote_url: str, target_dir: Path, preferred_n
     if not remote_url:
         return None
     target_dir.mkdir(parents=True, exist_ok=True)
+    safe_preferred_name = _sanitize_filename(preferred_name)
     url_hash = hashlib.sha1(remote_url.encode("utf-8")).hexdigest()[:12]
-    file_prefix = f"{_sanitize_filename(preferred_name)}-{url_hash}"
-    for candidate in sorted(target_dir.glob(f"{file_prefix}.*")):
+    file_prefix = f"{safe_preferred_name}-{url_hash}"
+
+    # Fast path: deterministic direct-file existence checks.
+    for suffix in _COMMON_IMAGE_SUFFIXES:
+        candidate = target_dir / f"{file_prefix}{suffix}"
+        if candidate.exists() and candidate.is_file() and candidate.stat().st_size > 0:
+            return candidate
+
+    # Fallback: preserve compatibility for uncommon extensions.
+    for candidate in target_dir.glob(f"{file_prefix}.*"):
         if candidate.is_file() and candidate.stat().st_size > 0:
             return candidate
     return None
