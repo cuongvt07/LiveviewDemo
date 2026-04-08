@@ -421,6 +421,9 @@ def compute_and_cache_cylindrical_map(
         dst_corners = src_canonical
 
     H_mat, _ = cv2.findHomography(dst_corners, src_canonical)
+    if H_mat is None:
+        # Fallback: ma trận đơn vị nếu homography thất bại (tọa độ suy biến)
+        H_mat = np.eye(3, dtype=np.float64)
 
     PREVIEW_GRID_SIZE = 512
     if is_preview and (W > PREVIEW_GRID_SIZE or H > PREVIEW_GRID_SIZE):
@@ -647,6 +650,8 @@ def cylindrical_warp(
                     [-1, 1],
                 ])
                 H_mat, _ = cv2.findHomography(dst_corners, src_canonical)
+                if H_mat is None:
+                    H_mat = np.eye(3, dtype=np.float64)
 
             curved_mask = _build_curved_clip_mask(
                 mockup_bgr=reference_mockup,

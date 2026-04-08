@@ -31,6 +31,8 @@ def extract_specular_from_mockup(
 ) -> np.ndarray:
     """Extract highlight men sứ từ ảnh cốc trắng."""
     gray = cv2.cvtColor(mockup, cv2.COLOR_BGR2GRAY).astype(np.float32)
+    # Khống chế threshold tối đa 254 để tránh chia cho 0 (255 - 255)
+    threshold = min(254, int(threshold))
     specular = np.clip(gray - threshold, 0, 255) / (255 - threshold)
     specular = cv2.GaussianBlur(specular, (15, 15), sigmaX=5)
     return specular

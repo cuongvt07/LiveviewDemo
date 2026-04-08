@@ -744,11 +744,22 @@ async def download_remote_asset_async(remote_url: str, target_dir: Path, preferr
             },
         )
     except Exception as exc:
-        if "h2" in str(exc).lower() and "http2" in str(exc).lower():
+        exc_str = str(exc).lower()
+        # HTTP/2 protocol error → fallback to urllib
+        if "h2" in exc_str and "http2" in exc_str:
             logger.warning("HTTP/2 transport unavailable, fallback to urllib downloader for %s", remote_url)
             return await asyncio.to_thread(download_remote_asset, remote_url, target_dir, preferred_name)
+        # Lỗi kết nối mạng (DNS, SSL, Timeout) → chuyển thành ValueError rõ ràng
+        if httpx is not None and isinstance(exc, (httpx.ConnectError, httpx.ConnectTimeout)):
+            raise ValueError(f"Không thể kết nối đến server: {remote_url}") from exc
+        if httpx is not None and isinstance(exc, httpx.TimeoutException):
+            raise ValueError(f"Hết thời gian chờ khi tải ảnh: {remote_url}") from exc
         raise
-    response.raise_for_status()
+    # Lỗi HTTP (404, 403, 500 từ server nguồn)
+    try:
+        response.raise_for_status()
+    except Exception as status_exc:
+        raise ValueError(f"Server trả về lỗi {response.status_code} cho URL: {remote_url}") from status_exc
     content = response.content
     content_type = response.headers.get("Content-Type", "")
 

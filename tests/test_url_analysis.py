@@ -112,6 +112,9 @@ class UrlAnalysisTests(unittest.TestCase):
     )
     def test_analyze_url_uses_builtin_print_rule_when_env_missing(self, *_mocks) -> None:
         with patch(
+            "app.services.url_analysis._find_cached_downloaded_asset",
+            return_value=None,
+        ), patch(
             "app.services.url_analysis.download_remote_asset",
             return_value=Path("inputs/artworks/builtin-source.png"),
         ) as mocked_download:

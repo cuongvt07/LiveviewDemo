@@ -18,9 +18,14 @@ def composite(
     warped_r = cv2.resize(warped, (w, h)) if warped.shape[:2] != (h, w) else warped
     mask_r   = cv2.resize(mask, (w, h))   if mask.shape[:2]   != (h, w) else mask
 
-    soft_mask    = feather_mask(mask_r, feather_px)
-    design_alpha = warped_r[:, :, 3].astype(np.float32) / 255.0
-    alpha        = (soft_mask * design_alpha)[:, :, np.newaxis]
+    if warped_r.shape[2] == 4:
+        warped_alpha = warped_r[:, :, 3]
+    else:
+        warped_alpha = np.full(warped_r.shape[:2], 255, dtype=np.uint8)
+
+    soft_mask         = feather_mask(mask_r, feather_px)
+    soft_design_alpha = feather_mask(warped_alpha, feather_px)
+    alpha             = (soft_mask * soft_design_alpha)[:, :, np.newaxis]
 
     base    = mockup.astype(np.float32)
     overlay = warped_r[:, :, :3].astype(np.float32)

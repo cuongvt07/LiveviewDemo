@@ -15,7 +15,7 @@ from ..shared.design_transform import apply_design_transform, estimate_print_are
 from ..shared.smooth_mesh_warp import apply_smooth_mesh_warp
 from .cylindrical_warp import cylindrical_warp
 from .renderer import render_mug_final, render_mug_preview
-from .mesh_config import MugMeshConfig
+from .mesh_config import MugMeshConfig, MeshPoint
 from .lighting_extract import (
     build_cylinder_surface_maps,
     build_light_direction,
@@ -54,6 +54,35 @@ class MugAssets:
     config: dict
 
 
+def _run_cylindrical_fallback(
+    design: np.ndarray,
+    cfg: dict,
+    out_w: int,
+    out_h: int,
+    reference_mockup: np.ndarray,
+) -> np.ndarray:
+    '''Cylindrical warp fallback — gom tham số dùng chung.'''
+    is_preview = cfg.get('is_preview', False)
+    cyl = cfg.get('cylinder', {})
+    return cylindrical_warp(
+        design,
+        print_area=cfg['print_area'],
+        output_size=(out_w, out_h),
+        reference_mockup=reference_mockup,
+        theta_max_deg=cyl.get('theta_max_deg', 52.0),
+        pitch=cyl.get('pitch', 0.0),
+        smile_base=cyl.get('smile_base', 0.08),
+        curve_top=cyl.get('curve_top'),
+        curve_bottom=cyl.get('curve_bottom'),
+        edge_squeeze=cyl.get('edge_squeeze', 0.0),
+        squeeze_power=cyl.get('squeeze_power', 2.0),
+        center_focus_width=cyl.get('center_focus_width', 0.0),
+        curve_correction_alpha=cyl.get('curve_correction_alpha', 0.0),
+        curve_snap_threshold_px=cyl.get('curve_snap_threshold_px', 2.0),
+        is_preview=is_preview,
+    )
+
+
 def run_mug_pipeline(
     design_bytes: bytes,
     assets: MugAssets,
@@ -75,6 +104,7 @@ def run_mug_pipeline(
     specular_strength = float(lighting_cfg.get("specular_strength", 0.0))
     color_cfg = cfg.get("color", {})
     render_cfg = cfg.get("render", {})
+    cyl = cfg.get('cylinder', {})
     preserve_original_color = bool(render_cfg.get("preserve_original_color", False))
     out_w, out_h = assets.mockup.shape[1], assets.mockup.shape[0]
     is_preview = bool(cfg.get("is_preview", False))
@@ -121,7 +151,6 @@ def run_mug_pipeline(
             # If points provided, override
             pts = mesh_cfg.get("points")
             if isinstance(pts, list) and len(pts) == (mcfg.rows + 1) * (mcfg.cols + 1):
-                from .mesh_config import MeshPoint
                 mcfg.points = [
                     MeshPoint(u=float(p[0]), v=float(p[1]), locked=bool(p[2]) if len(p) > 2 else False)
                     for p in pts
@@ -129,48 +158,20 @@ def run_mug_pipeline(
 
             # Use full renderer for final output
             warped = render_mug_final(design, mcfg, out_w=out_w, out_h=out_h)
-        except Exception:
-            # fallback to cylindrical
-            is_preview = cfg.get("is_preview", False)
-            cyl = cfg.get("cylinder", {})
-            warped = cylindrical_warp(
-                design,
-                print_area=cfg["print_area"],
-                output_size=(out_w, out_h),
-                reference_mockup=assets.mockup,
-                theta_max_deg=cyl.get("theta_max_deg", 52.0),
-                pitch=cyl.get("pitch", 0.0),
-                smile_base=cyl.get("smile_base", 0.08),
-                curve_top=cyl.get("curve_top"),
-                curve_bottom=cyl.get("curve_bottom"),
-                edge_squeeze=cyl.get("edge_squeeze", 0.0),
-                squeeze_power=cyl.get("squeeze_power", 2.0),
-                center_focus_width=cyl.get("center_focus_width", 0.0),
-                curve_correction_alpha=cyl.get("curve_correction_alpha", 0.0),
-                curve_snap_threshold_px=cyl.get("curve_snap_threshold_px", 2.0),
-                is_preview=is_preview,
-            )
+        except Exception as mesh_exc:
+            # fallback to cylindrical — log lỗi mesh để dễ debug
+            logger.warning('[WARP] Mesh warp failed, fallback to cylindrical: %s', mesh_exc)
+            warped = _run_cylindrical_fallback(design, cfg, out_w, out_h, assets.mockup)
     else:
-        is_preview = cfg.get("is_preview", False)
-        cyl = cfg.get("cylinder", {})
-        warped = cylindrical_warp(
-            design,
-            print_area=cfg["print_area"],
-            output_size=(out_w, out_h),
-            reference_mockup=assets.mockup,
-            theta_max_deg=cyl.get("theta_max_deg", 52.0),
-            pitch=cyl.get("pitch", 0.0),
-            smile_base=cyl.get("smile_base", 0.08),
-            curve_top=cyl.get("curve_top"),
-            curve_bottom=cyl.get("curve_bottom"),
-            edge_squeeze=cyl.get("edge_squeeze", 0.0),
-            squeeze_power=cyl.get("squeeze_power", 2.0),
-            center_focus_width=cyl.get("center_focus_width", 0.0),
-            curve_correction_alpha=cyl.get("curve_correction_alpha", 0.0),
-            curve_snap_threshold_px=cyl.get("curve_snap_threshold_px", 2.0),
-            is_preview=is_preview,
-        )
+        warped = _run_cylindrical_fallback(design, cfg, out_w, out_h, assets.mockup)
     logger.info('[PERF]   cylindrical_warp: %dms', int((time.perf_counter() - t_warp) * 1000))
+
+    # --- Đảm bảo Alpha channel tồn tại để tránh crash ---
+    if warped.ndim == 3 and warped.shape[2] == 4:
+        warped_alpha = warped[:, :, 3]
+    else:
+        # Nếu ảnh BGR, coi như toàn bộ vùng in là đặc (alpha=255)
+        warped_alpha = np.full(warped.shape[:2], 255, dtype=np.uint8)
 
     mesh_src = cfg.get("print_area", {}).get("mesh_control_src")
     mesh_dst = cfg.get("print_area", {}).get("mesh_control_dst")
@@ -192,13 +193,19 @@ def run_mug_pipeline(
 
     is_preview = cfg.get("is_preview", False)
 
+    # Auto-scale feather_px proportionally to output resolution
+    # Base reference: 512px width. At 2048px, 6px becomes ~24px.
+    base_feather = cfg.get('edge', {}).get('feather_px', 6)
+    scale_factor = max(1.0, out_w / 512.0)
+    scaled_feather = int(round(base_feather * scale_factor))
+
     if is_preview:
         t_comp = time.perf_counter()
         result = composite(
             assets.mockup,
             warped,
             assets.mask,
-            feather_px=cfg.get("edge", {}).get("feather_px", 6),
+            feather_px=base_feather,
         )
         logger.info('[PERF]   composite: %dms', int((time.perf_counter() - t_comp) * 1000))
         logger.info('[PERF]   ===== TOTAL mug_pipeline (Preview): %dms =====', int((time.perf_counter() - t_total) * 1000))
@@ -215,7 +222,7 @@ def run_mug_pipeline(
         )
         logger.info('[PERF]   color_match: %dms', int((time.perf_counter() - t_cm) * 1000))
 
-    lighting_mask = warped[:, :, 3].astype(np.float32) / 255.0
+    lighting_mask = warped_alpha.astype(np.float32) / 255.0
     base_mask = assets.mask.astype(np.float32)
     if base_mask.max() > 1.0:
         base_mask /= 255.0
@@ -245,15 +252,15 @@ def run_mug_pipeline(
             p_area = cfg["print_area"]
             p_scaled = {}
             for k, v in p_area.items():
-                # Scale numeric coordinate pairs
+                # Scale numeric coordinate pairs + làm tròn để tối ưu cache key
                 if isinstance(v, list) and len(v) >= 2 and all(isinstance(x, (int, float)) for x in v[:2]):
-                    p_scaled[k] = [v[0] * SCALE, v[1] * SCALE]
-                # Scale list of coordinate pairs (e.g., mesh_control_src / mesh_control_dst)
+                    p_scaled[k] = [round(v[0] * SCALE, 3), round(v[1] * SCALE, 3)]
+                # Scale list of coordinate pairs
                 elif isinstance(v, list) and len(v) > 0 and isinstance(v[0], (list, tuple)):
                     scaled_list = []
                     for item in v:
                         if isinstance(item, (list, tuple)) and len(item) >= 2 and all(isinstance(x, (int, float)) for x in item[:2]):
-                            scaled_list.append([item[0] * SCALE, item[1] * SCALE])
+                            scaled_list.append([round(item[0] * SCALE, 3), round(item[1] * SCALE, 3)])
                         else:
                             scaled_list.append(item)
                     p_scaled[k] = scaled_list
@@ -387,7 +394,7 @@ def run_mug_pipeline(
         assets.mockup,
         warped,
         assets.mask,
-        feather_px=cfg.get("edge", {}).get("feather_px", 6),
+        feather_px=scaled_feather,
     )
     logger.info('[PERF]   composite: %dms', int((time.perf_counter() - t_comp) * 1000))
     logger.info('[PERF]   ===== TOTAL mug_pipeline: %dms =====', int((time.perf_counter() - t_total) * 1000))

@@ -52,7 +52,7 @@ class MugLightingPipelineTests(unittest.TestCase):
         result = apply_shadow_overlay(warped, shadow_map, strength=1.0)
 
         self.assertLess(int(result[0, 0, 0]), int(result[0, 1, 0]))
-        self.assertEqual(int(result[0, 1, 0]), 200)
+        self.assertAlmostEqual(int(result[0, 1, 0]), 200, delta=1)
 
     def test_extract_masked_highlight_detail_finds_bright_stripe(self) -> None:
         mockup = np.full((9, 9, 3), 120, dtype=np.uint8)

@@ -42,7 +42,7 @@ def _normalize_points(points: list | tuple | None, quantize_step: float | None =
     return tuple(normalized)
 
 
-class _ByteBoundLruCache:
+class ByteBoundLruCache:
     def __init__(self, max_bytes: int):
         self._max_bytes = max(1, int(max_bytes))
         self._entries: OrderedDict[Any, tuple[Any, int]] = OrderedDict()
@@ -87,9 +87,9 @@ class _ByteBoundLruCache:
         return value
 
 
-_preview_canvas_cache = _ByteBoundLruCache(max_bytes=32 * 1024 * 1024)
-_cylindrical_map_cache = _ByteBoundLruCache(max_bytes=160 * 1024 * 1024)
-_tps_map_cache = _ByteBoundLruCache(max_bytes=400 * 1024 * 1024)
+_preview_canvas_cache = ByteBoundLruCache(max_bytes=32 * 1024 * 1024)
+_cylindrical_map_cache = ByteBoundLruCache(max_bytes=160 * 1024 * 1024)
+_tps_map_cache = ByteBoundLruCache(max_bytes=400 * 1024 * 1024)
 
 
 def make_preview_canvas_cache_key(width: int, height: int, mesh_density_strength: float) -> tuple:
@@ -140,7 +140,7 @@ def make_cylindrical_map_cache_key(
         ),
         _quantize_scalar(theta_max_deg, 2.0),
         _quantize_scalar(pitch, 5.0),
-        _quantize_scalar(smile_base, 0.02),
+        _quantize_scalar(smile_base, 0.04),
         _quantize_scalar(curve_top, 5.0),
         _quantize_scalar(curve_bottom, 5.0),
         _quantize_scalar(edge_squeeze, 0.05),

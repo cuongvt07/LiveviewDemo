@@ -17,6 +17,51 @@ OUT_DIR = Path('output') / 'renders'
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 PREVIEW_MAX_DIM = 512
 
+# --- Giới hạn bộ nhớ ---
+_JOB_TTL_SECONDS = 3600       # Xóa job sau 1 giờ
+_MAX_JOBS_IN_MEMORY = 200     # Giới hạn tối đa 200 job trong RAM
+_LAST_CLEANUP_TIME = 0.0
+_CLEANUP_INTERVAL = 300       # Dọn dẹp mỗi 5 phút
+
+
+def _cleanup_expired_jobs():
+    '''Xóa các job đã quá hạn TTL ra khỏi bộ nhớ.'''
+    global _LAST_CLEANUP_TIME
+    now = time.time()
+    if now - _LAST_CLEANUP_TIME < _CLEANUP_INTERVAL:
+        return
+    _LAST_CLEANUP_TIME = now
+
+    expired_ids = []
+    for job_id, job in _jobs.items():
+        age = now - job.get('created_at', now)
+        is_terminal = job.get('status') in ('done', 'failed')
+        if is_terminal and age > _JOB_TTL_SECONDS:
+            expired_ids.append(job_id)
+
+    for job_id in expired_ids:
+        _jobs.pop(job_id, None)
+
+    # Nếu vẫn vượt giới hạn, xóa thêm job cũ nhất đã hoàn thành
+    if len(_jobs) > _MAX_JOBS_IN_MEMORY:
+        terminal_jobs = [
+            (jid, j.get('created_at', 0))
+            for jid, j in _jobs.items()
+            if j.get('status') in ('done', 'failed')
+        ]
+        terminal_jobs.sort(key=lambda x: x[1])
+        excess = len(_jobs) - _MAX_JOBS_IN_MEMORY
+        for jid, _ in terminal_jobs[:excess]:
+            _jobs.pop(jid, None)
+
+
+def _release_job_payload(job: Dict[str, Any]):
+    '''Giải phóng dữ liệu nặng (bytes ảnh) sau khi job xong.'''
+    payload = job.get('payload')
+    if isinstance(payload, dict):
+        payload.pop('design_bytes', None)
+        payload.pop('mockup_bytes', None)
+
 
 def _start_worker():
     global _worker_started
@@ -44,6 +89,7 @@ def enqueue_adhoc_render(design_bytes: bytes, mockup_bytes: bytes, config: dict,
         'result': {},
     }
     with _lock:
+        _cleanup_expired_jobs()
         _jobs[job_id] = job
         _queue.append(job_id)
     _start_worker()
@@ -157,17 +203,20 @@ def _worker_loop():
                 job['phase'] = 'done'
                 job['status'] = 'done'
                 job['updated_at'] = time.time()
+                _release_job_payload(job)
             except Exception as e:
                 job['status'] = 'failed'
                 job['phase'] = 'error'
                 job['error'] = str(e)
                 job['updated_at'] = time.time()
+                _release_job_payload(job)
         except Exception as exc:
             with _lock:
                 job['status'] = 'failed'
                 job['phase'] = 'error'
                 job['error'] = str(exc)
                 job['updated_at'] = time.time()
+                _release_job_payload(job)
         finally:
             # loop continues
             pass

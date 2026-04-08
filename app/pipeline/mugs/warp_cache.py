@@ -6,6 +6,7 @@ from typing import Dict, Tuple
 
 from .mesh_config import MugMeshConfig
 from .warp_builder import build_warp_map
+from ..shared.liveview_cache import ByteBoundLruCache
 
 
 class WarpMapRegistry:
@@ -17,7 +18,8 @@ class WarpMapRegistry:
             with cls._lock:
                 if cls._instance is None:
                     cls._instance = super().__new__(cls)
-                    cls._instance._cache: Dict[str, Tuple[np.ndarray, np.ndarray]] = {}
+                    # Giới hạn 512MB RAM cho bộ đệm ma trận warp lưới (mỗi bộ ~32MB ở 2K)
+                    cls._instance._cache = ByteBoundLruCache(max_bytes=512 * 1024 * 1024)
         return cls._instance
 
     @staticmethod
@@ -32,11 +34,12 @@ class WarpMapRegistry:
             return build_warp_map(config, out_w, out_h, quality="preview")
 
         k = self._config_hash(config, out_w, out_h)
-        if k in self._cache:
-            return self._cache[k]
+        cached = self._cache.get(k)
+        if cached is not None:
+            return cached
 
         map_x, map_y = build_warp_map(config, out_w, out_h, quality="full")
-        self._cache[k] = (map_x, map_y)
+        self._cache.set(k, (map_x, map_y))
         return map_x, map_y
 
     def warmup(self, sku_configs: Dict[str, MugMeshConfig], sizes=[(512, 512), (2048, 2048)]) -> None:
