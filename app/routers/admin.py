@@ -8,6 +8,8 @@ import copy
 import shutil
 import logging
 import asyncio
+import cv2
+import numpy as np
 from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
@@ -43,6 +45,8 @@ from app.services.url_analysis import (
     list_available_mockup_views,
     resolve_local_asset_path,
 )
+from app.routers.render import _build_default_adhoc_config, _merge_adhoc_user_config, _build_adhoc_pipeline_config
+from app.services.render_persist import extractSlug, buildRenderFilename, saveRenderedImage
 
 router = APIRouter(tags=['admin'])
 logger = logging.getLogger('mockup_service')
@@ -77,8 +81,6 @@ def _normalize_saved_template_config(
     scale_x: float = 1.0,
     scale_y: float = 1.0,
 ) -> dict:
-    from app.routers.render import _build_default_adhoc_config, _merge_adhoc_user_config
-
     payload = copy.deepcopy(raw_config) if isinstance(raw_config, dict) else {}
     if not isinstance(payload.get('print_area'), dict):
         payload['print_area'] = {}
@@ -377,8 +379,6 @@ async def _load_active_template_assets(slug: str):
 
 
 async def _find_cached_rendered_result_path(source_url: str) -> str | None:
-    from app.services.render_persist import extractSlug
-
     slug = extractSlug(source_url)
     async with async_session() as session:
         stmt = (
@@ -392,8 +392,6 @@ async def _find_cached_rendered_result_path(source_url: str) -> str | None:
 
 
 async def _persist_rendered_result_and_get_path(source_url: str, image_bytes: bytes, output_format: str = 'jpg') -> str:
-    from app.services.render_persist import buildRenderFilename, extractSlug, saveRenderedImage
-
     slug = extractSlug(source_url)
     filename = buildRenderFilename(slug, output_format)
     saveRenderedImage(image_bytes, filename)
@@ -407,8 +405,6 @@ async def _persist_rendered_result_and_get_path(source_url: str, image_bytes: by
 
 @asynccontextmanager
 async def _mockup_link_render_lock(source_url: str):
-    from app.services.render_persist import extractSlug
-
     lock_key = extractSlug(source_url)
     async with _MOCKUP_LINK_RENDER_LOCKS_GUARD:
         lock = _MOCKUP_LINK_RENDER_LOCKS.get(lock_key)
@@ -434,9 +430,6 @@ def _write_preview_data_url(
     header, _, payload = preview_data_url.partition(',')
     if ';base64' not in header or not payload:
         raise ValueError('preview_data_url must be base64 data URL')
-
-    import cv2
-    import numpy as np
 
     binary = base64.b64decode(payload)
     buf = np.frombuffer(binary, dtype=np.uint8)
@@ -476,9 +469,6 @@ async def getTemplatePreviewImage(
     fit: str = URL_ANALYSIS_PREVIEW_FIT,
     quality: int = URL_ANALYSIS_PREVIEW_QUALITY,
 ):
-    import cv2
-    import numpy as np
-
     if '..' in Path(slug).parts:
         raise HTTPException(status_code=400, detail={'message': 'invalid_slug'})
 
@@ -486,69 +476,77 @@ async def getTemplatePreviewImage(
     if source_path is None:
         raise HTTPException(status_code=404, detail={'message': f"Template '{slug}' preview not found"})
 
-    buf = np.frombuffer(source_path.read_bytes(), dtype=np.uint8)
-    image = cv2.imdecode(buf, cv2.IMREAD_UNCHANGED)
-    if image is None:
-        raise HTTPException(status_code=500, detail={'message': 'failed_to_decode_preview'})
+    def _process_preview_image():
+        buf = np.frombuffer(source_path.read_bytes(), dtype=np.uint8)
+        image = cv2.imdecode(buf, cv2.IMREAD_UNCHANGED)
+        if image is None:
+            return None
 
-    if image.ndim == 2:
-        image = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
-    elif image.ndim == 3 and image.shape[2] == 4:
-        alpha = image[:, :, 3:4].astype(np.float32) / 255.0
-        rgb = image[:, :, :3].astype(np.float32)
-        white = np.full_like(rgb, 255.0, dtype=np.float32)
-        image = np.clip(rgb * alpha + white * (1.0 - alpha), 0.0, 255.0).astype(np.uint8)
-
-    src_h, src_w = image.shape[:2]
-    target_w = int(width) if width is not None else None
-    target_h = int(height) if height is not None else None
-
-    if target_w is None and target_h is None:
-        target_w, target_h = src_w, src_h
-    elif target_w is None:
-        target_h = max(1, target_h)
-        target_w = max(1, int(round(src_w * (target_h / max(src_h, 1)))))
-    elif target_h is None:
-        target_w = max(1, target_w)
-        target_h = max(1, int(round(src_h * (target_w / max(src_w, 1)))))
-    else:
-        target_w = max(1, target_w)
-        target_h = max(1, target_h)
-
-    resized = image
-    fit_mode = _normalize_preview_fit(fit)
-    if target_w != src_w or target_h != src_h:
-        if fit_mode == 'cover':
-            scale = max(target_w / max(src_w, 1), target_h / max(src_h, 1))
-            new_w = max(1, int(round(src_w * scale)))
-            new_h = max(1, int(round(src_h * scale)))
-            interpolation = cv2.INTER_AREA if new_w < src_w or new_h < src_h else cv2.INTER_LINEAR
-            expanded = cv2.resize(image, (new_w, new_h), interpolation=interpolation)
-            start_x = max(0, (new_w - target_w) // 2)
-            start_y = max(0, (new_h - target_h) // 2)
-            resized = expanded[start_y:start_y + target_h, start_x:start_x + target_w]
+        if image.ndim == 2:
+            image_bgr = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
+        elif image.ndim == 3 and image.shape[2] == 4:
+            alpha = image[:, :, 3:4].astype(np.float32) / 255.0
+            rgb = image[:, :, :3].astype(np.float32)
+            white = np.full_like(rgb, 255.0, dtype=np.float32)
+            image_bgr = np.clip(rgb * alpha + white * (1.0 - alpha), 0.0, 255.0).astype(np.uint8)
         else:
-            scale = min(target_w / max(src_w, 1), target_h / max(src_h, 1))
-            new_w = max(1, int(round(src_w * scale)))
-            new_h = max(1, int(round(src_h * scale)))
-            interpolation = cv2.INTER_AREA if new_w < src_w or new_h < src_h else cv2.INTER_LINEAR
-            contained = cv2.resize(image, (new_w, new_h), interpolation=interpolation)
-            resized = np.full((target_h, target_w, 3), 255, dtype=np.uint8)
-            offset_x = (target_w - new_w) // 2
-            offset_y = (target_h - new_h) // 2
-            resized[offset_y:offset_y + new_h, offset_x:offset_x + new_w] = contained
+            image_bgr = image
 
-    encode_quality = max(1, min(100, int(quality)))
-    ok, encoded = cv2.imencode(
-        '.jpg',
-        resized,
-        [int(cv2.IMWRITE_JPEG_QUALITY), encode_quality],
-    )
-    if not ok:
-        raise HTTPException(status_code=500, detail={'message': 'failed_to_encode_preview'})
+        src_h, src_w = image_bgr.shape[:2]
+        target_w = int(width) if width is not None else None
+        target_h = int(height) if height is not None else None
+
+        if target_w is None and target_h is None:
+            target_w, target_h = src_w, src_h
+        elif target_w is None:
+            target_h = max(1, target_h)
+            target_w = max(1, int(round(src_w * (target_h / max(src_h, 1)))))
+        elif target_h is None:
+            target_w = max(1, target_w)
+            target_h = max(1, int(round(src_h * (target_w / max(src_w, 1)))))
+        else:
+            target_w = max(1, target_w)
+            target_h = max(1, target_h)
+
+        resized = image_bgr
+        fit_mode = _normalize_preview_fit(fit)
+        if target_w != src_w or target_h != src_h:
+            if fit_mode == 'cover':
+                scale = max(target_w / max(src_w, 1), target_h / max(src_h, 1))
+                new_w = max(1, int(round(src_w * scale)))
+                new_h = max(1, int(round(src_h * scale)))
+                interpolation = cv2.INTER_AREA if new_w < src_w or new_h < src_h else cv2.INTER_LINEAR
+                expanded = cv2.resize(image_bgr, (new_w, new_h), interpolation=interpolation)
+                start_x = max(0, (new_w - target_w) // 2)
+                start_y = max(0, (new_h - target_h) // 2)
+                resized = expanded[start_y:start_y + target_h, start_x:start_x + target_w]
+            else:
+                scale = min(target_w / max(src_w, 1), target_h / max(src_h, 1))
+                new_w = max(1, int(round(src_w * scale)))
+                new_h = max(1, int(round(src_h * scale)))
+                interpolation = cv2.INTER_AREA if new_w < src_w or new_h < src_h else cv2.INTER_LINEAR
+                contained = cv2.resize(image_bgr, (new_w, new_h), interpolation=interpolation)
+                resized = np.full((target_h, target_w, 3), 255, dtype=np.uint8)
+                offset_x = (target_w - new_w) // 2
+                offset_y = (target_h - new_h) // 2
+                resized[offset_y:offset_y + new_h, offset_x:offset_x + new_w] = contained
+
+        encode_quality = max(1, min(100, int(quality)))
+        ok, encoded = cv2.imencode(
+            '.jpg',
+            resized,
+            [int(cv2.IMWRITE_JPEG_QUALITY), encode_quality],
+        )
+        if not ok:
+            return None
+        return encoded.tobytes()
+
+    result = await asyncio.to_thread(_process_preview_image)
+    if result is None:
+        raise HTTPException(status_code=500, detail={'message': 'failed_to_process_preview'})
 
     return Response(
-        content=encoded.tobytes(),
+        content=result,
         media_type='image/jpeg',
         headers={'Cache-Control': 'public, max-age=300'},
     )
@@ -572,8 +570,6 @@ async def createTemplate(
     Tạo template mới. Upload mockup + mask (bắt buộc),
     shadow/normal/specular (tùy chọn).
     '''
-    import json
-
     try:
         config_dict = json.loads(config)
     except json.JSONDecodeError:
@@ -1235,10 +1231,16 @@ async def saveAdhocTemplate(
     maps_dir = template_dir / 'maps'
     maps_dir.mkdir(parents=True, exist_ok=True)
 
+    # 4. Normalize config (CPU-light, ok trên event loop)
     import cv2
     import numpy as np
 
-    src_img = cv2.imread(str(mockup_path), cv2.IMREAD_COLOR)
+    # Đọc ảnh gốc để lấy kích thước — chạy trong thread
+    def _read_source_image():
+        img = cv2.imread(str(mockup_path), cv2.IMREAD_COLOR)
+        return img
+
+    src_img = await asyncio.to_thread(_read_source_image)
     if src_img is None:
         raise HTTPException(status_code=400, detail={'message': 'invalid mockup image'})
     src_h, src_w = src_img.shape[:2]
@@ -1246,7 +1248,6 @@ async def saveAdhocTemplate(
     scale_x = float(target_w) / float(max(1, src_w))
     scale_y = float(target_h) / float(max(1, src_h))
 
-    # 4. Normalize config with coordinate scaling to target output size
     normalized_config = _normalize_saved_template_config(
         body.config,
         target_w,
@@ -1256,63 +1257,71 @@ async def saveAdhocTemplate(
         scale_y=scale_y,
     )
 
-    # 5. Save canonical mockup resized exactly to requested size
-    resized_mockup = cv2.resize(
-        src_img,
-        (target_w, target_h),
-        interpolation=cv2.INTER_AREA if (src_w > target_w or src_h > target_h) else cv2.INTER_LINEAR,
-    )
+    # 5-6-8. Xử lý ảnh nặng (resize mockup, build mask, save preview) — chạy trong thread
     canonical_mockup_path = template_dir / 'mockup.jpg'
-    ok_mockup = cv2.imwrite(
-        str(canonical_mockup_path),
-        resized_mockup,
-        [int(cv2.IMWRITE_JPEG_QUALITY), 95],
-    )
-    if not ok_mockup:
-        raise HTTPException(status_code=500, detail={'message': 'failed to save mockup.jpg'})
-
-    from scripts.generate_maps_from_photo import generate_all_maps
-
-    # 6. Build mask from scaled config
     mask_path = maps_dir / 'mask.jpg'
-    mask = np.zeros((target_h, target_w), dtype=np.uint8)
-    mask_points = normalized_config.get('print_area', {}).get('mask_points')
-    if mask_points:
-        pts = np.array(mask_points, dtype=np.int32)
-        cv2.fillPoly(mask, [pts], 255)
-    else:
-        quad = normalized_config.get('print_area', {}).get('quad')
-        if quad:
-            pts = np.array(quad, dtype=np.int32)
+    preview_path = template_dir / 'preview.jpg'
+
+    def _process_and_save_assets():
+        # 5. Resize mockup
+        resized_mockup = cv2.resize(
+            src_img,
+            (target_w, target_h),
+            interpolation=cv2.INTER_AREA if (src_w > target_w or src_h > target_h) else cv2.INTER_LINEAR,
+        )
+        ok_mockup = cv2.imwrite(
+            str(canonical_mockup_path),
+            resized_mockup,
+            [int(cv2.IMWRITE_JPEG_QUALITY), 95],
+        )
+        if not ok_mockup:
+            return 'failed to save mockup.jpg'
+
+        # 6. Build mask
+        mask = np.zeros((target_h, target_w), dtype=np.uint8)
+        mask_points = normalized_config.get('print_area', {}).get('mask_points')
+        if mask_points:
+            pts = np.array(mask_points, dtype=np.int32)
             cv2.fillPoly(mask, [pts], 255)
         else:
-            mask.fill(255)
+            quad = normalized_config.get('print_area', {}).get('quad')
+            if quad:
+                pts = np.array(quad, dtype=np.int32)
+                cv2.fillPoly(mask, [pts], 255)
+            else:
+                mask.fill(255)
 
-    mask_bgr = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
-    ok_mask = cv2.imwrite(str(mask_path), mask_bgr, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
-    if not ok_mask:
-        raise HTTPException(status_code=500, detail={'message': 'failed to save mask.jpg'})
+        mask_bgr = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
+        ok_mask = cv2.imwrite(str(mask_path), mask_bgr, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
+        if not ok_mask:
+            return 'failed to save mask.jpg'
 
-    # 7. Generate maps
+        # 8. Save preview
+        if body.preview_data_url:
+            try:
+                _write_preview_data_url(
+                    body.preview_data_url,
+                    preview_path,
+                    resize_to=(target_w, target_h),
+                    jpeg_quality=95,
+                )
+            except Exception as e:
+                logger.warning(f'Failed to save preview image for {body.slug}: {e}')
+        if not preview_path.exists():
+            shutil.copy2(canonical_mockup_path, preview_path)
+
+        return None  # Success
+
+    asset_error = await asyncio.to_thread(_process_and_save_assets)
+    if asset_error:
+        raise HTTPException(status_code=500, detail={'message': asset_error})
+
+    # 7. Generate maps (đã có asyncio.to_thread)
+    from scripts.generate_maps_from_photo import generate_all_maps
     try:
         await asyncio.to_thread(generate_all_maps, str(canonical_mockup_path), str(maps_dir))
     except Exception as e:
         logger.error(f'Failed to generate maps: {e}')
-
-    # 8. Save preview as JPEG (resized to requested output size)
-    preview_path = template_dir / 'preview.jpg'
-    if body.preview_data_url:
-        try:
-            _write_preview_data_url(
-                body.preview_data_url,
-                preview_path,
-                resize_to=(target_w, target_h),
-                jpeg_quality=95,
-            )
-        except Exception as e:
-            logger.warning(f'Failed to save preview image for {body.slug}: {e}')
-    if not preview_path.exists():
-        shutil.copy2(canonical_mockup_path, preview_path)
 
     # 9. Save DB row
     template = Template(

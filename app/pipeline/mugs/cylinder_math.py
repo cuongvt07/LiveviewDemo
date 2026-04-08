@@ -143,6 +143,10 @@ def compute_uv_cylindrical(
     1) Legacy mode via smile_base + pitch.
     2) Explicit editor mode via curve_top/curve_bottom percentages.
     """
+    # --- NaN Sanitization: chặn NaN/Inf lan truyền từ homography hoặc input ---
+    X_proj = np.nan_to_num(X_proj, nan=0.0, posinf=1.0, neginf=-1.0)
+    Y_proj = np.nan_to_num(Y_proj, nan=0.0, posinf=1.0, neginf=-1.0)
+
     theta_max = np.radians(theta_max_deg)
     if abs(theta_max) < 1e-8:
         U = (X_proj + 1.0) / 2.0
@@ -194,19 +198,26 @@ def compute_uv_cylindrical(
             y = Y_proj[~small_a]
             disc = np.maximum(b * b + 4.0 * a * y, 0.0)
             sqrt_disc = np.sqrt(disc)
-            root1 = (-b + sqrt_disc) / (2.0 * a)
-            root2 = (-b - sqrt_disc) / (2.0 * a)
+            # Bảo vệ chia cho 0: nếu a quá nhỏ sau filter vẫn lọt, fallback về y
+            safe_2a = np.where(np.abs(a) < 1e-12, 1.0, 2.0 * a)
+            root1 = (-b + sqrt_disc) / safe_2a
+            root2 = (-b - sqrt_disc) / safe_2a
 
             # Choose the branch that stays closest to the output Y coordinate.
             use_root1 = np.abs(root1 - y) <= np.abs(root2 - y)
             source_y[~small_a] = np.where(use_root1, root1, root2)
 
+        # Chặn NaN còn sót sau phép chia/sqrt
+        source_y = np.nan_to_num(source_y, nan=0.0, posinf=1.0, neginf=-1.0)
         V_final = (source_y + 1.0) / 2.0
     else:
         factor = -Y_proj / 2.0
         curve_v = smile_base + factor * (pitch / 100.0) * hr_ratio * 0.15
         V_final = V_canon - curve_v * (np.cos(theta) - np.cos(theta_max))
 
+    # Sanitize output cuối cùng
+    U = np.nan_to_num(U, nan=0.5, posinf=1.0, neginf=0.0)
+    V_final = np.nan_to_num(V_final, nan=0.5, posinf=1.0, neginf=0.0)
     if clamp_v:
         V_final = np.clip(V_final, 0.0, 1.0)
     return np.clip(U, 0.0, 1.0), V_final
