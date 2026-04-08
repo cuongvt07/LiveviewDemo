@@ -188,16 +188,44 @@ if os.path.exists('public/mockups'):
 os.makedirs('output/renders', exist_ok=True)
 app.mount('/static/renders', StaticFiles(directory='output/renders'), name='renders')
 
-from fastapi import Request
 import time
+from starlette.types import ASGIApp, Receive, Scope, Send
 
-@app.middleware('http')
-async def log_requests(request: Request, call_next):
-    start_time = time.time()
-    response = await call_next(request)
-    duration = time.time() - start_time
-    logger.info(f'{request.method} {request.url.path} - {response.status_code} ({duration:.2f}s)')
-    return response
+
+class LogRequestsMiddleware:
+    def __init__(self, app: ASGIApp):
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send):
+        if scope['type'] != 'http':
+            await self.app(scope, receive, send)
+            return
+
+        start_time = time.time()
+        status_code = None
+
+        async def send_wrapper(message):
+            nonlocal status_code
+            if message['type'] == 'http.response.start':
+                status_code = message['status']
+            await send(message)
+
+        try:
+            await self.app(scope, receive, send_wrapper)
+        except Exception:
+            duration = time.time() - start_time
+            method = scope.get('method', '')
+            path = scope.get('path', '')
+            logger.error(f'{method} {path} - ERROR ({duration:.2f}s)')
+            raise
+
+        duration = time.time() - start_time
+        method = scope.get('method', '')
+        path = scope.get('path', '')
+        logger.info(f'{method} {path} - {status_code} ({duration:.2f}s)')
+
+
+app.add_middleware(LogRequestsMiddleware)
 
 # Routers
 app.include_router(render.router, prefix='/v1')
