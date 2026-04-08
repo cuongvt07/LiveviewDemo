@@ -972,7 +972,7 @@ async def analyze_and_ingest_url_async(
     except Exception:
         if detect_task is not None and not detect_task.done():
             detect_task.cancel()
-            with suppress(Exception):
+            with suppress(BaseException):
                 await detect_task
         raise
 

@@ -1012,6 +1012,9 @@ async def importFromAnalyzedUrl(
         analyzed['rotation_index'] = len(family_templates)
         analyzed['preferred_view'] = preferred_view
         return analyzed
+    except asyncio.CancelledError:
+        logger.warning('URL analysis import cancelled (client disconnected)')
+        raise HTTPException(status_code=499, detail={'message': 'request_cancelled'})
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail={'message': str(exc)}) from exc
     except ValueError as exc:
@@ -1096,6 +1099,9 @@ async def lookupTemplatesFromUrl(
             'selected_preview_url': first_match.get('preview_url') if first_match else None,
             'selected_preview_url_full': first_match.get('preview_url_full') if first_match else None,
         }
+    except asyncio.CancelledError:
+        logger.warning('Template URL lookup cancelled (client disconnected)')
+        raise HTTPException(status_code=499, detail={'message': 'request_cancelled'})
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail={'message': str(exc)}) from exc
     except ValueError as exc:
