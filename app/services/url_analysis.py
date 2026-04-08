@@ -683,7 +683,7 @@ async def _get_async_http_client() -> Optional["httpx.AsyncClient"]:
                 max_keepalive_connections=20,
                 keepalive_expiry=30.0
             ),
-            timeout=httpx.Timeout(connect=5.0, read=60.0, pool=5.0),
+            timeout=httpx.Timeout(connect=5.0, read=60.0, write=10.0, pool=5.0),
             follow_redirects=True,
             headers={
                 "Accept-Encoding": "gzip, br",
