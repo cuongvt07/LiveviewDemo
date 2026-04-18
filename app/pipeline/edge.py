@@ -4,13 +4,13 @@ import cv2
 import numpy as np
 
 
-def feather_mask(mask: np.ndarray, feather_px: int = 6) -> np.ndarray:
+def feather_mask(mask: np.ndarray, feather_px: int = 10) -> np.ndarray:
     '''
     Làm mềm viền mask để composite trông tự nhiên hơn.
 
     Args:
         mask:       Grayscale uint8 (H, W) — 255 = print area
-        feather_px: Bán kính blur (pixels). 4–8 cho cốc sứ.
+        feather_px: Bán kính blur (pixels). 8–15 cho cốc sứ.
                     0 = tắt feathering (giữ mask cứng).
 
     Returns:

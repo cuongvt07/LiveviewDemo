@@ -103,32 +103,32 @@ def _normalize_saved_template_config(
             if list_key in pa and isinstance(pa[list_key], list):
                 pa[list_key] = [_scale_point(p) for p in pa[list_key]]
 
-    # If frontend provided mesh.points (normalized [0..1]), convert to
-    # print_area.mesh_control_dst so downstream normalization/merge handles it.
-    try:
-        mesh = payload.get('mesh')
-        if isinstance(mesh, dict) and isinstance(mesh.get('points'), list) and len(mesh['points']) > 0:
-            pts = []
-            for p in mesh['points']:
-                if isinstance(p, (list, tuple)) and len(p) >= 2:
-                    x = float(p[0])
-                    y = float(p[1])
-                    # If values look normalized (<=1.5), scale to pixel coords
-                    if abs(x) <= 1.5 and abs(y) <= 1.5:
-                        pts.append([x * output_width, y * output_height])
-                    else:
-                        pts.append([x, y])
-            if pts:
-                payload.setdefault('print_area', {})
-                # store as mesh_control_dst by default
-                payload['print_area']['mesh_control_dst'] = pts
-    except Exception:
-        # Best-effort conversion; ignore on failure
-        pass
+    def _ensure_pixels(pts_list):
+        if not isinstance(pts_list, list):
+            return pts_list
+        out = []
+        for p in pts_list:
+            if isinstance(p, (list, tuple)) and len(p) >= 2:
+                x, y = float(p[0]), float(p[1])
+                # If values look normalized (<= 1.5), scale to pixel coords
+                if abs(x) <= 1.5 and abs(y) <= 1.5:
+                    out.append([x * output_width, y * output_height])
+                else:
+                    out.append([x, y])
+            else:
+                out.append(p)
+        return out
+
+    pa = payload.get('print_area', {})
+    if isinstance(pa, dict):
+        for k in ['mesh_control_src', 'mesh_control_dst', 'mask_points', 'quad', 'base_points_raw']:
+            if k in pa:
+                pa[k] = _ensure_pixels(pa[k])
 
     payload.setdefault('product_type', product_type_hint)
     payload['print_area'].setdefault('product_type', product_type_hint)
-    payload['warp'].setdefault('product_type', product_type_hint)
+    if isinstance(payload.get('warp'), dict):
+        payload['warp'].setdefault('product_type', product_type_hint)
 
     default_config = _build_default_adhoc_config(output_width, output_height)
     merged = _merge_adhoc_user_config(default_config, json.dumps(payload))
@@ -1256,6 +1256,7 @@ async def saveAdhocTemplate(
         scale_x=scale_x,
         scale_y=scale_y,
     )
+    logger.info("Saving adhoc template '%s' (slug=%s) with config: %s", body.name, body.slug, json.dumps(normalized_config))
 
     # 5-6-8. Xử lý ảnh nặng (resize mockup, build mask, save preview) — chạy trong thread
     canonical_mockup_path = template_dir / 'mockup.jpg'

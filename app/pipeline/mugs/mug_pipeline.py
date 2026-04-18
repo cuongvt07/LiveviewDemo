@@ -134,6 +134,19 @@ def run_mug_pipeline(
     )
     logger.info('[PERF]   design_transform: %dms', int((time.perf_counter() - t_dt) * 1000))
 
+    # Xử lý viền mờ "ăn theo khối lưới": Làm mềm alpha trên mặt phẳng 2D trước khi warp.
+    # Lúc warp (cv2.remap), viền mờ này sẽ tự động bị bóp méo, uốn cong chính xác theo từng node của lưới.
+    base_feather = cfg.get('edge', {}).get('feather_px', 10)
+    scale_factor = max(1.0, out_w / 512.0)
+    scaled_feather = int(round(base_feather * scale_factor))
+
+    if scaled_feather > 0 and design.shape[2] == 4:
+        ksize = scaled_feather * 2 + 1
+        flat_alpha = design[:, :, 3]
+        flat_eroded = cv2.erode(flat_alpha, cv2.getStructuringElement(cv2.MORPH_RECT, (ksize, ksize)))
+        flat_blurred = cv2.GaussianBlur(flat_eroded.astype(np.float32), (ksize, ksize), scaled_feather / 2.0)
+        design[:, :, 3] = np.minimum(flat_blurred, flat_alpha.astype(np.float32)).astype(np.uint8)
+
     # If template provides a dense mesh config, prefer mesh-based warp renderer.
     t_warp = time.perf_counter()
     mesh_cfg = cfg.get("mesh", {})
@@ -193,12 +206,6 @@ def run_mug_pipeline(
 
     is_preview = cfg.get("is_preview", False)
 
-    # Auto-scale feather_px proportionally to output resolution
-    # Base reference: 512px width. At 2048px, 6px becomes ~24px.
-    base_feather = cfg.get('edge', {}).get('feather_px', 6)
-    scale_factor = max(1.0, out_w / 512.0)
-    scaled_feather = int(round(base_feather * scale_factor))
-
     if is_preview:
         t_comp = time.perf_counter()
         result = composite(
@@ -206,6 +213,7 @@ def run_mug_pipeline(
             warped,
             assets.mask,
             feather_px=base_feather,
+            blur_design=False,
         )
         logger.info('[PERF]   composite: %dms', int((time.perf_counter() - t_comp) * 1000))
         logger.info('[PERF]   ===== TOTAL mug_pipeline (Preview): %dms =====', int((time.perf_counter() - t_total) * 1000))
@@ -288,8 +296,8 @@ def run_mug_pipeline(
             )
 
             g_diff = compute_directional_diffuse(s_maps["normals"], ldir, valid_mask=v_mask)
-            g_diff = normalize_masked_field(g_diff, v_mask, empty_fill=1.0, outside_fill=0.0, low_percentile=2.0, high_percentile=98.0)
-            g_diff = np.where(v_mask, 0.35 + 0.65 * g_diff, 0.0).astype(np.float32)
+            g_diff = normalize_masked_field(g_diff, v_mask, empty_fill=1.0, outside_fill=1.0, low_percentile=2.0, high_percentile=98.0)
+            g_diff = np.where(v_mask, 0.75 + 0.25 * g_diff, 1.0).astype(np.float32)
 
             lf = build_light_field(
                 s_maps["surface_u"], s_maps["surface_v"], v_mask,
@@ -341,12 +349,12 @@ def run_mug_pipeline(
     full_valid_mask = lighting_mask > 1e-3
     geometry_lighting = cv2.resize(geometry_lighting_small, (out_w, out_h), interpolation=cv2.INTER_CUBIC)
     
-    photo_lighting = np.where(full_valid_mask, 0.60 + 0.40 * extracted_lighting, 0.0).astype(np.float32)
+    photo_lighting = np.where(full_valid_mask, 0.85 + 0.15 * extracted_lighting, 1.0).astype(np.float32)
     lighting_map = normalize_masked_field(
-        photo_lighting * geometry_lighting, full_valid_mask, empty_fill=1.0, outside_fill=0.0,
+        photo_lighting * geometry_lighting, full_valid_mask, empty_fill=1.0, outside_fill=1.0,
         low_percentile=2.0, high_percentile=98.0
     )
-    lighting_map = np.where(full_valid_mask, 0.28 + 0.72 * lighting_map, 0.0).astype(np.float32)
+    lighting_map = np.where(full_valid_mask, 0.85 + 0.15 * lighting_map, 1.0).astype(np.float32)
 
     highlight_map = None
     if (not preserve_original_color) and specular_strength > 0:
@@ -367,15 +375,6 @@ def run_mug_pipeline(
 
     logger.info('[PERF]   parallel_lighting_phase: %dms', int((time.perf_counter() - t_lighting_phase) * 1000))
 
-    shadow_strength = float(lighting_cfg.get("shadow_strength", 0.45))
-    if (not preserve_original_color) and shadow_strength > 0:
-        t_shadow = time.perf_counter()
-        warped = apply_shadow_overlay(
-            warped,
-            lighting_map,
-            strength=shadow_strength,
-        )
-        logger.info('[PERF]   apply_shadow_overlay: %dms', int((time.perf_counter() - t_shadow) * 1000))
 
     # Apply separated mug lighting (diffuse * lighting_map + additive specular)
     if (not preserve_original_color) and (highlight_map is not None):
@@ -395,6 +394,7 @@ def run_mug_pipeline(
         warped,
         assets.mask,
         feather_px=scaled_feather,
+        blur_design=False,
     )
     logger.info('[PERF]   composite: %dms', int((time.perf_counter() - t_comp) * 1000))
     logger.info('[PERF]   ===== TOTAL mug_pipeline: %dms =====', int((time.perf_counter() - t_total) * 1000))

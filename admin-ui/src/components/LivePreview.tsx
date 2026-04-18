@@ -331,7 +331,7 @@ export default function LivePreview() {
                 light_highlight: effectiveWarp?.light_highlight ?? 60,
                 light_softness: effectiveWarp?.light_softness ?? 55,
               },
-              edge: { feather_px: 0 },
+              edge: { feather_px: effectiveWarp?.feather_radius ?? 2.5 },
               render: { preserve_original_color: false },
             } : {}),
           }
@@ -513,51 +513,36 @@ export default function LivePreview() {
 
       const OUT_W = 1500
       const OUT_H = 1500
-      const cfg: any = { print_area: effectivePrintArea, warp: effectiveWarp }
-      const ptsDst = effectivePrintArea?.mesh_control_dst
-      const ptsSrc = effectivePrintArea?.mesh_control_src
-      if (Array.isArray(ptsDst) && ptsDst.length > 0) {
-        const n = ptsDst.length
-        let side = Math.round(Math.sqrt(n))
-        let cols = Math.max(1, side - 1)
-        let rows = Math.max(1, side - 1)
-        if (side * side !== n) {
-          cols = Math.max(1, Math.round(Math.sqrt(n)))
-          rows = Math.max(1, Math.ceil(n / cols) - 1)
+      
+      const isCylinderProduct = String(effectiveWarp?.product_type || productType).startsWith('cylinder')
+      
+      // Use the Snapshot's config if available, fallback to manual reconstruction otherwise.
+      // This ensures we save EXACTLY what was in the editor session.
+      const cfg: any = {
+        print_area: effectivePrintArea,
+        warp: effectiveWarp,
+        product_type: effectiveWarp?.product_type || productType || 'mug',
+      }
+
+      // Ensure lighting and color blocks are at the top level for backend render.py compatibility
+      if (isCylinderProduct) {
+        if (effectiveWarp) {
+          cfg.lighting = {
+            shadow_strength: 0.45,
+            displacement_strength: 0,
+            specular_strength: effectiveWarp.specular_strength ?? 0.3,
+            specular_threshold: 180,
+            light_pos_x: effectiveWarp.light_pos_x ?? 0.62,
+            light_pos_y: effectiveWarp.light_pos_y ?? 0.32,
+            light_height: effectiveWarp.light_height ?? 55,
+            light_contrast: effectiveWarp.light_contrast ?? 50,
+            light_highlight: effectiveWarp.light_highlight ?? 60,
+            light_softness: effectiveWarp.light_softness ?? 55,
+          }
+          cfg.edge = { feather_px: effectiveWarp?.feather_radius ?? 2.5 }
         }
-        const points = ptsDst.map((p: number[]) => [Number(p[0]) / OUT_W, Number(p[1]) / OUT_H, false])
-        cfg.mesh = {
-          enabled: true,
-          cols: cols,
-          rows: rows,
-          spacing: 'cosine',
-          tension: 0.35,
-          corner_blend_radius: 0.08,
-          symmetry_lock: true,
-          max_displacement: 0.15,
-          points,
-        }
-      } else if (Array.isArray(ptsSrc) && ptsSrc.length > 0) {
-        const n = ptsSrc.length
-        let side = Math.round(Math.sqrt(n))
-        let cols = Math.max(1, side - 1)
-        let rows = Math.max(1, side - 1)
-        if (side * side !== n) {
-          cols = Math.max(1, Math.round(Math.sqrt(n)))
-          rows = Math.max(1, Math.ceil(n / cols) - 1)
-        }
-        const points = ptsSrc.map((p: number[]) => [Number(p[0]) / OUT_W, Number(p[1]) / OUT_H, false])
-        cfg.mesh = {
-          enabled: true,
-          cols: cols,
-          rows: rows,
-          spacing: 'cosine',
-          tension: 0.35,
-          corner_blend_radius: 0.08,
-          symmetry_lock: true,
-          max_displacement: 0.15,
-          points,
-        }
+        cfg.color = { enable_color_match: false, match_strength: 0 }
+        cfg.render = { preserve_original_color: false }
       }
 
       // Save-template must use full-quality preview (not low-res live preview).

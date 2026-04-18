@@ -1,7 +1,7 @@
 import cv2
 import numpy as np
 
-def feather_mask(mask: np.ndarray, feather_px: int = 6) -> np.ndarray:
+def feather_mask(mask: np.ndarray, feather_px: int = 10) -> np.ndarray:
     """Làm mềm viền mask. Dùng chung."""
     if feather_px <= 0:
         return mask.astype(np.float32) / 255.0

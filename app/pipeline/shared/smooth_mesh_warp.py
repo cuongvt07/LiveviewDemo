@@ -151,8 +151,8 @@ def apply_smooth_mesh_warp(
             _, mapped = tps.applyTransformation(grid_pts)
             mapped = mapped.reshape(tps_h, tps_w, 2)
             
-            map_x = cv2.resize(mapped[:, :, 0], (current_w, current_h), interpolation=cv2.INTER_LINEAR)
-            map_y = cv2.resize(mapped[:, :, 1], (current_w, current_h), interpolation=cv2.INTER_LINEAR)
+            map_x = cv2.resize(mapped[:, :, 0], (current_w, current_h), interpolation=cv2.INTER_CUBIC)
+            map_y = cv2.resize(mapped[:, :, 1], (current_w, current_h), interpolation=cv2.INTER_CUBIC)
             
             map_x = np.clip(map_x, 0, current_iw - 1)
             map_y = np.clip(map_y, 0, current_ih - 1)

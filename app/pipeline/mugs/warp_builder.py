@@ -13,21 +13,19 @@ def build_warp_map(config: MugMeshConfig, out_w: int, out_h: int, quality: str =
     v_knots = np.array(cosine_spacing(config.rows))
 
     if quality == "preview":
-        return _build_bilinear(pts, u_knots, v_knots, out_w, out_h)
+        return _build_preview_smooth(pts, u_knots, v_knots, out_w, out_h)
     return _build_cubic_with_fairing(pts, u_knots, v_knots, out_w, out_h, config)
 
 
-def _build_bilinear(pts, u_knots, v_knots, out_w, out_h):
-    interp_u = RegularGridInterpolator((v_knots, u_knots), pts[:, :, 0], method="linear")
-    interp_v = RegularGridInterpolator((v_knots, u_knots), pts[:, :, 1], method="linear")
+def _build_preview_smooth(pts, u_knots, v_knots, out_w, out_h):
+    spline_x = RectBivariateSpline(v_knots, u_knots, pts[:, :, 0], kx=3, ky=3)
+    spline_y = RectBivariateSpline(v_knots, u_knots, pts[:, :, 1], kx=3, ky=3)
 
     out_u = np.linspace(0.0, 1.0, out_w)
     out_v = np.linspace(0.0, 1.0, out_h)
-    vv, uu = np.meshgrid(out_v, out_u, indexing='ij')
-    query = np.stack([vv.ravel(), uu.ravel()], axis=1)
 
-    map_x = interp_u(query).reshape(out_h, out_w).astype(np.float32) * out_w
-    map_y = interp_v(query).reshape(out_h, out_w).astype(np.float32) * out_h
+    map_x = spline_x(out_v, out_u).astype(np.float32) * out_w
+    map_y = spline_y(out_v, out_u).astype(np.float32) * out_h
     return map_x, map_y
 
 

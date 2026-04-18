@@ -509,93 +509,61 @@ def _merge_adhoc_user_config(config: dict, config_json: Optional[str], scale_fac
             config["color"]["match_strength"] = _to_finite_float(user_color.get("match_strength"), config["color"]["match_strength"])
 
     user_lighting = user_config.get("lighting", {})
-    if isinstance(user_lighting, dict):
-        if "shadow_strength" in user_lighting:
-            config["lighting"]["shadow_strength"] = _to_finite_float(user_lighting.get("shadow_strength"), config["lighting"]["shadow_strength"])
-        if "displacement_strength" in user_lighting:
-            config["lighting"]["displacement_strength"] = _to_finite_float(
-                user_lighting.get("displacement_strength"), config["lighting"]["displacement_strength"]
-            )
-        if "specular_strength" in user_lighting:
-            config["lighting"]["specular_strength"] = _to_finite_float(
-                user_lighting.get("specular_strength"), config["lighting"]["specular_strength"]
-            )
-        if "specular_threshold" in user_lighting:
-            config["lighting"]["specular_threshold"] = _to_finite_int(
-                user_lighting.get("specular_threshold"), config["lighting"]["specular_threshold"]
-            )
-        if "light_pos_x" in user_lighting:
-            config["lighting"]["light_pos_x"] = _to_finite_float(
-                user_lighting.get("light_pos_x"), config["lighting"]["light_pos_x"]
-            )
-        if "light_pos_y" in user_lighting:
-            config["lighting"]["light_pos_y"] = _to_finite_float(
-                user_lighting.get("light_pos_y"), config["lighting"]["light_pos_y"]
-            )
-        if "light_height" in user_lighting:
-            config["lighting"]["light_height"] = _to_finite_float(
-                user_lighting.get("light_height"), config["lighting"]["light_height"]
-            )
-        if "light_contrast" in user_lighting:
-            config["lighting"]["light_contrast"] = _to_finite_float(
-                user_lighting.get("light_contrast"), config["lighting"]["light_contrast"]
-            )
-        if "light_highlight" in user_lighting:
-            config["lighting"]["light_highlight"] = _to_finite_float(
-                user_lighting.get("light_highlight"), config["lighting"]["light_highlight"]
-            )
-        if "light_softness" in user_lighting:
-            config["lighting"]["light_softness"] = _to_finite_float(
-                user_lighting.get("light_softness"), config["lighting"]["light_softness"]
-            )
-        if "cylinder_shading_strength" in user_lighting:
-            config["lighting"]["cylinder_shading_strength"] = _to_finite_float(
-                user_lighting.get("cylinder_shading_strength"), config["lighting"]["cylinder_shading_strength"]
-            )
-        if "edge_darkening_strength" in user_lighting:
-            config["lighting"]["edge_darkening_strength"] = _to_finite_float(
-                user_lighting.get("edge_darkening_strength"), config["lighting"]["edge_darkening_strength"]
-            )
-        if "specular_line_strength" in user_lighting:
-            config["lighting"]["specular_line_strength"] = _to_finite_float(
-                user_lighting.get("specular_line_strength"), config["lighting"]["specular_line_strength"]
-            )
-        if "specular_line_position" in user_lighting:
-            config["lighting"]["specular_line_position"] = _to_finite_float(
-                user_lighting.get("specular_line_position"), config["lighting"]["specular_line_position"]
-            )
-        if "specular_line_sigma" in user_lighting:
-            config["lighting"]["specular_line_sigma"] = _to_finite_float(
-                user_lighting.get("specular_line_sigma"), config["lighting"]["specular_line_sigma"]
-            )
-        if "specular_line_blur_kernel" in user_lighting:
-            config["lighting"]["specular_line_blur_kernel"] = _to_finite_int(
-                user_lighting.get("specular_line_blur_kernel"), config["lighting"]["specular_line_blur_kernel"]
-            )
-        if "diffuse_highlight_strength" in user_lighting:
-            config["lighting"]["diffuse_highlight_strength"] = _to_finite_float(
-                user_lighting.get("diffuse_highlight_strength"), config["lighting"]["diffuse_highlight_strength"]
-            )
-        if "highlight_detail_strength" in user_lighting:
-            config["lighting"]["highlight_detail_strength"] = _to_finite_float(
-                user_lighting.get("highlight_detail_strength"), config["lighting"]["highlight_detail_strength"]
-            )
-        if "lighting_blur_kernel" in user_lighting:
-            config["lighting"]["lighting_blur_kernel"] = _to_finite_int(
-                user_lighting.get("lighting_blur_kernel"), config["lighting"]["lighting_blur_kernel"]
-            )
-        if "highlight_blur_kernel" in user_lighting:
-            config["lighting"]["highlight_blur_kernel"] = _to_finite_int(
-                user_lighting.get("highlight_blur_kernel"), config["lighting"]["highlight_blur_kernel"]
-            )
-        if "highlight_extract_blur_kernel" in user_lighting:
-            config["lighting"]["highlight_extract_blur_kernel"] = _to_finite_int(
-                user_lighting.get("highlight_extract_blur_kernel"), config["lighting"]["highlight_extract_blur_kernel"]
-            )
-        if "highlight_detail_blur_kernel" in user_lighting:
-            config["lighting"]["highlight_detail_blur_kernel"] = _to_finite_int(
-                user_lighting.get("highlight_detail_blur_kernel"), config["lighting"]["highlight_detail_blur_kernel"]
-            )
+    if not isinstance(user_lighting, dict):
+        user_lighting = {}
+
+    # Helper to pick up value from either lighting block or warp block
+    def _get_lighting_val(key, default):
+        val = user_lighting.get(key)
+        if val is None:
+            val = user_warp.get(key)
+        return _to_finite_float(val, default) if key != "specular_threshold" and not key.endswith("kernel") else _to_finite_int(val, default)
+
+    if user_lighting or user_warp:
+        if "shadow_strength" in user_lighting or "shadow_strength" in user_warp:
+            config["lighting"]["shadow_strength"] = _get_lighting_val("shadow_strength", config["lighting"]["shadow_strength"])
+        if "displacement_strength" in user_lighting or "displacement_strength" in user_warp:
+            config["lighting"]["displacement_strength"] = _get_lighting_val("displacement_strength", config["lighting"]["displacement_strength"])
+        if "specular_strength" in user_lighting or "specular_strength" in user_warp:
+            config["lighting"]["specular_strength"] = _get_lighting_val("specular_strength", config["lighting"]["specular_strength"])
+        if "specular_threshold" in user_lighting or "specular_threshold" in user_warp:
+            config["lighting"]["specular_threshold"] = _get_lighting_val("specular_threshold", config["lighting"]["specular_threshold"])
+        if "light_pos_x" in user_lighting or "light_pos_x" in user_warp:
+            config["lighting"]["light_pos_x"] = _get_lighting_val("light_pos_x", config["lighting"]["light_pos_x"])
+        if "light_pos_y" in user_lighting or "light_pos_y" in user_warp:
+            config["lighting"]["light_pos_y"] = _get_lighting_val("light_pos_y", config["lighting"]["light_pos_y"])
+        if "light_height" in user_lighting or "light_height" in user_warp:
+            config["lighting"]["light_height"] = _get_lighting_val("light_height", config["lighting"]["light_height"])
+        if "light_contrast" in user_lighting or "light_contrast" in user_warp:
+            config["lighting"]["light_contrast"] = _get_lighting_val("light_contrast", config["lighting"]["light_contrast"])
+        if "light_highlight" in user_lighting or "light_highlight" in user_warp:
+            config["lighting"]["light_highlight"] = _get_lighting_val("light_highlight", config["lighting"]["light_highlight"])
+        if "light_softness" in user_lighting or "light_softness" in user_warp:
+            config["lighting"]["light_softness"] = _get_lighting_val("light_softness", config["lighting"]["light_softness"])
+        if "cylinder_shading_strength" in user_lighting or "cylinder_shading_strength" in user_warp:
+            config["lighting"]["cylinder_shading_strength"] = _get_lighting_val("cylinder_shading_strength", config["lighting"]["cylinder_shading_strength"])
+        if "edge_darkening_strength" in user_lighting or "edge_darkening_strength" in user_warp:
+            config["lighting"]["edge_darkening_strength"] = _get_lighting_val("edge_darkening_strength", config["lighting"]["edge_darkening_strength"])
+        if "specular_line_strength" in user_lighting or "specular_line_strength" in user_warp:
+            config["lighting"]["specular_line_strength"] = _get_lighting_val("specular_line_strength", config["lighting"]["specular_line_strength"])
+        if "specular_line_position" in user_lighting or "specular_line_position" in user_warp:
+            config["lighting"]["specular_line_position"] = _get_lighting_val("specular_line_position", config["lighting"]["specular_line_position"])
+        if "specular_line_sigma" in user_lighting or "specular_line_sigma" in user_warp:
+            config["lighting"]["specular_line_sigma"] = _get_lighting_val("specular_line_sigma", config["lighting"]["specular_line_sigma"])
+        if "specular_line_blur_kernel" in user_lighting or "specular_line_blur_kernel" in user_warp:
+            config["lighting"]["specular_line_blur_kernel"] = _get_lighting_val("specular_line_blur_kernel", config["lighting"]["specular_line_blur_kernel"])
+        if "diffuse_highlight_strength" in user_lighting or "diffuse_highlight_strength" in user_warp:
+            config["lighting"]["diffuse_highlight_strength"] = _get_lighting_val("diffuse_highlight_strength", config["lighting"]["diffuse_highlight_strength"])
+        if "highlight_detail_strength" in user_lighting or "highlight_detail_strength" in user_warp:
+            config["lighting"]["highlight_detail_strength"] = _get_lighting_val("highlight_detail_strength", config["lighting"]["highlight_detail_strength"])
+        if "lighting_blur_kernel" in user_lighting or "lighting_blur_kernel" in user_warp:
+            config["lighting"]["lighting_blur_kernel"] = _get_lighting_val("lighting_blur_kernel", config["lighting"]["lighting_blur_kernel"])
+        if "highlight_blur_kernel" in user_lighting or "highlight_blur_kernel" in user_warp:
+            config["lighting"]["highlight_blur_kernel"] = _get_lighting_val("highlight_blur_kernel", config["lighting"]["highlight_blur_kernel"])
+        if "highlight_extract_blur_kernel" in user_lighting or "highlight_extract_blur_kernel" in user_warp:
+            config["lighting"]["highlight_extract_blur_kernel"] = _get_lighting_val("highlight_extract_blur_kernel", config["lighting"]["highlight_extract_blur_kernel"])
+        if "highlight_detail_blur_kernel" in user_lighting or "highlight_detail_blur_kernel" in user_warp:
+            config["lighting"]["highlight_detail_blur_kernel"] = _get_lighting_val("highlight_detail_blur_kernel", config["lighting"]["highlight_detail_blur_kernel"])
 
     user_render = user_config.get("render", {})
     if isinstance(user_render, dict) and "preserve_original_color" in user_render:
